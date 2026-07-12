@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aei-controller
+  namespace: aei-system
+  labels:
+    app.kubernetes.io/name: aei-controller
+spec:
+  # replicas: 1 is intentional — the control plane's completion registry, ticket
+  # store, and run-status store are in-memory, and the reconciler's dispatch guard
+  # is a single-replica in-memory set. Do not scale up until those are shared.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aei-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aei-controller
+    spec:
+      serviceAccountName: aei-controller
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          # Build + load this, or override via kustomize images: in config/default.
+          image: localhost/aei-manager:dev
+          args: ["-abi-addr=:8080"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: AEI_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: aei-signing
+                  key: AEI_SIGNING_SECRET
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

@@ -1,0 +1,31 @@
+# The AEI controller's cluster permissions. Two rules are easy to miss:
+#   * batch/jobs — the k8s-job provider runs IN-PROCESS in the manager and creates
+#     Jobs with the manager's ServiceAccount. It is NOT covered by the reconciler's
+#     CRD RBAC, so without this rule every dispatch 403s.
+#   * tokenreviews/create — backs the data-plane caller identity (the app's
+#     projected ServiceAccount token is validated here; no shared secret).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aei-controller
+rules:
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["agentruns"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["agentruns/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["agentproviderclasses", "agentapps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # The in-process k8s-job provider creates and watches Jobs (the privileged bit).
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # Uncomment for the agent-sandbox provider (it creates Sandbox CRs):
+  # - apiGroups: ["agents.x-k8s.io"]
+  #   resources: ["sandboxes"]
+  #   verbs: ["create", "get", "list", "watch", "delete"]
