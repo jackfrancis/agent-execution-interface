@@ -3,6 +3,9 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -74,6 +77,40 @@ func TestTokenRoundTripTamperExpire(t *testing.T) {
 	}
 	expired := p.mintToken(Claims{RunID: "r", Exp: p.now().Add(-time.Hour).Unix()})
 	if _, ok := p.verifyToken(expired); ok {
+		t.Error("expired token must fail")
+	}
+}
+
+// The asymmetric authority: the plane mints with the private key, and a
+// verify-only tier holding ONLY the public key verifies the same wire format
+// (base64url(json).base64url(ed25519-sig)) without the plane and without a shared
+// secret. This is the interop an app's verify-only tier relies on (e.g. gofer's
+// web tier, ADR 0002).
+func TestEd25519AuthorityPublicVerify(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := NewEd25519Authority(priv)
+
+	tok, err := auth.Mint(Claims{RunID: "r", Subject: "u", Scopes: []string{"signals:read"}, Audience: "gofer-agent", Exp: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := auth.Verify(tok); !ok || c.RunID != "r" || c.Audience != "gofer-agent" {
+		t.Fatalf("valid token should verify, ok=%v claims=%+v", ok, c)
+	}
+	// A holder of only the public key verifies the signature independently.
+	b, sigPart, _ := strings.Cut(tok, ".")
+	sig, _ := base64.RawURLEncoding.DecodeString(sigPart)
+	if !ed25519.Verify(pub, []byte(b), sig) {
+		t.Fatal("public key must verify the signature")
+	}
+	if _, ok := auth.Verify(tok + "x"); ok {
+		t.Error("tampered token must fail")
+	}
+	expired, _ := auth.Mint(Claims{RunID: "r", Exp: time.Now().Add(-time.Hour).Unix()})
+	if _, ok := auth.Verify(expired); ok {
 		t.Error("expired token must fail")
 	}
 }

@@ -24,6 +24,7 @@ package control
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -430,6 +431,60 @@ func (a hmacAuthority) sign(b string) string {
 	m := hmac.New(sha256.New, a.secret)
 	m.Write([]byte(b))
 	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
+}
+
+// ed25519Authority is the asymmetric TokenAuthority: the control plane holds the
+// private key and is the sole minter, while a verify-only tier (e.g. an app's web
+// tier) holds only the public key. The wire format matches hmacAuthority —
+// base64url(json(claims)).base64url(sig) — with an Ed25519 signature over the
+// encoded payload, so any holder of the public key verifies a token independently,
+// without the plane and without a shared secret. Supply it via Config.Authority.
+type ed25519Authority struct {
+	priv ed25519.PrivateKey
+	pub  ed25519.PublicKey
+	now  func() time.Time
+}
+
+// NewEd25519Authority builds an asymmetric TokenAuthority from an Ed25519 private
+// key. The control plane mints run credentials with it; a verify-only tier (which
+// holds only priv.Public(), distributed out of band) verifies the same tokens and
+// can never mint — the stronger identity profile the reference HMAC authority is
+// deliberately not, plugged in without changing the plane.
+func NewEd25519Authority(priv ed25519.PrivateKey) TokenAuthority {
+	return ed25519Authority{priv: priv, pub: priv.Public().(ed25519.PublicKey), now: time.Now}
+}
+
+func (a ed25519Authority) Mint(c Claims) (string, error) {
+	payload, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
+	b := base64.RawURLEncoding.EncodeToString(payload)
+	sig := ed25519.Sign(a.priv, []byte(b))
+	return b + "." + base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
+func (a ed25519Authority) Verify(tok string) (Claims, bool) {
+	b, sigPart, ok := strings.Cut(tok, ".")
+	if !ok {
+		return Claims{}, false
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(sigPart)
+	if err != nil || !ed25519.Verify(a.pub, []byte(b), sig) {
+		return Claims{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(b)
+	if err != nil {
+		return Claims{}, false
+	}
+	var c Claims
+	if err := json.Unmarshal(payload, &c); err != nil {
+		return Claims{}, false
+	}
+	if a.now().Unix() > c.Exp {
+		return Claims{}, false
+	}
+	return c, true
 }
 
 // --- runtime ABI server (Contract 2, platform side) ---

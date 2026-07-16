@@ -5,9 +5,12 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"flag"
 	"net/http"
 	"os"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -50,7 +53,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	plane := control.New(control.Config{Secret: []byte(os.Getenv("AEI_SIGNING_SECRET"))})
+	cfg := control.Config{Secret: []byte(os.Getenv("AEI_SIGNING_SECRET"))}
+	// An app with an asymmetric identity posture (a sole-minter control tier and a
+	// verify-only app tier) provisions the control plane with its Ed25519 private
+	// key. When set, the plane mints run credentials with it and the app verifies
+	// them with only the public half — no shared secret (e.g. gofer's ADR 0002).
+	// Unset keeps the reference-grade HMAC authority.
+	if k := strings.TrimSpace(os.Getenv("AEI_ED25519_PRIVATE_KEY")); k != "" {
+		raw, decErr := base64.StdEncoding.DecodeString(k)
+		if decErr != nil || len(raw) != ed25519.PrivateKeySize {
+			log.Error(decErr, "AEI_ED25519_PRIVATE_KEY must be a base64-encoded Ed25519 private key", "wantBytes", ed25519.PrivateKeySize)
+			os.Exit(1)
+		}
+		cfg.Authority = control.NewEd25519Authority(ed25519.PrivateKey(raw))
+		log.Info("run-credential authority: Ed25519 (asymmetric, sole-minter)")
+	}
+	plane := control.New(cfg)
 
 	// TokenReview-backed caller identity for the data-plane dispatch API — the
 	// app authenticates with its projected ServiceAccount token, no shared secret.
