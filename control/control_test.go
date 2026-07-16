@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,6 +75,43 @@ func TestTokenRoundTripTamperExpire(t *testing.T) {
 	expired := p.mintToken(Claims{RunID: "r", Exp: p.now().Add(-time.Hour).Unix()})
 	if _, ok := p.verifyToken(expired); ok {
 		t.Error("expired token must fail")
+	}
+}
+
+// stubAuthority is a trivial TokenAuthority (token == "stub.<runID>") that counts
+// its calls, so a test can prove the plane mints/verifies through the injected
+// authority rather than the HMAC default.
+type stubAuthority struct{ minted, verified int }
+
+func (s *stubAuthority) Mint(c Claims) (string, error) { s.minted++; return "stub." + c.RunID, nil }
+func (s *stubAuthority) Verify(tok string) (Claims, bool) {
+	s.verified++
+	if id, ok := strings.CutPrefix(tok, "stub."); ok {
+		return Claims{RunID: id, Exp: 1 << 62}, true
+	}
+	return Claims{}, false
+}
+
+// A supplied Config.Authority replaces the HMAC default for both mint and verify
+// — the pluggable identity seam (an asymmetric, audience-bound authority plugs in
+// the same way).
+func TestConfigAuthorityOverridesDefault(t *testing.T) {
+	sa := &stubAuthority{}
+	p := New(Config{Authority: sa})
+	tok := p.mintToken(Claims{RunID: "r7"})
+	if tok != "stub.r7" {
+		t.Fatalf("plane should mint via the injected authority, got %q", tok)
+	}
+	c, ok := p.verifyToken(tok)
+	if !ok || c.RunID != "r7" {
+		t.Fatalf("plane should verify via the injected authority, got ok=%v claims=%+v", ok, c)
+	}
+	if sa.minted == 0 || sa.verified == 0 {
+		t.Fatal("injected authority was not used")
+	}
+	// The HMAC default must reject a stub token, confirming the two are distinct.
+	if _, ok := New(Config{Secret: []byte("k")}).verifyToken(tok); ok {
+		t.Fatal("the HMAC default must not verify a stub-authority token")
 	}
 }
 

@@ -150,6 +150,12 @@ func Load(ctx context.Context, getenv func(string) string, metadata map[string]s
 // Spec returns the decoded run description.
 func (r *Runtime) Spec() RunSpec { return r.spec }
 
+// Credential returns the run credential the runtime holds (injected on the push
+// path, or redeemed on the pull path), so a runtime can authenticate calls to its
+// own application backend with the same audience-bound credential it uses for the
+// ABI. Hold it in memory only; never log or persist it (rule R2).
+func (r *Runtime) Credential() string { return r.cred }
+
 // Vend brokers a short-lived downstream credential (a model key, a user's Git
 // token) at {broker}/vend, so the runtime never holds a standing secret. The
 // result is held in memory for the run only; never log or persist it (R2).

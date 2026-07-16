@@ -14,9 +14,12 @@
 // It imports only the aei core and the standard library — no provider, no
 // client-go — so an app that embeds it stays lightweight (design tenet #5).
 //
-// This is reference-grade: in-memory ticket and waiter stores, an HMAC token, a
-// single process. A production profile hardens the stores and mints against
-// SPIFFE/SPIRE (roadmap Phase 6). The seam does not change.
+// This is reference-grade by default: in-memory ticket and waiter stores, a
+// single process, and a symmetric HMAC token. Identity is a seam — supply
+// Config.Authority to mint/verify with an asymmetric, audience-bound credential
+// (Ed25519, a SPIFFE/SVID issuer, a transaction-token service); a production
+// profile also hardens the stores and mints against SPIFFE/SPIRE (roadmap
+// Phase 6). The seam does not change.
 package control
 
 import (
@@ -55,9 +58,31 @@ type VendedCredential struct {
 // the requested provider (surfaced to the runtime as 404).
 var ErrNoCredential = errors.New("control: no credential for provider")
 
+// TokenAuthority mints and verifies the claims of a run credential. It is the
+// pluggable identity seam — the mint/verify analog of CredentialSource for /vend
+// (docs/design.md, Contract 3). The reference implementation is a symmetric HMAC
+// token; a platform can supply an asymmetric, audience-bound authority (Ed25519,
+// a SPIFFE/SVID issuer, a transaction-token service) so the sole-minter tier holds
+// a private key and a verify-only tier holds only the public half — without
+// changing the plane. Set it via Config.Authority; unset uses the built-in HMAC
+// default, so existing callers are unaffected.
+type TokenAuthority interface {
+	// Mint returns a signed credential encoding claims.
+	Mint(Claims) (string, error)
+	// Verify checks a credential and returns its claims, or false if it is
+	// invalid, tampered, or expired.
+	Verify(token string) (Claims, bool)
+}
+
 // Config configures a control plane.
 type Config struct {
-	Secret      []byte           // HMAC key that signs run credentials
+	// Secret is the HMAC key for the default (reference-grade) TokenAuthority. It
+	// is ignored when Authority is set.
+	Secret []byte
+	// Authority mints and verifies run credentials. Optional: nil uses a built-in
+	// HMAC authority keyed by Secret. Supply one to replace the reference token
+	// with an asymmetric, audience-bound credential (the mint/verify seam).
+	Authority   TokenAuthority
 	Credentials CredentialSource // optional: serves POST /vend
 	TokenTTL    time.Duration    // run credential lifetime; default 15m
 	TicketTTL   time.Duration    // redemption ticket lifetime; default 5m
@@ -66,7 +91,7 @@ type Config struct {
 // Plane is a running control plane. Construct it with New; serve Handler() and
 // dispatch with Run.
 type Plane struct {
-	secret    []byte
+	auth      TokenAuthority
 	creds     CredentialSource
 	tokenTTL  time.Duration
 	ticketTTL time.Duration
@@ -87,12 +112,18 @@ type ticket struct {
 
 // New builds a control plane from cfg, applying defaults.
 func New(cfg Config) *Plane {
+	now := time.Now
+	auth := cfg.Authority
+	if auth == nil {
+		// Reference-grade default: a symmetric HMAC token keyed by cfg.Secret.
+		auth = hmacAuthority{secret: cfg.Secret, now: now}
+	}
 	return &Plane{
-		secret:    cfg.Secret,
+		auth:      auth,
 		creds:     cfg.Credentials,
 		tokenTTL:  orDur(cfg.TokenTTL, 15*time.Minute),
 		ticketTTL: orDur(cfg.TicketTTL, 5*time.Minute),
-		now:       time.Now,
+		now:       now,
 		waiters:   map[string]chan aei.Result{},
 		tickets:   map[string]ticket{},
 		runs:      map[string]*RunState{},
@@ -346,23 +377,39 @@ func (p *Plane) redeem(id string) (string, int, bool) {
 	return p.mintToken(t.claims), ttl, true
 }
 
-// mintToken signs claims as base64url(json).base64url(hmac-sha256).
+// mintToken produces a run credential via the configured TokenAuthority. It keeps
+// a single-value signature (a mint error collapses to an empty token) so the
+// internal mint/redeem paths stay unchanged.
 func (p *Plane) mintToken(c Claims) string {
-	payload, _ := json.Marshal(c)
-	b := base64.RawURLEncoding.EncodeToString(payload)
-	return b + "." + p.sign(b)
+	tok, _ := p.auth.Mint(c)
+	return tok
 }
 
-func (p *Plane) sign(b string) string {
-	m := hmac.New(sha256.New, p.secret)
-	m.Write([]byte(b))
-	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
-}
-
-// verifyToken checks the signature and expiry and returns the claims.
+// verifyToken authenticates a run credential via the configured TokenAuthority.
 func (p *Plane) verifyToken(tok string) (Claims, bool) {
+	return p.auth.Verify(tok)
+}
+
+// hmacAuthority is the reference-grade TokenAuthority: base64url(json).base64url(
+// hmac-sha256). It is symmetric — the same secret mints and verifies — which is
+// why a production deployment supplies an asymmetric Authority instead (Config).
+type hmacAuthority struct {
+	secret []byte
+	now    func() time.Time
+}
+
+func (a hmacAuthority) Mint(c Claims) (string, error) {
+	payload, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
+	b := base64.RawURLEncoding.EncodeToString(payload)
+	return b + "." + a.sign(b), nil
+}
+
+func (a hmacAuthority) Verify(tok string) (Claims, bool) {
 	b, sig, ok := strings.Cut(tok, ".")
-	if !ok || !hmac.Equal([]byte(sig), []byte(p.sign(b))) {
+	if !ok || !hmac.Equal([]byte(sig), []byte(a.sign(b))) {
 		return Claims{}, false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(b)
@@ -373,10 +420,16 @@ func (p *Plane) verifyToken(tok string) (Claims, bool) {
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return Claims{}, false
 	}
-	if p.now().Unix() > c.Exp {
+	if a.now().Unix() > c.Exp {
 		return Claims{}, false
 	}
 	return c, true
+}
+
+func (a hmacAuthority) sign(b string) string {
+	m := hmac.New(sha256.New, a.secret)
+	m.Write([]byte(b))
+	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
 }
 
 // --- runtime ABI server (Contract 2, platform side) ---
