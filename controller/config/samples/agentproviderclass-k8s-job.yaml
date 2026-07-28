@@ -1,0 +1,20 @@
+# The zero-dependency provider class. k8s-job dispatches each run as a native
+# batch/v1 Job, so it needs NO external substrate — this is the binding `make
+# smoke` exercises on a fresh cluster. It is annotated as the cluster default so
+# an AgentRun may omit providerClassName. The controller already carries the
+# batch/jobs RBAC it needs (controller/config/rbac/role.yaml).
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: AgentProviderClass
+metadata:
+  name: k8s-job
+  annotations:
+    agents.x-k8s.io/is-default-class: "true"
+spec:
+  provider: k8s-job
+  parameters:
+    # The Job (and thus the runtime pod) lands here; aei-system already exists.
+    namespace: aei-system
+    # Where a real runtime calls back (/complete, /redeem, /vend). No image here:
+    # the class is a generic substrate binding, the app supplies its own image.
+    controlURL: http://aei-controller.aei-system.svc:8080/aei/v1alpha1
+  capabilities: [ASYNC]

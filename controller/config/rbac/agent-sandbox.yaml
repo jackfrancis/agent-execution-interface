@@ -1,0 +1,38 @@
+# Optional RBAC for the agent-sandbox provider. The controller runs that provider
+# in-process and creates Sandbox CRs (plus, for per-app placement, provisions each
+# app's runtime namespace and a default-deny-ingress NetworkPolicy) — permissions
+# the default ClusterRole (role.yaml) deliberately omits so the base install stays
+# least-privilege. This is the ONLY cluster-side change AEI owns for agent-sandbox;
+# the substrate (the Sandbox CRD + its controller) is installed with the upstream
+# project's own tooling. Applied by `make agent-sandbox-enable`, not config/default.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aei-controller-agent-sandbox
+rules:
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # Per-app runtime placement ("{app}-runtime" on the class) has the controller
+  # provision each app's runtime namespace on demand with a default-deny-ingress
+  # NetworkPolicy. Omit these two rules if every class pins runs to a single,
+  # admin-pre-provisioned namespace (a plain literal, not an {app} template).
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aei-controller-agent-sandbox
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aei-controller-agent-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: aei-controller
+    namespace: aei-system

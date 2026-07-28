@@ -1,0 +1,38 @@
+# The kind cluster config `make dev-up` builds by default (KIND_CONFIG). It carries
+# the Kubernetes feature gates Agent Substrate's podcertcontroller needs, so ONE dev
+# cluster runs every AEI provider (k8s-job, agent-sandbox, agent-substrate) and you
+# can A/B-swap between them without recreating it. The gates are inert for providers
+# that don't use them.
+#
+# It mirrors agent-substrate/substrate's hack/create-kind-cluster.sh (the source of
+# truth). Parts of that script are handled elsewhere or omitted on purpose, because
+# they are not cluster-config:
+#   - Proxy ARP per node (gVisor pod-to-pod loopback) — applied by `make kind-up`
+#     after creation, since it is a runtime node sysctl, not kind config.
+#   - The local image registry — OMITTED. That is substrate's build/image-distribution
+#     mechanism (build many images -> push to localhost:5001 -> nodes pull), not a
+#     cluster requirement; AEI loads its single manager image with `kind load`, and
+#     substrate's own installer sets the registry up when you deploy its images.
+#   - /dev/kvm mount + micro-VM (kata) node labels — OMITTED (optional; gVisor works
+#     without them). Use substrate's own script if you need micro-VM WorkerPools.
+#
+# REQUIRES a Kubernetes v1.36+ node image: these gates do not exist earlier and kind
+# fails creation on an unknown gate. If your kind defaults to an older Kubernetes,
+# pin a v1.36+ image on the nodes below, or set KIND_CONFIG= to build a plain cluster.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+# Three workers so runs actually spread: per-run providers (k8s-job, agent-sandbox)
+# schedule across nodes, and a durable WorkerPool can hold more than one ateom worker.
+# Scheduling on the control plane stays off, which keeps the AEI control plane away
+# from the sandboxes it dispatches. Drop workers here if you want a lighter cluster.
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker
+featureGates:
+  ClusterTrustBundle: true
+  ClusterTrustBundleProjection: true
+  PodCertificateRequest: true
+runtimeConfig:
+  "certificates.k8s.io/v1beta1": "true"

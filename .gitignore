@@ -1,0 +1,2 @@
+# Upstream repos cloned by `make install-agent-substrate` (not part of AEI).
+hack/.cache/

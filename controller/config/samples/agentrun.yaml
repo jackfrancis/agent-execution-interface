@@ -1,0 +1,23 @@
+# A sample run. `make smoke` deletes and re-applies this so each invocation gets a
+# fresh dispatch. taskRef and parameters are opaque handles — AEI never parses
+# them. providerClassName names the k8s-job class above; leaving it empty would
+# resolve to the cluster-default class instead.
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: AgentRun
+metadata:
+  name: hello
+  namespace: default
+spec:
+  providerClassName: k8s-job
+  # The app brings its own runtime image (the class is a generic substrate
+  # binding). This placeholder exits 0 without calling back, so the run reaches
+  # Succeeded via the k8s-job watch-completion backstop; swap in an aeiruntime
+  # image to exercise the /complete callback.
+  image: busybox:1.37
+  taskRef: prompt://hello
+  parameters:
+    prompt: "Say hello"
+  identity:
+    subject: "user:1"
+    scopes: ["model:invoke"]
+  timeoutSeconds: 120

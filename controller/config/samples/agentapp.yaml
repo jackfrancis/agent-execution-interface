@@ -1,0 +1,28 @@
+# The app's long-lived dispatch registration (namespaced). Together with one
+# AgentProviderClass these are the two objects an app needs before it can dispatch
+# runs through the data-plane API (docs/dispatch-plane.md, hello-world.md §3).
+#
+# No metadata.namespace is set on purpose: `make prereqs` applies this with
+# `-n $(APP_NS)` so you can drop it into your app's namespace (e.g. APP_NS=gofer)
+# without editing the file.
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: AgentApp
+metadata:
+  name: hello
+spec:
+  # Names the AgentProviderClass runs dispatch to (empty would pick the cluster
+  # default). k8s-job is the zero-dependency class in this directory.
+  providerClassName: k8s-job
+  # The app's runtime (agent) container image — the app brings it; the provider
+  # class is a generic substrate binding shared across apps, not app-specific.
+  image: busybox:1.37
+  # ServiceAccounts in this namespace allowed to dispatch as this app. The
+  # data-plane authenticates the caller's token (TokenReview) and rejects any SA
+  # not listed. "default" is the namespace's default SA; set this to the SA your
+  # app pod actually runs as.
+  dispatchers: ["default"]
+  identity:
+    # The audience minted run credentials are bound to; a dispatch cannot widen it.
+    audience: hello-agent
+    # The ceiling on scopes any run may request (least privilege, enforced at mint).
+    maxScopes: ["model:invoke"]

@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aei-controller
+  namespace: aei-system
+  labels:
+    app.kubernetes.io/name: aei-controller
+spec:
+  # replicas: 1 is intentional. The control plane's persistable state — the ticket
+  # store and run-status store — sits behind the control.Store seam whose default is
+  # in-memory; the completion registry (the same-replica waiter) and the reconciler's
+  # dispatch-dedupe guard are single-replica in-memory sets. To run replicas > 1,
+  # supply a shared control.Store (a /complete callback on any replica then finalizes
+  # durably, first-writer-wins) plus a shared/leader-elected dedupe guard — the HA
+  # profile (roadmap Phase 7). Until then, keep one replica.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aei-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aei-controller
+    spec:
+      serviceAccountName: aei-controller
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          # A local (kind-loaded) image, not a registry image. You MUST load it
+          # into the target cluster first — `make load` (kind load docker-image)
+          # — or override via kustomize images: in config/default to a real
+          # registry. IfNotPresent uses the loaded image and never dials a
+          # registry; without the image loaded the pod ImagePullBackOffs.
+          image: localhost/aei-manager:dev
+          imagePullPolicy: IfNotPresent
+          args: ["-abi-addr=:8080"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Reference-grade symmetric authority (HMAC). Used unless an Ed25519
+            # key is provided below.
+            - name: AEI_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: aei-signing
+                  key: AEI_SIGNING_SECRET
+            # Optional asymmetric authority: when set (a base64 Ed25519 private
+            # key), the control plane becomes the sole minter and verify-only apps
+            # hold just the public half. Takes precedence over AEI_SIGNING_SECRET.
+            # Populate the aei-signing secret's AEI_ED25519_PRIVATE_KEY to enable.
+            - name: AEI_ED25519_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aei-signing
+                  key: AEI_ED25519_PRIVATE_KEY
+                  optional: true
+            # Optional: AEI_REGISTRY_REWRITE redirects where the durable agent-substrate
+            # provider READS an app image's config to resolve its entrypoint for the
+            # ActorTemplate (ate does not derive the process command from the image).
+            # Comma-separated <from>=<to> pairs; an http:// target is plain HTTP. Only
+            # needed when the image ref's registry is unreachable from this pod (e.g. a
+            # kind local registry, where `make agent-substrate-enable` sets it). In a
+            # real cluster the ref's own registry is reachable, so leave it unset.
+            # - name: AEI_REGISTRY_REWRITE
+            #   value: "localhost:5001=http://kind-registry.default.svc.cluster.local:5000"
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

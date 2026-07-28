@@ -1,0 +1,99 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: agentapps.agents.x-k8s.io
+spec:
+  group: agents.x-k8s.io
+  names:
+    kind: AgentApp
+    listKind: AgentAppList
+    plural: agentapps
+    shortNames:
+    - aa
+    singular: agentapp
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.providerClassName
+      name: Class
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          AgentApp is the app's dispatch registration (namespaced): one long-lived object
+          per app, so high-volume dispatch is a data-plane call rather than an object per
+          run (docs/dispatch-plane.md).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              AgentAppSpec is the app developer's long-lived registration — the one object
+              that replaces a per-run AgentRun at scale (docs/dispatch-plane.md). It binds an
+              app to a provider class and bounds the identity its runs may mint; the runs
+              themselves are dispatched through the data-plane API, not as Kubernetes
+              objects, so a single AgentApp fronts thousands of runs.
+            properties:
+              dispatchers:
+                description: |-
+                  Dispatchers are the names of ServiceAccounts in this namespace permitted to
+                  dispatch as this app. The data-plane endpoint authenticates the caller's
+                  workload token (TokenReview) and rejects any SA not listed — the token-level
+                  analog of the AgentRun create RBAC the declarative path relied on.
+                items:
+                  type: string
+                type: array
+              identity:
+                description: Identity bounds the per-run credentials minted for this
+                  app's runs.
+                properties:
+                  audience:
+                    description: |-
+                      Audience the minted run credentials are bound to. The app fixes it; a
+                      dispatch request cannot widen it.
+                    type: string
+                  maxScopes:
+                    description: |-
+                      MaxScopes is the maximum set of scopes any run may request. A dispatch
+                      asking for a scope outside this set is rejected.
+                    items:
+                      type: string
+                    type: array
+                type: object
+              image:
+                description: |-
+                  Image is the runtime (agent) container image this app's runs execute. It
+                  rides each dispatch as the run image, so the AgentProviderClass stays a
+                  generic substrate binding shared across apps rather than carrying an app
+                  image. A durable substrate that targets a standing actor ignores it.
+                type: string
+              providerClassName:
+                description: |-
+                  ProviderClassName selects the AgentProviderClass this app's runs dispatch
+                  to; empty selects the cluster default (the class annotated
+                  IsDefaultClassAnnotation). The app never names a substrate.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources: {}

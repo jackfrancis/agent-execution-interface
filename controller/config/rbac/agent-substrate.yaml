@@ -1,0 +1,37 @@
+# Optional RBAC for the agent-substrate provider. The controller runs that provider
+# in-process and, for AEI-managed actor provisioning, materializes each app's actor
+# from its AgentApp image: it applies the ate.dev ActorTemplate/WorkerPool (dynamic
+# client) and mints a ServiceAccount bearer token to create the atespace + actor via
+# the ate-api-server (which are NOT CRDs). The default ClusterRole (role.yaml) omits
+# these so the base install stays least-privilege. The Agent Substrate platform
+# itself (ate-api-server, atenet-router, the CRDs) is installed with the upstream
+# project's own tooling. Applied by `make agent-substrate-enable`, not config/default.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aei-controller-agent-substrate
+rules:
+  # Materialize the actor's k8s-side resources from the app image + class params.
+  - apiGroups: ["ate.dev"]
+    resources: ["actortemplates", "workerpools"]
+    verbs: ["get", "create"]
+  # Mint the ate-api bearer (TokenRequest) for the ate-client ServiceAccount, so the
+  # controller can create atespaces + actors through ate-api-server. Scoped to that
+  # one ServiceAccount. Omit if the actor is always provisioned out of band.
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    resourceNames: ["ate-client"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aei-controller-agent-substrate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aei-controller-agent-substrate
+subjects:
+  - kind: ServiceAccount
+    name: aei-controller
+    namespace: aei-system

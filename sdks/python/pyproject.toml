@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aei"
+version = "0.0.1"
+description = "Agent Execution Interface — Python app-developer SDK: typed AgentRun models + a thin Kubernetes client, so an app dispatches agent runs with no CRD boilerplate."
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2",
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyyaml>=6", "jsonschema>=4"]
+# `../generate.sh python` regenerates aei/_agentrun.py from the CRD schema.
+gen = ["datamodel-code-generator>=0.25"]
+
+[tool.setuptools.packages.find]
+include = ["aei*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,24 @@
+# A sample run for the isolated (agent-sandbox) class. `make agent-sandbox-smoke`
+# (re)creates this and checks that the provider creates a Sandbox — the proof that
+# dispatch is wired through controller → provider → substrate.
+#
+# The run then finalizes either way: the runtime's /complete callback normally ends
+# it, and if no runtime ever reports (a placeholder image, or a pod that fails to
+# start) the provider's watch of the Sandbox's Finished condition does, carrying the
+# pod's outcome. The deadline below remains the last backstop.
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: AgentRun
+metadata:
+  name: hello-sandbox
+  namespace: default
+spec:
+  providerClassName: isolated
+  # The app brings its own runtime image (generic class).
+  image: busybox:1.37
+  taskRef: prompt://hello
+  parameters:
+    prompt: "Say hello"
+  identity:
+    subject: "user:1"
+    scopes: ["model:invoke"]
+  timeoutSeconds: 300

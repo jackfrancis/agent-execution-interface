@@ -1,0 +1,61 @@
+# agent-substrate provider class (non-default). Requires the upstream Agent
+# Substrate ("ate") platform — the atenet-router and ate-api-server — installed with
+# ate's own tooling. AEI does NOT install the substrate, but it DOES materialize each
+# app's actor from its AgentApp image: on first dispatch the controller applies the
+# ate ActorTemplate/WorkerPool and creates the atespace + actor via ate-api (see
+# controller/config/rbac/agent-substrate.yaml). `make agent-substrate-enable` applies
+# that RBAC + this class. The AgentApp image MUST be digest-pinned (a tag invalidates
+# the golden snapshot); leave the AgentApp image empty to target a pre-provisioned actor.
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: AgentProviderClass
+metadata:
+  name: durable
+spec:
+  provider: agent-substrate
+  parameters:
+    routerURL: http://atenet-router.ate-system.svc.cluster.local
+    # Per-app actor: {app} resolves to the run's origin app, so each app dispatches
+    # to its OWN standing actor (one actor runs one app's runtime image). An app-less
+    # run (a declarative AgentRun) pools into the shared "aei-runtime" actor. Use a
+    # literal here (e.g. aei-runtime) to share one actor across apps instead. The
+    # actor is provisioned out of band (e.g. `kubectl ate`) under this same name.
+    actor: "{app}"
+    atespace: aei
+    controlURL: http://aei-controller.aei-system.svc:8080/aei/v1alpha1
+    # --- Actor auto-provisioning (AEI materializes the WorkerPool + ActorTemplate +
+    # actor from the AgentApp image, so the app ships no ate artifacts). On kind,
+    # `make agent-substrate-enable` builds the ateom image and fills snapshotLocation +
+    # ateomImage in for you; in a real deployment set them here yourself. ---
+    # Golden-snapshot storage PREFIX; AEI appends the actor (-> gs://.../<app>/) so apps
+    # sharing this class never collide. Empty ⇒ AEI will not auto-create the actor.
+    snapshotLocation: ""            # e.g. gs://ate-snapshots/  (gs:// routes to in-cluster rustfs on kind)
+    # The substrate ateom (gVisor) image. Set it and AEI creates the WorkerPool too;
+    # leave empty and the admin provides a pool labeled aei.dev/worker-pool=<workerPool>.
+    ateomImage: ""
+    templateNamespace: aei-actors   # k8s namespace holding the ActorTemplate + WorkerPool
+    sandboxClass: gvisor            # gvisor | microvm
+    workerPool: aei                 # pool name AEI creates and the template selects
+    # --- Actor overload controls (optional; a standing actor multiplexes many runs in
+    # one process). maxConcurrentRuns caps in-flight runs — at capacity the actor sheds
+    # new tasks with a retryable 503 the provider's warm-up retry absorbs (graceful
+    # backpressure, not OOM). actorCPU/actorMemory are the defense-in-depth resource
+    # ceiling on the AEI-created WorkerPool's pod template (applies when ateomImage is
+    # set so AEI owns the pool; Kubernetes quantity strings). ---
+    # maxConcurrentRuns: "16"
+    # actorCPU: "1"
+    # actorMemory: "1Gi"
+    # ate-api (atespace/actor creation; not CRDs) — defaults target the in-cluster
+    # ate-api-server Service, so usually leave these unset:
+    # ateApiEndpoint: api.ate-system.svc:443
+    # ateApiTokenServiceAccount: ate-client
+    # ateApiTokenNamespace: ate-system
+  # A durable, snapshotted actor: AEI mints a single-use pull ticket instead of a
+  # live token, which the runtime redeems before working.
+  #
+  # Isolation here is the ate sandbox the actor already runs in, not a pod
+  # RuntimeClass — so it must match the sandboxClass parameter above (change one and
+  # you must change the other; a run asking for anything else is rejected rather
+  # than run under isolation it did not name). It is fixed at provisioning: a
+  # standing actor cannot be re-isolated per run.
+  defaultIsolationClass: gvisor
+  capabilities: [ASYNC, PULL_CREDENTIAL, DURABLE, "ISOLATION:gvisor"]

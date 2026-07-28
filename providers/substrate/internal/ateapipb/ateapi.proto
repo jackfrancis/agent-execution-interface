@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+// Package ateapi is a MINIMAL, AEI-owned copy of the agent-substrate ate-api
+// control surface — only the atespace/actor creation RPCs and the fields AEI sets.
+// It is vendored (not imported) so AEI depends on the stable gRPC stack, not the
+// unstable substrate Go module. The proto package name (ateapi) and service
+// (Control) MUST match the server so the wire method path "/ateapi.Control/Create*"
+// resolves. Messages intentionally define only the fields AEI populates; the
+// server's additional response fields arrive as ignored unknown fields.
+package ateapi;
+
+option go_package = "github.com/jackfrancis/agent-execution-interface/providers/substrate/internal/ateapipb";
+
+service Control {
+  rpc CreateAtespace(CreateAtespaceRequest) returns (Atespace) {}
+  rpc CreateActor(CreateActorRequest) returns (Actor) {}
+}
+
+message ResourceMetadata {
+  string atespace = 1;
+  string name = 2;
+}
+
+message Atespace {
+  ResourceMetadata metadata = 1;
+}
+
+message Actor {
+  ResourceMetadata metadata = 1;
+  string actor_template_namespace = 2;
+  string actor_template_name = 3;
+}
+
+message CreateAtespaceRequest {
+  Atespace atespace = 1;
+}
+
+message CreateActorRequest {
+  Actor actor = 1;
+}

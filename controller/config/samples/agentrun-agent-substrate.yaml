@@ -1,0 +1,23 @@
+# A sample run for the durable (agent-substrate) class. `make agent-substrate-smoke`
+# (re)creates this and checks the run is accepted (stays Running, not Failed) —
+# i.e. the atenet-router took the A2A dispatch message. There is no per-run
+# Kubernetes object for this substrate (dispatch is an A2A message, not a
+# workload), so there is nothing on-cluster to assert beyond the run phase.
+#
+# Reaching Succeeded needs the full ate platform: a standing actor plus a runtime
+# that redeems its pull-ticket and calls /complete. This run stays Running until
+# the deadline otherwise.
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: AgentRun
+metadata:
+  name: hello-substrate
+  namespace: default
+spec:
+  providerClassName: durable
+  taskRef: prompt://hello
+  parameters:
+    prompt: "Say hello"
+  identity:
+    subject: "user:1"
+    scopes: ["model:invoke"]
+  timeoutSeconds: 300
