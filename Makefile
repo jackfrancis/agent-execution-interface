@@ -122,8 +122,14 @@ SAMPLES       := controller/config/samples
 PROVIDERS     ?=
 # The agent-sandbox release that `make install-agent-sandbox` applies (upstream's
 # Standard Install: core + extensions). Bump it as new releases land, or override
-# per run: make install-agent-sandbox AGENT_SANDBOX_VERSION=v0.6.0
-AGENT_SANDBOX_VERSION ?= v0.5.3
+# per run: make install-agent-sandbox AGENT_SANDBOX_VERSION=v1.0.10
+#
+# v1.0.0 removed the v1alpha1 API and the conversion webhook. A cluster already on
+# v0.5.2 or later upgrades in place (install-agent-sandbox also removes the webhook
+# objects the old release left behind). One on an older release must go through
+# v0.5.x and its storage migration first, or the API server rejects the new CRDs:
+# https://github.com/kubernetes-sigs/agent-sandbox/blob/main/docs/api-migration-guide.md
+AGENT_SANDBOX_VERSION ?= v1.0.11
 # The agent-substrate checkout `make install-agent-substrate` builds from. Substrate
 # has no published install manifest — it builds from source — so this tracks a git
 # ref (default main; substrate is very early, so expect breakage). Overridable.
@@ -436,6 +442,13 @@ install-agent-sandbox: check-cluster ## install upstream agent-sandbox (core + e
 	$(KUBECTL) apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$(AGENT_SANDBOX_VERSION)/sandbox-with-extensions.yaml
 	@echo "waiting for the Sandbox CRD to be established..."
 	$(KUBECTL) wait --for=condition=established --timeout=60s crd/sandboxes.agents.x-k8s.io
+	@# Upstream's post-upgrade cleanup for a cluster that had a pre-1.0 release: the
+	@# conversion webhook's objects, which v1.0.0 no longer ships. Nothing to do on a
+	@# fresh install.
+	@$(KUBECTL) delete -n agent-sandbox-system svc/agent-sandbox-webhook-service \
+		secret/agent-sandbox-webhook-certs role/agent-sandbox-controller \
+		rolebinding/agent-sandbox-controller --ignore-not-found
+	$(KUBECTL) -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=180s
 	@echo "agent-sandbox $(AGENT_SANDBOX_VERSION) installed on $(TARGET). Enable the AEI-side delta with:"
 	@echo "  make agent-sandbox-enable $(TARGET_ARG)   (or wire a class via PROVIDERS=agent-sandbox on make dev-up / make deploy)"
 
