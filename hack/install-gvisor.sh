@@ -106,7 +106,7 @@ systemctl restart containerd
 for i in $(seq 1 30); do
 	dump="$(containerd config dump 2>/dev/null || true)"
 	case "${dump}" in
-		*"runtimes.${handler}]"*)
+		(*"runtimes.${handler}]"*)
 			echo "runsc-configured"
 			exit 0
 			;;
