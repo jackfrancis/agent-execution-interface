@@ -54,6 +54,18 @@
 # current context is used unless KUBE_CONTEXT names another. The kind-only targets
 # (kind-up/down, load, dev-up, install-gvisor, install-agent-substrate,
 # agent-substrate-enable) refuse to run against a kubeconfig.
+#
+# AN EXAMPLE OF SUCH A CLUSTER: AKS. Not part of AEI or of the standard; a
+# convenience kept wholly in hack/aks/, as hack/kind/ is for the dev loop:
+#     make create-aks      create/reuse a resource group, an AKS cluster (a system
+#                          pool + a Kata pool for the 'isolated' class's
+#                          kata-vm-isolation RuntimeClass) and an attached container
+#                          registry; write a kubeconfig FILE; print the push/deploy
+#                          commands above with the values filled in.
+#     make delete-aks      delete what create-aks made (it asks for
+#                          AKS_CONFIRM_DELETE=<resource group> first).
+# AKS_* variables size and name everything, and AKS_DRY_RUN=1 prints the Azure
+# commands without running them; see hack/aks/aks.mk.
 
 IMG           ?= localhost/aei-manager:dev
 # Container engine for building the image: prefer docker, fall back to podman when
@@ -218,6 +230,10 @@ else
 		exit 1; }
 	@echo "→ targeting kind cluster '$(KIND_CLUSTER)' (context kind-$(KIND_CLUSTER))"
 endif
+
+# An example non-kind cluster (create-aks, delete-aks). Everything Azure-specific is
+# in hack/aks/.
+include hack/aks/aks.mk
 
 ## ── build & deploy ────────────────────────────────────────────────────────────
 

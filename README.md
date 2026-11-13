@@ -79,6 +79,48 @@ make public-key KUBECONFIG=/path/to/kubeconfig
   `ISOLATION_CLASS`, e.g. `ISOLATION_CLASS=kata-vm-isolation` for AKS Pod Sandboxing
   (Kata), which needs a node pool created with `--workload-runtime KataVmIsolation`.
 
+### Example: an AKS cluster
+
+AEI does not need AKS and does not manage clusters. `make create-aks` is a
+convenience for getting one that satisfies AEI, the way `make kind-up` is for the dev
+loop; everything Azure-specific is in [hack/aks/](hack/aks/).
+
+```sh
+make create-aks AKS_DRY_RUN=1     # print the az commands, create nothing
+make create-aks                   # needs az (2.80.0+) logged in; shows the subscription first
+```
+
+It creates, or reuses if they exist:
+
+- a resource group and an AKS cluster with a small system pool and a user pool for
+  agent runs with [Pod Sandboxing](https://learn.microsoft.com/azure/aks/use-pod-sandboxing)
+  (`--workload-runtime KataVmIsolation`, Azure Linux, a nested-virtualization VM
+  size), which gives the cluster the `kata-vm-isolation` RuntimeClass;
+- an Azure Container Registry attached to the cluster, so nodes pull without pull
+  secrets (`AKS_CREATE_ACR=false` skips it, `AKS_ATTACH_ACR=<registry>` attaches one
+  you already have);
+- a kubeconfig file of its own (`AKS_KUBECONFIG`, default
+  `~/.kube/aei-aks-<cluster>.kubeconfig`). Your default kubeconfig is not touched.
+
+It then checks that a pod naming only the RuntimeClass runs on the Kata pool, and
+prints the install commands from above with the registry and kubeconfig filled in:
+`make push`, `make install-agent-sandbox`, `make deploy ... PROVIDERS=agent-sandbox
+ISOLATION_CLASS=kata-vm-isolation`, `make public-key`.
+
+Names, location, node counts, VM sizes and the Kubernetes version are `AKS_*`
+variables, listed in [hack/aks/aks.mk](hack/aks/aks.mk). The defaults are one
+`Standard_D2s_v3` system node and two `Standard_D4s_v3` Kata nodes, which bill for as
+long as the cluster exists.
+
+`make delete-aks` prints what it would delete and stops; add
+`AKS_CONFIRM_DELETE=<resource group>` to carry it out. It deletes only what
+`create-aks` created (marked with an `aei-created-by` tag): the whole resource group
+if `create-aks` made it, otherwise just the cluster and registry it added to your
+existing group.
+
+A Kata pod with no memory limit runs in a 512Mi VM with one vCPU. AEI's runtime pods
+set no limits today, so that is what each isolated run gets on this cluster.
+
 ## Docs
 
 - [docs/hello-world.md](docs/hello-world.md) — **start here**: a Go + Python "Hello, World!" agent, end to end
