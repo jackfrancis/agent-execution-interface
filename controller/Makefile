@@ -18,8 +18,12 @@ IMAGE_ARCHIVE ?= /tmp/aei-manager-$(KIND_CLUSTER).tar
 help: ## list targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-16s %s\n", $$1, $$2}'
 
+# PLATFORM (e.g. linux/amd64) cross-builds for a cluster whose nodes differ from this
+# machine; empty builds for the engine's own platform.
+PLATFORM ?=
+
 docker-build: ## build the manager image (context = repo root)
-	cd .. && $(ENGINE) build -f controller/Dockerfile -t $(IMG) .
+	cd .. && $(ENGINE) build $(if $(PLATFORM),--platform $(PLATFORM)) -f controller/Dockerfile -t $(IMG) .
 
 # `kind load docker-image` is unreliable with the podman provider on macOS (the
 # podman machine is a remote VM, so the image kind looks for is "not present

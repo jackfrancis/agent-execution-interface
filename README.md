@@ -40,6 +40,42 @@ Go **runtime** SDK. **[docs/hello-world.md](docs/hello-world.md) is what
 this looks like in practice** — "Hello, World!" as an agentic run in both Go and
 Python, operationalized over agent-sandbox and Agent Substrate.
 
+## Install
+
+`make help` lists every target. There are two ways in.
+
+**kind (the dev loop).** `make dev-up` creates or reuses a kind cluster, builds and
+loads the controller image, installs the CRDs and controller, and provisions the
+signing authority. Add `PROVIDERS=agent-sandbox` (and `make install-agent-sandbox`,
+`make install-gvisor`) for the isolated class.
+
+**Any other cluster (AKS, GKE, …).** AEI does not create or manage the cluster; give
+it a kubeconfig file. This is what a CI job would run:
+
+```sh
+# 1. Build for the nodes' platform and push to a registry the cluster can pull from.
+make push IMG=<registry>/aei-manager:<tag> PLATFORM=linux/amd64
+
+# 2. Install the CRDs + controller, provision the signing authority, wire a class.
+make deploy KUBECONFIG=/path/to/kubeconfig IMG=<registry>/aei-manager:<tag> PROVIDERS=k8s-job
+
+# 3. The public key an app verifies run credentials with.
+make public-key KUBECONFIG=/path/to/kubeconfig
+```
+
+- `KUBECONFIG` must be passed on the make command line. One that is only exported
+  in your shell is ignored, so the dev loop keeps targeting kind. The file's
+  current context is used unless `KUBE_CONTEXT=<name>` picks another.
+- Use a new image tag per build: the controller pod re-pulls only when the image
+  reference changes.
+- The same flag works on the other cluster-agnostic targets (`status`, `logs`,
+  `smoke`, `provider`, `install-agent-sandbox`, `agent-sandbox-enable`,
+  `register-app`, `undeploy`). The kind-only ones (`dev-up`, `load`, `kind-up`,
+  `install-gvisor`, `install-agent-substrate`, `agent-substrate-enable`) refuse it.
+- `k8s-job` needs no extra substrate. The `isolated` sample class asks for a
+  `gvisor` RuntimeClass, which `install-gvisor` only provides on kind; on another
+  cluster, install a RuntimeClass of that name yourself or use `k8s-job`.
+
 ## Docs
 
 - [docs/hello-world.md](docs/hello-world.md) — **start here**: a Go + Python "Hello, World!" agent, end to end
