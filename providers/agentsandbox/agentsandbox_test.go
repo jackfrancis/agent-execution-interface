@@ -97,13 +97,21 @@ func TestSelfReapWhenDeadlineSet(t *testing.T) {
 	l := testLauncher()
 	u := l.sandbox(aei.RunSpec{ID: "r", Deadline: time.Minute}, aei.Credential{Value: "tok"}, l.now())
 
-	shutdown, found, err := unstructured.NestedString(u.Object, "spec", "lifecycle", "shutdownTime")
+	// The Sandbox API has these directly under spec. Anywhere else the API server
+	// prunes them and the Sandbox is never reaped.
+	shutdown, found, err := unstructured.NestedString(u.Object, "spec", "shutdownTime")
 	if err != nil || !found || shutdown == "" {
-		t.Fatalf("shutdownTime not set: found=%v err=%v", found, err)
+		t.Fatalf("spec.shutdownTime not set: found=%v err=%v", found, err)
 	}
-	policy, _, _ := unstructured.NestedString(u.Object, "spec", "lifecycle", "shutdownPolicy")
+	if want := l.now().Add(time.Minute + shutdownGrace).UTC().Format(time.RFC3339); shutdown != want {
+		t.Errorf("spec.shutdownTime = %q, want %q (deadline + grace)", shutdown, want)
+	}
+	policy, _, _ := unstructured.NestedString(u.Object, "spec", "shutdownPolicy")
 	if policy != "Delete" {
-		t.Errorf("shutdownPolicy = %q, want Delete", policy)
+		t.Errorf("spec.shutdownPolicy = %q, want Delete", policy)
+	}
+	if _, found, _ := unstructured.NestedMap(u.Object, "spec", "lifecycle"); found {
+		t.Error("spec.lifecycle is not part of the Sandbox API and must not be set")
 	}
 }
 
