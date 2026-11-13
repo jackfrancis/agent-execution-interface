@@ -120,10 +120,16 @@ AGENT_SUBSTRATE_REF ?= main
 # storage.googleapis.com/gvisor/releases/ — "release/latest", or a dated pin like
 # release/20260101.
 GVISOR_RELEASE ?= release/latest
-# The isolation class the 'isolated' sample class asks for. It is a RuntimeClass
+# The isolation class the 'isolated' class applies to every run. It is a RuntimeClass
 # name: the pod-shaped providers put it on the runtime pod, so the cluster must have
-# a RuntimeClass by this name (see install-gvisor).
+# a RuntimeClass by this name. The default, gvisor, is what install-gvisor provides on
+# kind. On a cluster with a different sandbox runtime, name its RuntimeClass instead,
+# e.g. ISOLATION_CLASS=kata-vm-isolation for AKS Pod Sandboxing (Kata).
 ISOLATION_CLASS ?= gvisor
+# Apply the 'isolated' (agent-sandbox) class with ISOLATION_CLASS as both its default
+# isolation and its advertised ISOLATION: capability, so the two cannot drift.
+APPLY_ISOLATED_CLASS = sed -e 's|^  defaultIsolationClass: gvisor$$|  defaultIsolationClass: $(ISOLATION_CLASS)|' \
+	-e 's|"ISOLATION:gvisor"|"ISOLATION:$(ISOLATION_CLASS)"|' $(SAMPLES)/agentproviderclass-agent-sandbox.yaml | $(KUBECTL) apply -f -
 # The local registry the durable substrate pulls actor images from (stood up by
 # install-agent-substrate). agent-substrate-enable builds the ateom-gvisor image here
 # and pins the durable class's ateomImage to the pushed digest.
@@ -380,7 +386,7 @@ providers: check-cluster ## wire default AgentProviderClasses for PROVIDERS=<nam
 		case "$$p" in \
 			k8s-job) $(KUBECTL) apply -f $(SAMPLES)/agentproviderclass-k8s-job.yaml;; \
 			agent-sandbox) $(KUBECTL) apply -f controller/config/rbac/agent-sandbox.yaml; \
-				$(KUBECTL) apply -f $(SAMPLES)/agentproviderclass-agent-sandbox.yaml; \
+				$(APPLY_ISOLATED_CLASS); \
 				$(KUBECTL) get runtimeclass $(ISOLATION_CLASS) >/dev/null 2>&1 || \
 					echo "  WARNING: no '$(ISOLATION_CLASS)' RuntimeClass yet — isolated runs fail at dispatch until: make install-gvisor KIND_CLUSTER=$(KIND_CLUSTER) (kind only; elsewhere install a '$(ISOLATION_CLASS)' RuntimeClass yourself)";; \
 			agent-substrate) $(KUBECTL) apply -f controller/config/rbac/agent-substrate.yaml; \
@@ -441,8 +447,8 @@ agent-sandbox-enable: ## grant the controller Sandbox RBAC + a sample class (nee
 		echo "  then re-run this target."; \
 		exit 1; }
 	$(KUBECTL) apply -f controller/config/rbac/agent-sandbox.yaml
-	$(KUBECTL) apply -f $(SAMPLES)/agentproviderclass-agent-sandbox.yaml
-	@# The class asks for gVisor isolation, which resolves to a pod RuntimeClass. If
+	$(APPLY_ISOLATED_CLASS)
+	@# The class asks for ISOLATION_CLASS isolation, which resolves to a pod RuntimeClass. If
 	@# the cluster has no such handler the provider fails every dispatch (by design —
 	@# it will not run unisolated under an isolated class), so say so up front.
 	@$(KUBECTL) get runtimeclass $(ISOLATION_CLASS) >/dev/null 2>&1 || { \

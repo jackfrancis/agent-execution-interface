@@ -72,9 +72,12 @@ make public-key KUBECONFIG=/path/to/kubeconfig
   `smoke`, `provider`, `install-agent-sandbox`, `agent-sandbox-enable`,
   `register-app`, `undeploy`). The kind-only ones (`dev-up`, `load`, `kind-up`,
   `install-gvisor`, `install-agent-substrate`, `agent-substrate-enable`) refuse it.
-- `k8s-job` needs no extra substrate. The `isolated` sample class asks for a
-  `gvisor` RuntimeClass, which `install-gvisor` only provides on kind; on another
-  cluster, install a RuntimeClass of that name yourself or use `k8s-job`.
+- `k8s-job` needs no extra substrate. The `isolated` class (`PROVIDERS=agent-sandbox`,
+  after `make install-agent-sandbox`) puts an isolation RuntimeClass on every run's
+  pod. It defaults to `gvisor`, which `install-gvisor` provides on kind only. On a
+  cluster with another sandbox runtime, name its RuntimeClass with
+  `ISOLATION_CLASS`, e.g. `ISOLATION_CLASS=kata-vm-isolation` for AKS Pod Sandboxing
+  (Kata), which needs a node pool created with `--workload-runtime KataVmIsolation`.
 
 ## Docs
 
