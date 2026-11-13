@@ -90,12 +90,16 @@ make create-aks AKS_DRY_RUN=1     # print the az commands, create nothing
 make create-aks                   # needs az (2.80.0+) logged in; shows the subscription first
 ```
 
+Before creating anything it checks that the subscription has the
+`Microsoft.ContainerService` and (for the registry) `Microsoft.ContainerRegistry`
+resource providers registered, and prints the command to register one that is not.
+
 It creates, or reuses if they exist:
 
 - a resource group and an AKS cluster with a small system pool and a user pool for
   agent runs with [Pod Sandboxing](https://learn.microsoft.com/azure/aks/use-pod-sandboxing)
   (`--workload-runtime KataVmIsolation`, Azure Linux, a nested-virtualization VM
-  size), which gives the cluster the `kata-vm-isolation` RuntimeClass;
+  size), the only nodes that pods with the `kata-vm-isolation` RuntimeClass run on;
 - an Azure Container Registry attached to the cluster, so nodes pull without pull
   secrets (`AKS_CREATE_ACR=false` skips it, `AKS_ATTACH_ACR=<registry>` attaches one
   you already have);

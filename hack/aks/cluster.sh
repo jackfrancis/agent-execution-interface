@@ -13,9 +13,10 @@
 # WHAT "satisfies AEI" means here: a cluster the controller can run on, a registry
 # its nodes can pull from, and a RuntimeClass for the 'isolated' provider class. On
 # AKS that RuntimeClass is 'kata-vm-isolation' (Pod Sandboxing: each pod in its own
-# Kata VM). AKS installs it once the cluster has a node pool created with
-# --workload-runtime KataVmIsolation, which needs the Azure Linux OS SKU and a
-# Generation 2 VM size with nested virtualization
+# Kata VM). AKS ships the RuntimeClass on every cluster, with a node selector of its
+# own, so its pods run only on nodes of a pool created with --workload-runtime
+# KataVmIsolation (and stay Pending if there is none). Such a pool needs the Azure
+# Linux OS SKU and a Generation 2 VM size with nested virtualization
 # (https://learn.microsoft.com/azure/aks/use-pod-sandboxing; its examples use the
 # Dsv3 series, the default here is the current Dsv7 series, which has both).
 #
@@ -31,8 +32,8 @@
 # through), with the defaults below. AKS_DRY_RUN=1 prints the Azure commands instead
 # of running them and assumes nothing exists yet, so it shows the full sequence.
 #
-# Requires: az (2.80.0+, or the aks-preview extension, for --workload-runtime) and
-# kubectl. Works under macOS's bash 3.2.
+# Requires: az 2.80.0 or later (for --workload-runtime) and kubectl. Works under
+# macOS's bash 3.2.
 set -o errexit -o nounset -o pipefail
 
 AKS_RESOURCE_GROUP="${AKS_RESOURCE_GROUP:-aei}"
@@ -131,16 +132,31 @@ preflight() {
 }
 
 # require_kata_flag: --workload-runtime moved from the aks-preview extension into
-# the core CLI in 2.80.0. Check the installed CLI rather than a version number, so
-# either route passes.
+# the core CLI in 2.80.0. The check is for the flag, not a version number. The
+# advice is to upgrade, not to add the extension: the extension tracks the newest
+# core CLI, and on an old one `az aks create` crashes inside it.
 require_kata_flag() {
 	local help
 	help="$(az aks nodepool add --help 2>/dev/null || true)"
 	case "${help}" in
 		*--workload-runtime*) return 0 ;;
 	esac
-	local msg="this az CLI has no 'az aks nodepool add --workload-runtime' (needed for the Kata pool). Upgrade to 2.80.0 or later ('az upgrade'), or: az extension add --name aks-preview"
+	local msg="this az CLI has no 'az aks nodepool add --workload-runtime' (needed for the Kata pool). Upgrade the Azure CLI to 2.80.0 or later ('az upgrade', or your package manager)."
 	if dry; then echo "WARNING: ${msg}"; else die "${msg}"; fi
+}
+
+# require_provider: a subscription must have a resource provider registered before
+# anything of that type can be created in it, and a subscription that has never held
+# a registry (or a cluster) has not. Registering is a one-time change to the
+# subscription, so it is left to its owner: this only checks, before anything is
+# created, and says what to run.
+require_provider() {
+	dry && return 0
+	local state
+	state="$(az provider show --subscription "${SUB}" --namespace "$1" --query registrationState -o tsv 2>/dev/null || true)"
+	[ "${state}" = Registered ] || die "subscription ${SUB} has not registered the $1 resource provider (state: ${state:-unknown}), which $2 needs. Register it once, then re-run:
+  az provider register --subscription ${SUB} --namespace $1 --wait${3:+
+$3}"
 }
 
 # default_acr_name: registry names are global across Azure, so derive one that is
@@ -182,9 +198,17 @@ create() {
 		acr_create=1
 	fi
 
+	require_provider Microsoft.ContainerService "an AKS cluster"
+	[ -z "${acr_create}" ] || require_provider Microsoft.ContainerRegistry "the container registry" \
+		"Or skip the registry (AKS_CREATE_ACR=false), or attach one you already have (AKS_ATTACH_ACR=<registry>)."
+
 	say "resource group '${AKS_RESOURCE_GROUP}' (${AKS_LOCATION})"
 	if group_exists; then
-		echo "    exists; reusing (delete-aks will not remove a group it did not create)"
+		if [ "$(group_tag)" = "${OWNER_TAG_VALUE}" ]; then
+			echo "    exists (created by create-aks); reusing"
+		else
+			echo "    exists; reusing. create-aks did not create it, so delete-aks will keep it."
+		fi
 	else
 		run az group create --subscription "${SUB}" --name "${AKS_RESOURCE_GROUP}" --location "${AKS_LOCATION}" \
 			--tags "${OWNER_TAG}" --output none
@@ -257,7 +281,7 @@ create() {
 	run mkdir -p "$(dirname "${AKS_KUBECONFIG}")"
 	run rm -f "${tmp}"
 	run az aks get-credentials --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" \
-		--file "${tmp}" --output none
+		--file "${tmp}" --only-show-errors --output none
 	run chmod 600 "${tmp}"
 	run mv -f "${tmp}" "${AKS_KUBECONFIG}"
 
@@ -347,7 +371,7 @@ next_steps() {
 	echo "  make public-key KUBECONFIG=${AKS_KUBECONFIG}"
 	echo
 	echo "The cluster bills while it exists. Remove it with:"
-	echo "  make delete-aks AKS_RESOURCE_GROUP=${AKS_RESOURCE_GROUP} AKS_CLUSTER=${AKS_CLUSTER} AKS_CONFIRM_DELETE=${AKS_RESOURCE_GROUP}"
+	echo "  make delete-aks AKS_SUBSCRIPTION=${SUB} AKS_RESOURCE_GROUP=${AKS_RESOURCE_GROUP} AKS_CLUSTER=${AKS_CLUSTER} AKS_CONFIRM_DELETE=${AKS_RESOURCE_GROUP}"
 }
 
 # delete removes only what carries the ownership tag. If `create` made the resource
