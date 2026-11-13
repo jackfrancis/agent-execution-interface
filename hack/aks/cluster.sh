@@ -15,8 +15,14 @@
 # AKS that RuntimeClass is 'kata-vm-isolation' (Pod Sandboxing: each pod in its own
 # Kata VM). AKS installs it once the cluster has a node pool created with
 # --workload-runtime KataVmIsolation, which needs the Azure Linux OS SKU and a
-# Generation 2 VM size with nested virtualization (the Dsv3 series, per
-# https://learn.microsoft.com/azure/aks/use-pod-sandboxing).
+# Generation 2 VM size with nested virtualization
+# (https://learn.microsoft.com/azure/aks/use-pod-sandboxing; its examples use the
+# Dsv3 series, the default here is the current Dsv7 series, which has both).
+#
+# The cluster keeps itself current, with the two channels AKS Automatic presets, on
+# an ordinary (Standard) cluster: Kubernetes upgrades on the 'stable' channel and
+# node OS images on the 'NodeImage' channel. The AKS Automatic SKU itself is not
+# used: it manages the node pools for you, which rules out choosing a Kata pool.
 #
 # So the cluster has two pools: a small system pool (controller, add-ons), and a
 # Kata pool for agent runs.
@@ -35,19 +41,27 @@ AKS_LOCATION="${AKS_LOCATION:-westus2}"
 # Subscription name or id. Empty means the az CLI's current default; either way the
 # resolved id is shown first and pinned on every command.
 AKS_SUBSCRIPTION="${AKS_SUBSCRIPTION:-}"
-# Empty leaves the version to AKS's default. Pod Sandboxing needs 1.27 or later.
+# The version to CREATE with; empty leaves it to AKS's default. Pod Sandboxing needs
+# 1.27 or later. It is a starting point, not a pin, unless the channel below is none.
 AKS_KUBERNETES_VERSION="${AKS_KUBERNETES_VERSION:-}"
+# Automatic upgrades, applied at creation and re-applied on every run.
+#   Kubernetes: stable (latest patch of minor N-1) | patch | rapid | node-image | none
+#   Node OS:    NodeImage (a fresh node image, about weekly) | SecurityPatch | Unmanaged | None
+# 'none' / 'None' turn them off. Upgrades reimage nodes, which ends any run on them;
+# an AKS planned-maintenance window (not set here) controls when.
+AKS_AUTO_UPGRADE_CHANNEL="${AKS_AUTO_UPGRADE_CHANNEL:-stable}"
+AKS_NODE_OS_UPGRADE_CHANNEL="${AKS_NODE_OS_UPGRADE_CHANNEL:-NodeImage}"
 
 # System pool: the AEI controller and cluster add-ons. No agent run needs to land here.
 AKS_SYSTEM_POOL="${AKS_SYSTEM_POOL:-system}"
 AKS_SYSTEM_NODE_COUNT="${AKS_SYSTEM_NODE_COUNT:-1}"
-AKS_SYSTEM_VM_SIZE="${AKS_SYSTEM_VM_SIZE:-Standard_D2s_v3}"
+AKS_SYSTEM_VM_SIZE="${AKS_SYSTEM_VM_SIZE:-Standard_D2s_v7}"
 
 # Kata pool: where isolated runs execute. The VM size must be Generation 2 with
 # nested virtualization. Pool names are at most 12 lowercase alphanumerics.
 AKS_KATA_POOL="${AKS_KATA_POOL:-kata}"
 AKS_KATA_NODE_COUNT="${AKS_KATA_NODE_COUNT:-2}"
-AKS_KATA_VM_SIZE="${AKS_KATA_VM_SIZE:-Standard_D4s_v3}"
+AKS_KATA_VM_SIZE="${AKS_KATA_VM_SIZE:-Standard_D4s_v7}"
 # The RuntimeClass AKS provides for Pod Sandboxing; passed to AEI as ISOLATION_CLASS.
 AKS_RUNTIME_CLASS="${AKS_RUNTIME_CLASS:-kata-vm-isolation}"
 
@@ -198,6 +212,8 @@ create() {
 			--location "${AKS_LOCATION}" ${version[@]+"${version[@]}"} \
 			--nodepool-name "${AKS_SYSTEM_POOL}" --node-count "${AKS_SYSTEM_NODE_COUNT}" \
 			--node-vm-size "${AKS_SYSTEM_VM_SIZE}" --os-sku AzureLinux \
+			--auto-upgrade-channel "${AKS_AUTO_UPGRADE_CHANNEL}" \
+			--node-os-upgrade-channel "${AKS_NODE_OS_UPGRADE_CHANNEL}" \
 			--enable-managed-identity --no-ssh-key --tags "${OWNER_TAG}" --output none
 	fi
 
@@ -218,18 +234,21 @@ create() {
 	esac
 
 	# The AKS docs call for an `az aks update` after adding a Kata pool, so the
-	# cluster reconciles and installs the RuntimeClass. Attaching the registry is an
-	# `az aks update` too, so one call does both. --attach-acr creates a role
+	# cluster reconciles and installs the RuntimeClass. Setting the upgrade channels
+	# (so a reused cluster gets them too) and attaching the registry are `az aks
+	# update` as well, so one call does all three. --attach-acr creates a role
 	# assignment, which needs Owner (or User Access Administrator) on the registry.
+	local attach=()
 	if [ -n "${acr}" ]; then
-		say "reconciling the cluster and attaching registry '${acr}'"
-		run az aks update --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" \
-			--attach-acr "${acr}" --output none
+		attach=(--attach-acr "${acr}")
+		say "reconciling the cluster: upgrade channels ${AKS_AUTO_UPGRADE_CHANNEL}/${AKS_NODE_OS_UPGRADE_CHANNEL}, registry '${acr}'"
 	else
-		say "reconciling the cluster (no registry: AKS_CREATE_ACR=${AKS_CREATE_ACR})"
-		run az aks update --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" \
-			--yes --output none
+		say "reconciling the cluster: upgrade channels ${AKS_AUTO_UPGRADE_CHANNEL}/${AKS_NODE_OS_UPGRADE_CHANNEL} (no registry: AKS_CREATE_ACR=${AKS_CREATE_ACR})"
 	fi
+	run az aks update --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" \
+		--auto-upgrade-channel "${AKS_AUTO_UPGRADE_CHANNEL}" \
+		--node-os-upgrade-channel "${AKS_NODE_OS_UPGRADE_CHANNEL}" \
+		${attach[@]+"${attach[@]}"} --output none
 
 	# Credentials go to a fresh temporary file that then replaces the target, so a
 	# stale or unrelated file at that path is never merged into.

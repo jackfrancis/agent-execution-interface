@@ -109,8 +109,13 @@ ISOLATION_CLASS=kata-vm-isolation`, `make public-key`.
 
 Names, location, node counts, VM sizes and the Kubernetes version are `AKS_*`
 variables, listed in [hack/aks/aks.mk](hack/aks/aks.mk). The defaults are one
-`Standard_D2s_v3` system node and two `Standard_D4s_v3` Kata nodes, which bill for as
+`Standard_D2s_v7` system node and two `Standard_D4s_v7` Kata nodes, which bill for as
 long as the cluster exists.
+
+The cluster upgrades itself: Kubernetes on the `stable` channel and node OS images on
+the `NodeImage` channel (`AKS_AUTO_UPGRADE_CHANNEL`, `AKS_NODE_OS_UPGRADE_CHANNEL`),
+the same channels AKS Automatic presets. An upgrade reimages nodes, which ends any
+run on them.
 
 `make delete-aks` prints what it would delete and stops; add
 `AKS_CONFIRM_DELETE=<resource group>` to carry it out. It deletes only what
