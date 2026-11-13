@@ -137,7 +137,12 @@ GVISOR_RELEASE ?= release/latest
 # a RuntimeClass by this name. The default, gvisor, is what install-gvisor provides on
 # kind. On a cluster with a different sandbox runtime, name its RuntimeClass instead,
 # e.g. ISOLATION_CLASS=kata-vm-isolation for AKS Pod Sandboxing (Kata).
-ISOLATION_CLASS ?= gvisor
+#
+# When it is not given, a cluster that already has the 'isolated' class keeps that
+# class's isolation, and only a cluster without one gets gvisor. Several targets
+# re-apply the class (agent-sandbox-enable, agent-sandbox-smoke, provider), and
+# without this a later run of one of them would quietly reset a Kata cluster to gvisor.
+ISOLATION_CLASS ?= $(or $(shell $(KUBECTL) get agentproviderclass isolated --request-timeout=5s -o jsonpath='{.spec.defaultIsolationClass}' 2>/dev/null),gvisor)
 # Apply the 'isolated' (agent-sandbox) class with ISOLATION_CLASS as both its default
 # isolation and its advertised ISOLATION: capability, so the two cannot drift.
 APPLY_ISOLATED_CLASS = sed -e 's|^  defaultIsolationClass: gvisor$$|  defaultIsolationClass: $(ISOLATION_CLASS)|' \
@@ -432,7 +437,7 @@ install-agent-sandbox: check-cluster ## install upstream agent-sandbox (core + e
 	@echo "waiting for the Sandbox CRD to be established..."
 	$(KUBECTL) wait --for=condition=established --timeout=60s crd/sandboxes.agents.x-k8s.io
 	@echo "agent-sandbox $(AGENT_SANDBOX_VERSION) installed on $(TARGET). Enable the AEI-side delta with:"
-	@echo "  make agent-sandbox-enable   (or wire a class via: PROVIDERS=agent-sandbox make dev-up)"
+	@echo "  make agent-sandbox-enable $(TARGET_ARG)   (or wire a class via PROVIDERS=agent-sandbox on make dev-up / make deploy)"
 
 # install-agent-substrate installs the UPSTREAM agent-substrate ("ate") FROM SOURCE
 # (it has no published manifest): it clones the repo, stands up the local image registry

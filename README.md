@@ -78,6 +78,8 @@ make public-key KUBECONFIG=/path/to/kubeconfig
   cluster with another sandbox runtime, name its RuntimeClass with
   `ISOLATION_CLASS`, e.g. `ISOLATION_CLASS=kata-vm-isolation` for AKS Pod Sandboxing
   (Kata), which needs a node pool created with `--workload-runtime KataVmIsolation`.
+  Once the class exists on a cluster, later targets that re-apply it keep its
+  isolation unless `ISOLATION_CLASS` is given again.
 
 ### Example: an AKS cluster
 
