@@ -43,6 +43,29 @@
 #
 # KIND_CLUSTER selects the target cluster (env var or make arg); it defaults to your
 # current kind context, else "aei".
+#
+# ANY OTHER CLUSTER (AKS, GKE, ... — what a CI job would run). Pass a kubeconfig file
+# on the command line and the same targets act on that cluster instead of kind:
+#     make push   IMG=<registry>/aei-manager:<tag> PLATFORM=linux/amd64
+#     make deploy KUBECONFIG=<file> IMG=<registry>/aei-manager:<tag> PROVIDERS=k8s-job
+#     make public-key KUBECONFIG=<file>          the verify key an app is configured with
+# `deploy` installs the CRDs + controller, provisions the signing authority, and wires
+# the PROVIDERS classes. AEI does not create, size or manage the cluster. The file's
+# current context is used unless KUBE_CONTEXT names another. The kind-only targets
+# (kind-up/down, load, dev-up, install-gvisor, install-agent-substrate,
+# agent-substrate-enable) refuse to run against a kubeconfig.
+#
+# AN EXAMPLE OF SUCH A CLUSTER: AKS. Not part of AEI or of the standard; a
+# convenience kept wholly in hack/aks/, as hack/kind/ is for the dev loop:
+#     make create-aks      create/reuse a resource group, an AKS cluster (a system
+#                          pool + a Kata pool for the 'isolated' class's
+#                          kata-vm-isolation RuntimeClass) and an attached container
+#                          registry; write a kubeconfig FILE; print the push/deploy
+#                          commands above with the values filled in.
+#     make delete-aks      delete what create-aks made (it asks for
+#                          AKS_CONFIRM_DELETE=<resource group> first).
+# AKS_* variables size and name everything, and AKS_DRY_RUN=1 prints the Azure
+# commands without running them; see hack/aks/aks.mk.
 
 IMG           ?= localhost/aei-manager:dev
 # Container engine for building the image: prefer docker, fall back to podman when
@@ -61,9 +84,24 @@ endif
 # falling back to "aei". Override explicitly with KIND_CLUSTER=<name>.
 CURRENT_KIND_CLUSTER := $(shell kubectl config current-context 2>/dev/null | sed -n 's/^kind-//p')
 KIND_CLUSTER  ?= $(if $(CURRENT_KIND_CLUSTER),$(CURRENT_KIND_CLUSTER),aei)
-# Every kubectl/kind command is pinned to that one cluster; check-cluster (a dep
+# A kubeconfig FILE passed on the make command line (KUBECONFIG=<file>) retargets every
+# kubectl command at that cluster instead of kind. Only the command line counts: a
+# KUBECONFIG merely exported in your shell leaves the kind default alone, so the dev
+# loop cannot wander onto another cluster. KUBE_CONTEXT picks a context within the
+# file; empty means the file's current context.
+KUBECONFIG_GIVEN := $(filter command line,$(origin KUBECONFIG))
+KUBE_CONTEXT  ?= $(if $(KUBECONFIG_GIVEN),,kind-$(KIND_CLUSTER))
+# Every kubectl command is pinned to that one cluster; check-cluster (a dep
 # of the install targets) validates it exists and echoes the resolved target.
-KUBECTL       ?= kubectl --context kind-$(KIND_CLUSTER)
+KUBECTL       ?= kubectl $(if $(KUBECONFIG_GIVEN),--kubeconfig $(abspath $(KUBECONFIG))) $(if $(KUBE_CONTEXT),--context $(KUBE_CONTEXT))
+# How messages name the target, and the argument that selects it again.
+TARGET        = $(if $(KUBECONFIG_GIVEN),the cluster in $(KUBECONFIG),kind cluster '$(KIND_CLUSTER)')
+TARGET_ARG    = $(if $(KUBECONFIG_GIVEN),KUBECONFIG=$(KUBECONFIG),KIND_CLUSTER=$(KIND_CLUSTER))
+# The platform `make image` builds for (e.g. linux/amd64 for a cloud cluster built from
+# an arm64 laptop). Empty builds for the engine's own platform, which is what kind runs.
+PLATFORM      ?=
+# Render the full install with the manager image set to IMG, and apply it.
+APPLY_INSTALL = $(KUBECTL) kustomize controller/config/default | sed 's|image: localhost/aei-manager:dev$$|image: $(IMG)|' | $(KUBECTL) apply -f -
 
 # The sample run the smoke test (re)creates.
 SAMPLE_NS     ?= default
@@ -94,10 +132,21 @@ AGENT_SUBSTRATE_REF ?= main
 # storage.googleapis.com/gvisor/releases/ — "release/latest", or a dated pin like
 # release/20260101.
 GVISOR_RELEASE ?= release/latest
-# The isolation class the 'isolated' sample class asks for. It is a RuntimeClass
+# The isolation class the 'isolated' class applies to every run. It is a RuntimeClass
 # name: the pod-shaped providers put it on the runtime pod, so the cluster must have
-# a RuntimeClass by this name (see install-gvisor).
-ISOLATION_CLASS ?= gvisor
+# a RuntimeClass by this name. The default, gvisor, is what install-gvisor provides on
+# kind. On a cluster with a different sandbox runtime, name its RuntimeClass instead,
+# e.g. ISOLATION_CLASS=kata-vm-isolation for AKS Pod Sandboxing (Kata).
+#
+# When it is not given, a cluster that already has the 'isolated' class keeps that
+# class's isolation, and only a cluster without one gets gvisor. Several targets
+# re-apply the class (agent-sandbox-enable, agent-sandbox-smoke, provider), and
+# without this a later run of one of them would quietly reset a Kata cluster to gvisor.
+ISOLATION_CLASS ?= $(or $(shell $(KUBECTL) get agentproviderclass isolated --request-timeout=5s -o jsonpath='{.spec.defaultIsolationClass}' 2>/dev/null),gvisor)
+# Apply the 'isolated' (agent-sandbox) class with ISOLATION_CLASS as both its default
+# isolation and its advertised ISOLATION: capability, so the two cannot drift.
+APPLY_ISOLATED_CLASS = sed -e 's|^  defaultIsolationClass: gvisor$$|  defaultIsolationClass: $(ISOLATION_CLASS)|' \
+	-e 's|"ISOLATION:gvisor"|"ISOLATION:$(ISOLATION_CLASS)"|' $(SAMPLES)/agentproviderclass-agent-sandbox.yaml | $(KUBECTL) apply -f -
 # The local registry the durable substrate pulls actor images from (stood up by
 # install-agent-substrate). agent-substrate-enable builds the ateom-gvisor image here
 # and pins the durable class's ateomImage to the pushed digest.
@@ -129,8 +178,17 @@ help: ## list targets
 
 ## ── cluster lifecycle ─────────────────────────────────────────────────────────
 
+# Targets that only make sense on kind (they create the cluster, load images into its
+# nodes, or exec into them) depend on this, so they fail clearly against a kubeconfig.
+.PHONY: require-kind
+require-kind:
+	@[ -z "$(KUBECONFIG_GIVEN)" ] || { \
+		echo "ERROR: '$(MAKECMDGOALS)' includes a kind-only step, but KUBECONFIG=$(KUBECONFIG) targets another cluster."; \
+		echo "       On a non-kind cluster: push the image (make push IMG=...), then make deploy KUBECONFIG=... IMG=..."; \
+		exit 1; }
+
 .PHONY: kind-up
-kind-up: ## create the kind cluster if missing (reuses an existing one); KIND_CONFIG=<file> customizes creation
+kind-up: require-kind ## create the kind cluster if missing (reuses an existing one); KIND_CONFIG=<file> customizes creation
 	@if $(KIND) get clusters 2>/dev/null | grep -qx $(KIND_CLUSTER); then \
 		echo "reusing existing kind cluster '$(KIND_CLUSTER)'"; \
 	else \
@@ -152,11 +210,19 @@ kind-up: ## create the kind cluster if missing (reuses an existing one); KIND_CO
 	@$(KUBECTL) cluster-info >/dev/null && echo "kind cluster '$(KIND_CLUSTER)' ready"
 
 .PHONY: kind-down
-kind-down: ## delete the kind cluster
+kind-down: require-kind ## delete the kind cluster
 	$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 .PHONY: check-cluster
-check-cluster: ## verify the target kind cluster/context exists (echoes the resolved target)
+check-cluster: ## verify the target cluster is reachable (echoes the resolved target)
+ifneq ($(KUBECONFIG_GIVEN),)
+	@[ -f "$(abspath $(KUBECONFIG))" ] || { echo "ERROR: kubeconfig not found: $(abspath $(KUBECONFIG))"; exit 1; }
+	@$(KUBECTL) get --raw /version >/dev/null 2>&1 || { \
+		echo "ERROR: cannot reach the cluster in $(KUBECONFIG)$(if $(KUBE_CONTEXT), (context $(KUBE_CONTEXT)))."; \
+		echo "contexts in that file:"; $(KUBECTL) config get-contexts -o name 2>/dev/null | sed 's/^/  - /'; \
+		exit 1; }
+	@echo "→ targeting context '$$($(KUBECTL) config view --minify -o jsonpath='{.current-context}')' at $$($(KUBECTL) config view --minify -o jsonpath='{.clusters[0].cluster.server}') ($(KUBECONFIG))"
+else
 	@kubectl config get-contexts -o name 2>/dev/null | grep -qx kind-$(KIND_CLUSTER) || { \
 		echo "ERROR: kube context 'kind-$(KIND_CLUSTER)' not found — AEI would install nowhere."; \
 		kubectl config current-context >/dev/null 2>&1 || \
@@ -165,33 +231,56 @@ check-cluster: ## verify the target kind cluster/context exists (echoes the reso
 		kubectl config get-contexts -o name 2>/dev/null | sed -n 's/^kind-/  - /p' | grep . || \
 			echo "  (none — create one with: make up KIND_CLUSTER=<name>)"; \
 		echo "Then: make <target> KIND_CLUSTER=<name>  (or first: kubectl config use-context kind-<name>)"; \
+		echo "For a non-kind cluster: make <target> KUBECONFIG=<file>"; \
 		exit 1; }
 	@echo "→ targeting kind cluster '$(KIND_CLUSTER)' (context kind-$(KIND_CLUSTER))"
+endif
+
+# An example non-kind cluster (create-aks, delete-aks). Everything Azure-specific is
+# in hack/aks/.
+include hack/aks/aks.mk
 
 ## ── build & deploy ────────────────────────────────────────────────────────────
 
 .PHONY: image
-image: ## build the manager image (context = repo root)
-	$(MAKE) -C controller docker-build IMG=$(IMG) ENGINE=$(ENGINE)
+image: ## build the manager image (context = repo root); PLATFORM=linux/amd64 cross-builds
+	$(MAKE) -C controller docker-build IMG=$(IMG) ENGINE=$(ENGINE) PLATFORM=$(PLATFORM)
+
+# A non-kind cluster pulls the manager from a registry, so the image needs a registry
+# name and the nodes' platform. The dev default (localhost/...) is not pushable.
+.PHONY: push
+push: ## build + push the manager image: IMG=<registry>/aei-manager:<tag> [PLATFORM=linux/amd64]
+	@case "$(IMG)" in localhost/*) \
+		echo "ERROR: IMG=$(IMG) is the kind dev tag. Set IMG=<registry>/aei-manager:<tag>."; exit 1;; esac
+	$(MAKE) image IMG=$(IMG) PLATFORM=$(PLATFORM)
+	$(ENGINE) push $(IMG)
 
 .PHONY: load
-load: check-cluster ## load the manager image into the kind cluster
+load: require-kind check-cluster ## load the manager image into the kind cluster
 	$(MAKE) -C controller kind-load IMG=$(IMG) ENGINE=$(ENGINE) KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER)
 
 .PHONY: install
 install: check-cluster ## install just the CRDs
 	$(KUBECTL) apply -k controller/config/crd
 
-# deploy only applies manifests — it does NOT build or load the manager image.
-# The image must already be loaded into the cluster (make load / make up), or the
-# pod will ImagePullBackOff trying to pull the local image name from a registry.
+# deploy brings AEI up on a cluster that already exists: it applies the CRDs, RBAC and
+# the manager (with its image set to IMG), provisions the signing authority, and wires
+# the PROVIDERS classes. It does NOT build, push or load the image: on kind it must
+# already be loaded (make load / make dev-up); on any other cluster IMG must be pullable
+# from a registry (make push). It is the whole install for a non-kind cluster:
+#     make deploy KUBECONFIG=<file> IMG=<registry>/aei-manager:<tag> PROVIDERS=k8s-job
+# Use a new tag per build: the pod only re-pulls when the image reference changes.
 .PHONY: deploy
-deploy: check-cluster ## install CRDs + RBAC + the manager (Deployment/Service/Secret)
-	$(MAKE) -C controller deploy KUBECTL="$(KUBECTL)"
-	@$(KUBECTL) -n aei-system rollout status deploy/aei-controller --timeout=120s || { \
-		echo; echo "controller not ready. If its pod is ImagePullBackOff, the image is not"; \
-		echo "loaded into cluster '$(KIND_CLUSTER)' — run: make load KIND_CLUSTER=$(KIND_CLUSTER)"; \
+deploy: check-cluster ## install CRDs + RBAC + the manager at IMG, provision the authority, wire PROVIDERS
+	$(APPLY_INSTALL)
+	@$(KUBECTL) -n aei-system rollout status deploy/aei-controller --timeout=180s || { \
+		echo; echo "controller not ready — check: $(KUBECTL) -n aei-system get pods"; \
+		echo "If its pod is ImagePullBackOff, the image '$(IMG)' is not available to $(TARGET):"; \
+		echo "  kind: make load $(TARGET_ARG)      other clusters: make push IMG=<registry>/aei-manager:<tag>"; \
 		exit 1; }
+	$(MAKE) authority
+	@[ -z "$(PROVIDERS)" ] || $(MAKE) providers PROVIDERS="$(PROVIDERS)"
+	@echo "AEI is up on $(TARGET). App devs: 'make public-key $(TARGET_ARG)', then register + smoke."
 
 .PHONY: undeploy
 undeploy: ## remove the operator (leaves the cluster running)
@@ -208,8 +297,8 @@ undeploy: ## remove the operator (leaves the cluster running)
 # down deletes the whole cluster.
 
 .PHONY: dev-up
-dev-up: kind-up image load ## create the cluster if needed, build+load+deploy AEI, and provision the signing authority
-	$(MAKE) -C controller deploy KUBECTL="$(KUBECTL)"
+dev-up: require-kind kind-up image load ## create the cluster if needed, build+load+deploy AEI, and provision the signing authority
+	$(APPLY_INSTALL)
 	@echo "rolling the controller to pick up the freshly loaded image..."
 	@$(KUBECTL) -n aei-system rollout restart deploy/aei-controller
 	@$(KUBECTL) -n aei-system rollout status deploy/aei-controller --timeout=120s || { \
@@ -267,7 +356,7 @@ samples: ## apply the default (generic) k8s-job provider class — an admin subs
 .PHONY: register-app
 register-app: install samples ## register an app: apply its AgentApp (its own runtime image + scopes)
 	$(KUBECTL) -n $(APP_NS) apply -f $(SAMPLES)/agentapp.yaml
-	@echo "registered app in namespace '$(APP_NS)' on '$(KIND_CLUSTER)'."
+	@echo "registered app in namespace '$(APP_NS)' on $(TARGET)."
 	@echo "Serve dispatch with a running control plane (make dev-up); for a verify-only"
 	@echo "app, provision the authority (make authority) and share it (make public-key)."
 
@@ -318,9 +407,9 @@ providers: check-cluster ## wire default AgentProviderClasses for PROVIDERS=<nam
 		case "$$p" in \
 			k8s-job) $(KUBECTL) apply -f $(SAMPLES)/agentproviderclass-k8s-job.yaml;; \
 			agent-sandbox) $(KUBECTL) apply -f controller/config/rbac/agent-sandbox.yaml; \
-				$(KUBECTL) apply -f $(SAMPLES)/agentproviderclass-agent-sandbox.yaml; \
+				$(APPLY_ISOLATED_CLASS); \
 				$(KUBECTL) get runtimeclass $(ISOLATION_CLASS) >/dev/null 2>&1 || \
-					echo "  WARNING: no '$(ISOLATION_CLASS)' RuntimeClass yet — isolated runs fail at dispatch until: make install-gvisor KIND_CLUSTER=$(KIND_CLUSTER)";; \
+					echo "  WARNING: no '$(ISOLATION_CLASS)' RuntimeClass yet — isolated runs fail at dispatch until: make install-gvisor KIND_CLUSTER=$(KIND_CLUSTER) (kind only; elsewhere install a '$(ISOLATION_CLASS)' RuntimeClass yourself)";; \
 			agent-substrate) $(KUBECTL) apply -f controller/config/rbac/agent-substrate.yaml; \
 				$(KUBECTL) apply -f $(SAMPLES)/agentproviderclass-agent-substrate.yaml; \
 				$(MAKE) durable-class-hints KIND_CLUSTER=$(KIND_CLUSTER);; \
@@ -343,12 +432,12 @@ provider: ## install ONE provider's default class: PROVIDER=<k8s-job|agent-sandb
 
 .PHONY: install-agent-sandbox
 install-agent-sandbox: check-cluster ## install upstream agent-sandbox (core + extensions) at AGENT_SANDBOX_VERSION
-	@echo "installing agent-sandbox $(AGENT_SANDBOX_VERSION) (core + extensions) on '$(KIND_CLUSTER)'..."
+	@echo "installing agent-sandbox $(AGENT_SANDBOX_VERSION) (core + extensions) on $(TARGET)..."
 	$(KUBECTL) apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$(AGENT_SANDBOX_VERSION)/sandbox-with-extensions.yaml
 	@echo "waiting for the Sandbox CRD to be established..."
 	$(KUBECTL) wait --for=condition=established --timeout=60s crd/sandboxes.agents.x-k8s.io
-	@echo "agent-sandbox $(AGENT_SANDBOX_VERSION) installed on '$(KIND_CLUSTER)'. Enable the AEI-side delta with:"
-	@echo "  make agent-sandbox-enable   (or wire a class via: PROVIDERS=agent-sandbox make dev-up)"
+	@echo "agent-sandbox $(AGENT_SANDBOX_VERSION) installed on $(TARGET). Enable the AEI-side delta with:"
+	@echo "  make agent-sandbox-enable $(TARGET_ARG)   (or wire a class via PROVIDERS=agent-sandbox on make dev-up / make deploy)"
 
 # install-agent-substrate installs the UPSTREAM agent-substrate ("ate") FROM SOURCE
 # (it has no published manifest): it clones the repo, stands up the local image registry
@@ -357,7 +446,7 @@ install-agent-sandbox: check-cluster ## install upstream agent-sandbox (core + e
 # hack/install-agent-substrate.sh. Then `make agent-substrate-enable` applies the
 # AEI-side 'durable' class.
 .PHONY: install-agent-substrate
-install-agent-substrate: check-cluster ## clone+build+install upstream agent-substrate (ate) from source (git+go+engine; AGENT_SUBSTRATE_REF=main)
+install-agent-substrate: require-kind check-cluster ## clone+build+install upstream agent-substrate (ate) from source (git+go+engine; AGENT_SUBSTRATE_REF=main)
 	AGENT_SUBSTRATE_REF="$(AGENT_SUBSTRATE_REF)" KIND_CLUSTER="$(KIND_CLUSTER)" KIND="$(KIND)" ENGINE="$(ENGINE)" hack/install-agent-substrate.sh
 
 # install-gvisor makes `defaultIsolationClass: gvisor` real on kind. AEI resolves a
@@ -367,7 +456,7 @@ install-agent-substrate: check-cluster ## clone+build+install upstream agent-sub
 # running cluster (no recreation) and is idempotent. Agent Substrate's own gVisor does
 # NOT satisfy this: it is not registered as a containerd runtime handler.
 .PHONY: install-gvisor
-install-gvisor: check-cluster ## install runsc on every node + the gvisor RuntimeClass (needed by defaultIsolationClass: gvisor)
+install-gvisor: require-kind check-cluster ## install runsc on every node + the gvisor RuntimeClass (needed by defaultIsolationClass: gvisor)
 	KIND_CLUSTER="$(KIND_CLUSTER)" KIND="$(KIND)" ENGINE="$(ENGINE)" GVISOR_RELEASE="$(GVISOR_RELEASE)" hack/install-gvisor.sh
 
 .PHONY: agent-sandbox-enable
@@ -379,8 +468,8 @@ agent-sandbox-enable: ## grant the controller Sandbox RBAC + a sample class (nee
 		echo "  then re-run this target."; \
 		exit 1; }
 	$(KUBECTL) apply -f controller/config/rbac/agent-sandbox.yaml
-	$(KUBECTL) apply -f $(SAMPLES)/agentproviderclass-agent-sandbox.yaml
-	@# The class asks for gVisor isolation, which resolves to a pod RuntimeClass. If
+	$(APPLY_ISOLATED_CLASS)
+	@# The class asks for ISOLATION_CLASS isolation, which resolves to a pod RuntimeClass. If
 	@# the cluster has no such handler the provider fails every dispatch (by design —
 	@# it will not run unisolated under an isolated class), so say so up front.
 	@$(KUBECTL) get runtimeclass $(ISOLATION_CLASS) >/dev/null 2>&1 || { \
@@ -391,7 +480,7 @@ agent-sandbox-enable: ## grant the controller Sandbox RBAC + a sample class (nee
 	@echo "running controller picks up the new Sandbox permission with no restart."
 
 .PHONY: agent-substrate-enable
-agent-substrate-enable: ## make durable ready: RBAC, namespace, registry route, ateom image + a CONFIGURED durable class (needs upstream ate)
+agent-substrate-enable: require-kind ## make durable ready: RBAC, namespace, registry route, ateom image + a CONFIGURED durable class (needs upstream ate)
 	@$(KUBECTL) get svc -n ate-system atenet-router >/dev/null 2>&1 || { \
 		echo "ERROR: atenet-router not found in namespace ate-system."; \
 		echo "Install the substrate first: make install-agent-substrate KIND_CLUSTER=$(KIND_CLUSTER)"; \

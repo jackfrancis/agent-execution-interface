@@ -40,6 +40,98 @@ Go **runtime** SDK. **[docs/hello-world.md](docs/hello-world.md) is what
 this looks like in practice** — "Hello, World!" as an agentic run in both Go and
 Python, operationalized over agent-sandbox and Agent Substrate.
 
+## Install
+
+`make help` lists every target. There are two ways in.
+
+**kind (the dev loop).** `make dev-up` creates or reuses a kind cluster, builds and
+loads the controller image, installs the CRDs and controller, and provisions the
+signing authority. Add `PROVIDERS=agent-sandbox` (and `make install-agent-sandbox`,
+`make install-gvisor`) for the isolated class.
+
+**Any other cluster (AKS, GKE, …).** AEI does not create or manage the cluster; give
+it a kubeconfig file. This is what a CI job would run:
+
+```sh
+# 1. Build for the nodes' platform and push to a registry the cluster can pull from.
+make push IMG=<registry>/aei-manager:<tag> PLATFORM=linux/amd64
+
+# 2. Install the CRDs + controller, provision the signing authority, wire a class.
+make deploy KUBECONFIG=/path/to/kubeconfig IMG=<registry>/aei-manager:<tag> PROVIDERS=k8s-job
+
+# 3. The public key an app verifies run credentials with.
+make public-key KUBECONFIG=/path/to/kubeconfig
+```
+
+- `KUBECONFIG` must be passed on the make command line. One that is only exported
+  in your shell is ignored, so the dev loop keeps targeting kind. The file's
+  current context is used unless `KUBE_CONTEXT=<name>` picks another.
+- Use a new image tag per build: the controller pod re-pulls only when the image
+  reference changes.
+- The same flag works on the other cluster-agnostic targets (`status`, `logs`,
+  `smoke`, `provider`, `install-agent-sandbox`, `agent-sandbox-enable`,
+  `register-app`, `undeploy`). The kind-only ones (`dev-up`, `load`, `kind-up`,
+  `install-gvisor`, `install-agent-substrate`, `agent-substrate-enable`) refuse it.
+- `k8s-job` needs no extra substrate. The `isolated` class (`PROVIDERS=agent-sandbox`,
+  after `make install-agent-sandbox`) puts an isolation RuntimeClass on every run's
+  pod. It defaults to `gvisor`, which `install-gvisor` provides on kind only. On a
+  cluster with another sandbox runtime, name its RuntimeClass with
+  `ISOLATION_CLASS`, e.g. `ISOLATION_CLASS=kata-vm-isolation` for AKS Pod Sandboxing
+  (Kata), which needs a node pool created with `--workload-runtime KataVmIsolation`.
+  Once the class exists on a cluster, later targets that re-apply it keep its
+  isolation unless `ISOLATION_CLASS` is given again.
+
+### Example: an AKS cluster
+
+AEI does not need AKS and does not manage clusters. `make create-aks` is a
+convenience for getting one that satisfies AEI, the way `make kind-up` is for the dev
+loop; everything Azure-specific is in [hack/aks/](hack/aks/).
+
+```sh
+make create-aks AKS_DRY_RUN=1     # print the az commands, create nothing
+make create-aks                   # needs az (2.80.0+) logged in; shows the subscription first
+```
+
+Before creating anything it checks that the subscription has the
+`Microsoft.ContainerService` and (for the registry) `Microsoft.ContainerRegistry`
+resource providers registered, and prints the command to register one that is not.
+
+It creates, or reuses if they exist:
+
+- a resource group and an AKS cluster with a small system pool and a user pool for
+  agent runs with [Pod Sandboxing](https://learn.microsoft.com/azure/aks/use-pod-sandboxing)
+  (`--workload-runtime KataVmIsolation`, Azure Linux, a nested-virtualization VM
+  size), the only nodes that pods with the `kata-vm-isolation` RuntimeClass run on;
+- an Azure Container Registry attached to the cluster, so nodes pull without pull
+  secrets (`AKS_CREATE_ACR=false` skips it, `AKS_ATTACH_ACR=<registry>` attaches one
+  you already have);
+- a kubeconfig file of its own (`AKS_KUBECONFIG`, default
+  `~/.kube/aei-aks-<cluster>.kubeconfig`). Your default kubeconfig is not touched.
+
+It then checks that a pod naming only the RuntimeClass runs on the Kata pool, and
+prints the install commands from above with the registry and kubeconfig filled in:
+`make push`, `make install-agent-sandbox`, `make deploy ... PROVIDERS=agent-sandbox
+ISOLATION_CLASS=kata-vm-isolation`, `make public-key`.
+
+Names, location, node counts, VM sizes and the Kubernetes version are `AKS_*`
+variables, listed in [hack/aks/aks.mk](hack/aks/aks.mk). The defaults are one
+`Standard_D2s_v7` system node and two `Standard_D4s_v7` Kata nodes, which bill for as
+long as the cluster exists.
+
+The cluster upgrades itself: Kubernetes on the `stable` channel and node OS images on
+the `NodeImage` channel (`AKS_AUTO_UPGRADE_CHANNEL`, `AKS_NODE_OS_UPGRADE_CHANNEL`),
+the same channels AKS Automatic presets. An upgrade reimages nodes, which ends any
+run on them.
+
+`make delete-aks` prints what it would delete and stops; add
+`AKS_CONFIRM_DELETE=<resource group>` to carry it out. It deletes only what
+`create-aks` created (marked with an `aei-created-by` tag): the whole resource group
+if `create-aks` made it, otherwise just the cluster and registry it added to your
+existing group.
+
+A Kata pod with no memory limit runs in a 512Mi VM with one vCPU. AEI's runtime pods
+set no limits today, so that is what each isolated run gets on this cluster.
+
 ## Docs
 
 - [docs/hello-world.md](docs/hello-world.md) — **start here**: a Go + Python "Hello, World!" agent, end to end
