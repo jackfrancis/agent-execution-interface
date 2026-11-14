@@ -167,4 +167,3 @@ func TestCheckIsolation(t *testing.T) {
 		t.Errorf("a class configured for microvm should satisfy microvm: %v", err)
 	}
 }
-
