@@ -114,7 +114,8 @@ It creates, or reuses if they exist:
 - a kubeconfig file of its own (`AKS_KUBECONFIG`, default
   `~/.kube/aei-aks-<cluster>.kubeconfig`). Your default kubeconfig is not touched.
 
-It then checks that a pod naming only the RuntimeClass runs on the Kata pool, and
+It then checks that a pod shaped like AEI's runtime pods (the RuntimeClass plus a
+toleration for the Kata pool's taint, nothing else) runs on the Kata pool, and
 prints the install commands from above with the registry and kubeconfig filled in:
 `make push`, `make install-agent-sandbox`, `make deploy ... PROVIDERS=agent-sandbox
 ISOLATION_CLASS=kata-vm-isolation RUNTIME_TOLERATIONS=...`, `make public-key`.

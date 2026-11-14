@@ -310,7 +310,7 @@ create() {
 	fi
 	local taint=()
 	[ -z "${AKS_KATA_TAINT}" ] || taint=(--node-taints "${AKS_KATA_TAINT}")
-	say "Kata pool '${AKS_KATA_POOL}' = ${sizing} (KataVmIsolation, AzureLinux), taint '${AKS_KATA_TAINT:-none}'"
+	say "Kata pool '${AKS_KATA_POOL}'"
 	local pool_runtime=""
 	dry || pool_runtime="$(az aks nodepool show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" --cluster-name "${AKS_CLUSTER}" \
 		-n "${AKS_KATA_POOL}" --query workloadRuntime -o tsv 2>/dev/null || true)"
@@ -326,6 +326,8 @@ create() {
 				--cluster-name "${AKS_CLUSTER}" -n "${AKS_KATA_POOL}" -o tsv \
 				--query "join('', ['count=', to_string(count), ', autoscaling=', to_string(enableAutoScaling), ', min=', to_string(minCount), ', max=', to_string(maxCount)])" 2>/dev/null || true), taints=${POOL_TAINTS:-none}" ;;
 		"")
+			# The requested settings are shown only here: a reused pool keeps its own.
+			echo "    creating: ${sizing} (KataVmIsolation, AzureLinux), taint '${AKS_KATA_TAINT:-none}'"
 			run az aks nodepool add --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" \
 				--cluster-name "${AKS_CLUSTER}" --name "${AKS_KATA_POOL}" --mode User \
 				--node-count "${AKS_KATA_NODE_COUNT}" ${scaling[@]+"${scaling[@]}"} \
