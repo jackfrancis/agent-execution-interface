@@ -6,7 +6,9 @@
 # The script holds their defaults and documents each one. The common ones:
 #     AKS_RESOURCE_GROUP=aei  AKS_CLUSTER=aei  AKS_LOCATION=westus2  AKS_SUBSCRIPTION=
 #     AKS_SYSTEM_NODE_COUNT=1 AKS_SYSTEM_VM_SIZE=Standard_D2s_v7
-#     AKS_KATA_NODE_COUNT=2   AKS_KATA_VM_SIZE=Standard_D4s_v7
+#     AKS_KATA_NODE_COUNT=1   AKS_KATA_VM_SIZE=Standard_D4s_v7
+#     AKS_KATA_MIN_COUNT=1    AKS_KATA_MAX_COUNT=3   the Kata pool's autoscaling range
+#     AKS_KATA_AUTOSCALE=true           (false: a fixed pool of AKS_KATA_NODE_COUNT)
 #     AKS_KUBERNETES_VERSION=           (empty: the AKS default; a starting point)
 #     AKS_AUTO_UPGRADE_CHANNEL=stable   AKS_NODE_OS_UPGRADE_CHANNEL=NodeImage
 #                                       automatic Kubernetes / node OS image upgrades

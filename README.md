@@ -115,8 +115,20 @@ ISOLATION_CLASS=kata-vm-isolation`, `make public-key`.
 
 Names, location, node counts, VM sizes and the Kubernetes version are `AKS_*`
 variables, listed in [hack/aks/aks.mk](hack/aks/aks.mk). The defaults are one
-`Standard_D2s_v7` system node and two `Standard_D4s_v7` Kata nodes, which bill for as
+`Standard_D2s_v7` system node and one `Standard_D4s_v7` Kata node, which bill for as
 long as the cluster exists.
+
+The Kata pool autoscales between one and three nodes (`AKS_KATA_MIN_COUNT`,
+`AKS_KATA_MAX_COUNT`; `AKS_KATA_AUTOSCALE=false` for a fixed pool). A node is added
+when a run's pod cannot be scheduled. AEI's runtime pods set no resource requests,
+so the scheduler counts only the RuntimeClass's 600Mi of memory per run: a node takes
+about 18 runs before the next one waits for a new node, and CPU is not counted. The
+settings apply when the pool is created; an existing pool is reused as it is.
+
+Scale-in does not evict a running run's pod. With `AKS_KATA_MIN_COUNT=0` the pool
+empties when nothing runs and a node returns for the next run in about two minutes,
+but only if the other pods on it (the AEI controller, your app) can move to the system
+pool; nothing keeps them off the Kata pool, so the default minimum is 1.
 
 The cluster upgrades itself: Kubernetes on the `stable` channel and node OS images on
 the `NodeImage` channel (`AKS_AUTO_UPGRADE_CHANNEL`, `AKS_NODE_OS_UPGRADE_CHANNEL`),
