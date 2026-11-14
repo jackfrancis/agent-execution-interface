@@ -136,7 +136,7 @@ AGENT_SANDBOX_VERSION ?= v1.0.11
 AGENT_SUBSTRATE_REF ?= main
 # The gVisor release `make install-gvisor` puts on the nodes, as it appears under
 # storage.googleapis.com/gvisor/releases/ — "release/latest", or a dated pin like
-# release/20260101.
+# release/20261109 (20260721 or later: the first release published as a tarball).
 GVISOR_RELEASE ?= release/latest
 # The isolation class the 'isolated' class applies to every run. It is a RuntimeClass
 # name: the pod-shaped providers put it on the runtime pod, so the cluster must have

@@ -13,27 +13,30 @@
 # from its ateom worker; it is not registered as a containerd runtime handler, so it
 # does nothing for the agent-sandbox or k8s-job providers.
 #
-# Per node it: installs runsc + containerd-shim-runsc-v1, appends a runsc runtime to
-# containerd's config (matching that node's config schema version), and restarts
-# containerd. Then it applies the RuntimeClass. Idempotent — safe to re-run, and it
-# works on an already-running cluster (no recreation needed).
+# Per node it: installs runsc + containerd-shim-runsc-v1 (and the gvisor-bin/ sidecars
+# runsc runs), appends a runsc runtime to containerd's config (matching that node's
+# config schema version), and restarts containerd. Then it applies the RuntimeClass.
+# Idempotent — safe to re-run, and it works on an already-running cluster (no
+# recreation needed).
 #
-# Requires: curl, an engine (docker/podman), kind, kubectl. Downloads binaries from
-# storage.googleapis.com/gvisor and verifies their published SHA-512.
+# Requires: curl, tar (with bzip2), an engine (docker/podman), kind, kubectl. Downloads
+# the release tarball from storage.googleapis.com/gvisor and verifies its published
+# SHA-512.
 set -o errexit -o nounset -o pipefail
 
 KIND_CLUSTER="${KIND_CLUSTER:-aei}"
 KIND="${KIND:-kind}"
 ENGINE="${ENGINE:-$(command -v docker >/dev/null 2>&1 && echo docker || echo podman)}"
 # A gVisor release point, as it appears under storage.googleapis.com/gvisor/releases/:
-# "release/latest", or a dated pin like "release/20260101".
+# "release/latest", or a dated pin like "release/20261109". It must be 20260721 or
+# later: that is the first release published as a tarball, which is what this installs.
 GVISOR_RELEASE="${GVISOR_RELEASE:-release/latest}"
 RUNTIME_CLASS="${RUNTIME_CLASS:-gvisor}"
 CTX="kind-${KIND_CLUSTER}"
 
 echo "==> gvisor: release=${GVISOR_RELEASE} cluster=${KIND_CLUSTER} engine=${ENGINE}"
 
-for t in curl "${ENGINE}" "${KIND}" kubectl; do
+for t in curl tar "${ENGINE}" "${KIND}" kubectl; do
 	command -v "${t}" >/dev/null 2>&1 || { echo "ERROR: required tool not found: ${t}"; exit 1; }
 done
 
@@ -52,24 +55,41 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 URL="https://storage.googleapis.com/gvisor/releases/${GVISOR_RELEASE}/${NODE_ARCH}"
 
-echo "==> downloading runsc + containerd-shim-runsc-v1 (${NODE_ARCH})"
+# gVisor publishes one tarball per architecture: runsc, containerd-shim-runsc-v1, and
+# a gvisor-bin/ directory of sidecar binaries that runsc looks for next to itself. The
+# bare runsc and shim binaries are no longer published (the last release with them is
+# 20260817). The .tar.bz2 is used, not the .tar.zstd, because macOS's tar reads bzip2
+# without extra tools.
+echo "==> downloading gvisor.tar.bz2 (${NODE_ARCH})"
 (
 	cd "${WORK}"
-	curl -fsSL -O "${URL}/runsc" -O "${URL}/runsc.sha512" \
-		-O "${URL}/containerd-shim-runsc-v1" -O "${URL}/containerd-shim-runsc-v1.sha512"
-	# Verify the publisher's checksums before anything is installed on a node.
+	curl -fsSL -O "${URL}/gvisor.tar.bz2" -O "${URL}/gvisor.tar.bz2.sha512"
+	# Verify the publisher's checksum before anything is installed on a node.
 	if command -v sha512sum >/dev/null 2>&1; then
-		sha512sum -c runsc.sha512 containerd-shim-runsc-v1.sha512
+		sha512sum -c gvisor.tar.bz2.sha512
 	else
-		shasum -a 512 -c runsc.sha512 containerd-shim-runsc-v1.sha512
+		shasum -a 512 -c gvisor.tar.bz2.sha512
 	fi
-	chmod 0755 runsc containerd-shim-runsc-v1
+	mkdir gvisor
+	tar -xjf gvisor.tar.bz2 -C gvisor
+	for f in runsc containerd-shim-runsc-v1; do
+		[ -f "gvisor/${f}" ] || { echo "ERROR: gvisor.tar.bz2 has no ${f} at its top level"; exit 1; }
+	done
+	# Make the whole tree readable and the binaries executable by everyone, whatever
+	# the local umask was when tar extracted it: gvisor-bin/ and its sidecars are run
+	# by runsc, not only by the user who installed them.
+	chmod -R u+rwX,go+rX gvisor
+	chmod 0755 gvisor/runsc gvisor/containerd-shim-runsc-v1
 )
 
 for node in ${NODES}; do
 	echo "==> installing runsc on ${node}"
-	${ENGINE} cp "${WORK}/runsc" "${node}:/usr/local/bin/runsc"
-	${ENGINE} cp "${WORK}/containerd-shim-runsc-v1" "${node}:/usr/local/bin/containerd-shim-runsc-v1"
+	# Copy the extracted tree as a whole ("/." copies a directory's contents), so the
+	# gvisor-bin/ sidecars land beside runsc, where it looks for them. A sidecar
+	# directory left by an earlier release is removed first, so the sidecars always
+	# match the runsc copied with them.
+	${ENGINE} exec "${node}" rm -rf /usr/local/bin/gvisor-bin
+	${ENGINE} cp "${WORK}/gvisor/." "${node}:/usr/local/bin/"
 
 	# Register the handler with containerd. Two ways this goes wrong quietly, so
 	# both are checked rather than assumed:
