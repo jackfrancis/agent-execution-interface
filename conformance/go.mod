@@ -1,6 +1,8 @@
 module github.com/jackfrancis/agent-execution-interface/conformance
 
-go 1.25.7
+go 1.27.0
+
+toolchain go1.27.4
 
 require (
 	github.com/jackfrancis/agent-execution-interface v0.0.0-00010101000000-000000000000

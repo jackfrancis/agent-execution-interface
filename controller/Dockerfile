@@ -6,7 +6,7 @@
 # The build stage runs on the build machine's own platform and cross-compiles for the
 # target (--platform), so building linux/amd64 on an arm64 laptop does not emulate
 # the Go toolchain.
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 ARG TARGETARCH
 WORKDIR /src
 COPY . .
