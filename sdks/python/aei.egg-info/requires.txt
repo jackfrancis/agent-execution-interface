@@ -1,7 +1,0 @@
-kubernetes>=29
-pydantic>=2
-
-[dev]
-pytest>=8
-pyyaml>=6
-jsonschema>=4

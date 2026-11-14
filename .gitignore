@@ -1,2 +1,16 @@
 # Upstream repos cloned by `make install-agent-substrate` (not part of AEI).
 hack/.cache/
+
+# Python build and test output (sdks/python): never source.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+/sdks/python/build/
+/sdks/python/dist/
+
+# Kubeconfig files hold cluster credentials (make deploy KUBECONFIG=<file>,
+# make create-aks AKS_KUBECONFIG=<file>); never commit one.
+*.kubeconfig

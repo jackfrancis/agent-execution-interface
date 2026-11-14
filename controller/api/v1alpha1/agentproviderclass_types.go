@@ -63,7 +63,3 @@ type AgentProviderClassList struct {
 // IsDefaultClassAnnotation marks the cluster-default provider class, used when an
 // AgentRun omits providerClassName.
 const IsDefaultClassAnnotation = "agents.x-k8s.io/is-default-class"
-
-func init() {
-	SchemeBuilder.Register(&AgentProviderClass{}, &AgentProviderClassList{})
-}

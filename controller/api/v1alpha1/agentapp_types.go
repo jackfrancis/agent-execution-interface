@@ -72,7 +72,3 @@ type AgentAppList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AgentApp `json:"items"`
 }
-
-func init() {
-	SchemeBuilder.Register(&AgentApp{}, &AgentAppList{})
-}

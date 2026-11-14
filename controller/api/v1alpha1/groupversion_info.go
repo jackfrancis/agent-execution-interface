@@ -10,15 +10,29 @@
 package v1alpha1
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/scheme"
 )
 
 // GroupVersion is the API group/version for the AEI CRDs.
 var GroupVersion = schema.GroupVersion{Group: "agents.x-k8s.io", Version: "v1alpha1"}
 
 // SchemeBuilder registers the AEI types with a runtime scheme.
-var SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+var SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
 
 // AddToScheme adds the AEI types to a scheme.
 var AddToScheme = SchemeBuilder.AddToScheme
+
+// addKnownTypes registers every AEI kind under GroupVersion. It uses the
+// apimachinery scheme builder directly so this API package depends only on
+// k8s.io/apimachinery, not on controller-runtime.
+func addKnownTypes(s *runtime.Scheme) error {
+	s.AddKnownTypes(GroupVersion,
+		&AgentRun{}, &AgentRunList{},
+		&AgentProviderClass{}, &AgentProviderClassList{},
+		&AgentApp{}, &AgentAppList{},
+	)
+	metav1.AddToGroupVersion(s, GroupVersion)
+	return nil
+}
