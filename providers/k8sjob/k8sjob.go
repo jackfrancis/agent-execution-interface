@@ -47,9 +47,18 @@ type Options struct {
 	ServiceAccount string
 	ControlURL     string
 	BrokerURL      string
+	// Tolerations go on every run's pod; see runtimespec.ParseTolerations.
+	Tolerations []corev1.Toleration
 }
 
-func optionsFromConfig(cfg aei.Config) Options {
+// optionsFromConfig reads the provider class parameters. It fails on a malformed
+// "tolerations" value, so a typo stops the class from loading instead of leaving
+// its runs Pending.
+func optionsFromConfig(cfg aei.Config) (Options, error) {
+	tolerations, err := runtimespec.ParseTolerations(cfg.Param("tolerations"))
+	if err != nil {
+		return Options{}, fmt.Errorf("k8s-job: parameter tolerations: %w", err)
+	}
 	ns := cfg.Param("namespace")
 	if ns == "" {
 		ns = "default"
@@ -60,7 +69,8 @@ func optionsFromConfig(cfg aei.Config) Options {
 		ServiceAccount: cfg.Param("serviceAccount"),
 		ControlURL:     cfg.Param("controlURL"),
 		BrokerURL:      cfg.Param("brokerURL"),
-	}
+		Tolerations:    tolerations,
+	}, nil
 }
 
 // Launcher runs each AEI run as a Kubernetes Job. It is an AsyncLauncher: Dispatch
@@ -98,7 +108,11 @@ func build(cfg aei.Config) (aei.Launcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("k8s-job: build client: %w", err)
 	}
-	l := New(cs, optionsFromConfig(cfg))
+	opts, err := optionsFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	l := New(cs, opts)
 	l.log = cfg.Logger
 	return l, nil
 }
@@ -209,6 +223,7 @@ func (l *Launcher) runtimeOptions() runtimespec.Options {
 		ServiceAccount: l.opts.ServiceAccount,
 		ControlURL:     l.opts.ControlURL,
 		BrokerURL:      l.opts.BrokerURL,
+		Tolerations:    l.opts.Tolerations,
 	}
 }
 

@@ -80,6 +80,12 @@ make public-key KUBECONFIG=/path/to/kubeconfig
   (Kata), which needs a node pool created with `--workload-runtime KataVmIsolation`.
   Once the class exists on a cluster, later targets that re-apply it keep its
   isolation unless `ISOLATION_CLASS` is given again.
+- To reserve nodes for agent runs, taint them and pass the taint as
+  `RUNTIME_TOLERATIONS=key=value:NoSchedule` (the class's `tolerations` parameter):
+  every isolated run's pod then tolerates it, and pods without the toleration stay
+  off those nodes. It is kept across re-applies like `ISOLATION_CLASS`. After
+  changing it on a running install, restart the controller, which reads a class
+  when it first uses it.
 
 ### Example: an AKS cluster
 
@@ -108,10 +114,18 @@ It creates, or reuses if they exist:
 - a kubeconfig file of its own (`AKS_KUBECONFIG`, default
   `~/.kube/aei-aks-<cluster>.kubeconfig`). Your default kubeconfig is not touched.
 
-It then checks that a pod naming only the RuntimeClass runs on the Kata pool, and
+It then checks that a pod shaped like AEI's runtime pods (the RuntimeClass plus a
+toleration for the Kata pool's taint, nothing else) runs on the Kata pool, and
 prints the install commands from above with the registry and kubeconfig filled in:
 `make push`, `make install-agent-sandbox`, `make deploy ... PROVIDERS=agent-sandbox
-ISOLATION_CLASS=kata-vm-isolation`, `make public-key`.
+ISOLATION_CLASS=kata-vm-isolation RUNTIME_TOLERATIONS=...`, `make public-key`.
+
+The Kata pool is created with the taint `aei.dev/agent-runs=true:NoSchedule`
+(`AKS_KATA_TAINT`; empty for none), and the printed `make deploy` passes it as
+`RUNTIME_TOLERATIONS`. Only agent runs (and DaemonSets) then land on the Kata pool; the AEI
+controller, add-ons and your own apps run on the system pool, so size that pool
+(`AKS_SYSTEM_NODE_COUNT`, `AKS_SYSTEM_VM_SIZE`) for them. An existing pool keeps the
+taints it has.
 
 Names, location, node counts, VM sizes and the Kubernetes version are `AKS_*`
 variables, listed in [hack/aks/aks.mk](hack/aks/aks.mk). The defaults are one
@@ -126,9 +140,10 @@ about 18 runs before the next one waits for a new node, and CPU is not counted. 
 settings apply when the pool is created; an existing pool is reused as it is.
 
 Scale-in does not evict a running run's pod. With `AKS_KATA_MIN_COUNT=0` the pool
-empties when nothing runs and a node returns for the next run in about two minutes,
-but only if the other pods on it (the AEI controller, your app) can move to the system
-pool; nothing keeps them off the Kata pool, so the default minimum is 1.
+empties when nothing runs and a node returns for the next run in about two minutes.
+That needs the Kata pool to hold only runs, which the Kata pool's taint (above) arranges; with
+`AKS_KATA_TAINT=` (no taint) the AEI controller or your app can hold a node. The
+default minimum is 1, so a run does not wait for a node to start.
 
 The cluster upgrades itself: Kubernetes on the `stable` channel and node OS images on
 the `NodeImage` channel (`AKS_AUTO_UPGRADE_CHANNEL`, `AKS_NODE_OS_UPGRADE_CHANNEL`),

@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -60,9 +61,18 @@ type Options struct {
 	ServiceAccount string
 	ControlURL     string
 	BrokerURL      string
+	// Tolerations go on every run's pod; see runtimespec.ParseTolerations.
+	Tolerations []corev1.Toleration
 }
 
-func optionsFromConfig(cfg aei.Config) Options {
+// optionsFromConfig reads the provider class parameters. It fails on a malformed
+// "tolerations" value, so a typo stops the class from loading instead of leaving
+// its runs Pending.
+func optionsFromConfig(cfg aei.Config) (Options, error) {
+	tolerations, err := runtimespec.ParseTolerations(cfg.Param("tolerations"))
+	if err != nil {
+		return Options{}, fmt.Errorf("agent-sandbox: parameter tolerations: %w", err)
+	}
 	ns := cfg.Param("namespace")
 	if ns == "" {
 		ns = "default"
@@ -73,7 +83,8 @@ func optionsFromConfig(cfg aei.Config) Options {
 		ServiceAccount: cfg.Param("serviceAccount"),
 		ControlURL:     cfg.Param("controlURL"),
 		BrokerURL:      cfg.Param("brokerURL"),
-	}
+		Tolerations:    tolerations,
+	}, nil
 }
 
 // Launcher runs each AEI run as an agent-sandbox Sandbox. It needs create and get
@@ -114,7 +125,11 @@ func build(cfg aei.Config) (aei.Launcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("agent-sandbox: build client: %w", err)
 	}
-	l := New(dyn, optionsFromConfig(cfg))
+	opts, err := optionsFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	l := New(dyn, opts)
 	l.kube = kube
 	l.log = cfg.Logger
 	return l, nil
@@ -238,6 +253,7 @@ func (l *Launcher) sandbox(spec aei.RunSpec, cred aei.Credential, dispatchedAt t
 		ServiceAccount: l.opts.ServiceAccount,
 		ControlURL:     l.opts.ControlURL,
 		BrokerURL:      l.opts.BrokerURL,
+		Tolerations:    l.opts.Tolerations,
 	}, spec, cred, dispatchedAt)
 	podMap, _ := runtime.DefaultUnstructuredConverter.ToUnstructured(&pod)
 

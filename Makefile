@@ -62,6 +62,8 @@
 #                          kata-vm-isolation RuntimeClass) and an attached container
 #                          registry; write a kubeconfig FILE; print the push/deploy
 #                          commands above with the values filled in.
+#                          The Kata pool is tainted for agent runs; the printed
+#                          deploy command passes the taint as RUNTIME_TOLERATIONS.
 #     make delete-aks      delete what create-aks made (it asks for
 #                          AKS_CONFIRM_DELETE=<resource group> first).
 # AKS_* variables size and name everything, and AKS_DRY_RUN=1 prints the Azure
@@ -149,10 +151,19 @@ GVISOR_RELEASE ?= release/latest
 # re-apply the class (agent-sandbox-enable, agent-sandbox-smoke, provider), and
 # without this a later run of one of them would quietly reset a Kata cluster to gvisor.
 ISOLATION_CLASS ?= $(or $(shell $(KUBECTL) get agentproviderclass isolated --request-timeout=5s -o jsonpath='{.spec.defaultIsolationClass}' 2>/dev/null),gvisor)
+# The taints the 'isolated' class's runs tolerate, as the class's `tolerations`
+# parameter: "key=value:NoSchedule[,…]", the form `kubectl taint` uses. Set it to the
+# taint on a node pool reserved for agent runs, e.g. the one create-aks puts on the
+# Kata pool. Like ISOLATION_CLASS, when it is not given a cluster that already has the
+# class keeps the class's value. The controller reads a class when it first uses it,
+# so after CHANGING this on a running install, restart the controller
+# (kubectl -n aei-system rollout restart deploy/aei-controller).
+RUNTIME_TOLERATIONS ?= $(shell $(KUBECTL) get agentproviderclass isolated --request-timeout=5s -o jsonpath='{.spec.parameters.tolerations}' 2>/dev/null)
 # Apply the 'isolated' (agent-sandbox) class with ISOLATION_CLASS as both its default
 # isolation and its advertised ISOLATION: capability, so the two cannot drift.
 APPLY_ISOLATED_CLASS = sed -e 's|^  defaultIsolationClass: gvisor$$|  defaultIsolationClass: $(ISOLATION_CLASS)|' \
-	-e 's|"ISOLATION:gvisor"|"ISOLATION:$(ISOLATION_CLASS)"|' $(SAMPLES)/agentproviderclass-agent-sandbox.yaml | $(KUBECTL) apply -f -
+	-e 's|"ISOLATION:gvisor"|"ISOLATION:$(ISOLATION_CLASS)"|' \
+	-e 's|^    tolerations: ""$$|    tolerations: "$(RUNTIME_TOLERATIONS)"|' $(SAMPLES)/agentproviderclass-agent-sandbox.yaml | $(KUBECTL) apply -f -
 # The local registry the durable substrate pulls actor images from (stood up by
 # install-agent-substrate). agent-substrate-enable builds the ateom-gvisor image here
 # and pins the durable class's ateomImage to the pushed digest.

@@ -23,6 +23,13 @@ spec:
     # No image: the class is a generic substrate binding; the app supplies its
     # own runtime image (on its AgentApp / AgentRun).
     controlURL: http://aei-controller.aei-system.svc:8080/aei/v1alpha1
+    # The taints every run's pod tolerates, so runs can use nodes an admin has
+    # reserved for them with a taint (which keeps everything else off those nodes).
+    # Written the way `kubectl taint` writes taints, comma-separated:
+    # "key=value:NoSchedule", "key:NoSchedule" (any value) or "key" (any effect).
+    # Empty means none. `make` sets it from RUNTIME_TOLERATIONS. A change reaches
+    # runs once the controller restarts: it reads a class when it first uses it.
+    tolerations: ""
   # Every run of this class gets gVisor isolation: the provider puts it on the
   # sandbox pod as runtimeClassName, so the cluster MUST have a RuntimeClass named
   # "gvisor" (`make install-gvisor` installs one on kind). Without it the run fails
