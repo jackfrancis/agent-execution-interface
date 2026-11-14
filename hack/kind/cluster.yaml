@@ -16,9 +16,18 @@
 #   - /dev/kvm mount + micro-VM (kata) node labels — OMITTED (optional; gVisor works
 #     without them). Use substrate's own script if you need micro-VM WorkerPools.
 #
-# REQUIRES a Kubernetes v1.36+ node image: these gates do not exist earlier and kind
-# fails creation on an unknown gate. If your kind defaults to an older Kubernetes,
-# pin a v1.36+ image on the nodes below, or set KIND_CONFIG= to build a plain cluster.
+# Which Kubernetes versions this works on (kind v0.33.0 defaults to v1.37.0):
+#   - v1.37 and later: the three gates are GA and on by default, and both APIs are
+#     served at certificates.k8s.io/v1, so the featureGates and runtimeConfig below
+#     are redundant. Setting a GA gate only logs "setting GA feature gate. It will be
+#     removed in a future release". They stay for v1.35/v1.36 and for substrate builds
+#     that still read v1beta1 (deprecated in v1.37). Remove the featureGates block when
+#     Kubernetes removes these gates: naming an unknown gate makes creation fail.
+#   - v1.35 and v1.36: all of it is required. The gates are beta and off by default,
+#     and ClusterTrustBundle and PodCertificateRequest are served only at v1beta1.
+#   - v1.34 and older: not supported. PodCertificateRequest is missing or alpha-only.
+#     Set KIND_CONFIG= to build a plain cluster there.
+# A v1.37+ node image needs kind v0.32.0 or later (v1.37 dropped kubeadm v1beta3).
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 # Three workers so runs actually spread: per-run providers (k8s-job, agent-sandbox)
