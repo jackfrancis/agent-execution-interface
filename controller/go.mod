@@ -1,6 +1,8 @@
 module github.com/jackfrancis/agent-execution-interface/controller
 
-go 1.26.0
+go 1.27.0
+
+toolchain go1.27.4
 
 replace github.com/jackfrancis/agent-execution-interface => ../
 
