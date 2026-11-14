@@ -61,7 +61,27 @@ AKS_SYSTEM_VM_SIZE="${AKS_SYSTEM_VM_SIZE:-Standard_D2s_v7}"
 # Kata pool: where isolated runs execute. The VM size must be Generation 2 with
 # nested virtualization. Pool names are at most 12 lowercase alphanumerics.
 AKS_KATA_POOL="${AKS_KATA_POOL:-kata}"
-AKS_KATA_NODE_COUNT="${AKS_KATA_NODE_COUNT:-2}"
+# The pool starts at AKS_KATA_NODE_COUNT nodes and the cluster autoscaler then keeps
+# it between AKS_KATA_MIN_COUNT and AKS_KATA_MAX_COUNT: it adds a node when a run's
+# pod cannot be scheduled, and removes one that has stayed underused (it does not
+# evict a running Sandbox pod to do so). AKS_KATA_AUTOSCALE=false makes it a fixed
+# pool of AKS_KATA_NODE_COUNT.
+#
+# AKS_KATA_MIN_COUNT=0 lets the pool empty out when nothing runs: a node comes back
+# for the next Kata pod in about two minutes. It only reaches zero if every other
+# pod on it can move to the system pool. Nothing keeps ordinary pods (the AEI
+# controller, an app) off the Kata pool, so the default stays at 1.
+#
+# What "cannot be scheduled" means for AEI: its runtime pods set no resource
+# requests, so the scheduler counts only the RuntimeClass's fixed 600Mi of memory
+# per pod. A Standard_D4s_v7 node therefore takes about 18 runs before the next one
+# waits for a new node, and CPU is not counted at all.
+#
+# These apply when the pool is CREATED. An existing pool is reused as it is.
+AKS_KATA_NODE_COUNT="${AKS_KATA_NODE_COUNT:-1}"
+AKS_KATA_AUTOSCALE="${AKS_KATA_AUTOSCALE:-true}"
+AKS_KATA_MIN_COUNT="${AKS_KATA_MIN_COUNT:-1}"
+AKS_KATA_MAX_COUNT="${AKS_KATA_MAX_COUNT:-3}"
 AKS_KATA_VM_SIZE="${AKS_KATA_VM_SIZE:-Standard_D4s_v7}"
 # The RuntimeClass AKS provides for Pod Sandboxing; passed to AEI as ISOLATION_CLASS.
 AKS_RUNTIME_CLASS="${AKS_RUNTIME_CLASS:-kata-vm-isolation}"
@@ -198,6 +218,13 @@ create() {
 		acr_create=1
 	fi
 
+	if [ "${AKS_KATA_AUTOSCALE}" = true ]; then
+		[ "${AKS_KATA_MIN_COUNT}" -ge 0 ] 2>/dev/null || die "AKS_KATA_MIN_COUNT must be a number, 0 or more (got '${AKS_KATA_MIN_COUNT}')"
+		[ "${AKS_KATA_MAX_COUNT}" -ge "${AKS_KATA_MIN_COUNT}" ] 2>/dev/null || die "AKS_KATA_MAX_COUNT (${AKS_KATA_MAX_COUNT}) must be at least AKS_KATA_MIN_COUNT (${AKS_KATA_MIN_COUNT})"
+		{ [ "${AKS_KATA_NODE_COUNT}" -ge "${AKS_KATA_MIN_COUNT}" ] && [ "${AKS_KATA_NODE_COUNT}" -le "${AKS_KATA_MAX_COUNT}" ]; } 2>/dev/null \
+			|| die "AKS_KATA_NODE_COUNT (${AKS_KATA_NODE_COUNT}) must be between AKS_KATA_MIN_COUNT (${AKS_KATA_MIN_COUNT}) and AKS_KATA_MAX_COUNT (${AKS_KATA_MAX_COUNT})"
+	fi
+
 	require_provider Microsoft.ContainerService "an AKS cluster"
 	[ -z "${acr_create}" ] || require_provider Microsoft.ContainerRegistry "the container registry" \
 		"Or skip the registry (AKS_CREATE_ACR=false), or attach one you already have (AKS_ATTACH_ACR=<registry>)."
@@ -241,17 +268,27 @@ create() {
 			--enable-managed-identity --no-ssh-key --tags "${OWNER_TAG}" --output none
 	fi
 
-	say "Kata pool '${AKS_KATA_POOL}' = ${AKS_KATA_NODE_COUNT} x ${AKS_KATA_VM_SIZE} (KataVmIsolation, AzureLinux)"
+	local scaling=() sizing="${AKS_KATA_NODE_COUNT} x ${AKS_KATA_VM_SIZE}, fixed size"
+	if [ "${AKS_KATA_AUTOSCALE}" = true ]; then
+		scaling=(--enable-cluster-autoscaler --min-count "${AKS_KATA_MIN_COUNT}" --max-count "${AKS_KATA_MAX_COUNT}")
+		sizing="${AKS_KATA_NODE_COUNT} x ${AKS_KATA_VM_SIZE}, autoscaling ${AKS_KATA_MIN_COUNT}-${AKS_KATA_MAX_COUNT}"
+	fi
+	say "Kata pool '${AKS_KATA_POOL}' = ${sizing} (KataVmIsolation, AzureLinux)"
 	local pool_runtime=""
 	dry || pool_runtime="$(az aks nodepool show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" --cluster-name "${AKS_CLUSTER}" \
 		-n "${AKS_KATA_POOL}" --query workloadRuntime -o tsv 2>/dev/null || true)"
 	case "${pool_runtime}" in
 		KataVmIsolation|KataMshvVmIsolation)
-			echo "    exists; reusing" ;;
+			# Reused as it is: resizing or re-scaling a pool that may be running agents
+			# is not something a re-run should do on its own.
+			echo "    exists; reusing as it is: $(az aks nodepool show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" \
+				--cluster-name "${AKS_CLUSTER}" -n "${AKS_KATA_POOL}" -o tsv \
+				--query "join('', ['count=', to_string(count), ', autoscaling=', to_string(enableAutoScaling), ', min=', to_string(minCount), ', max=', to_string(maxCount)])" 2>/dev/null || true)" ;;
 		"")
 			run az aks nodepool add --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" \
 				--cluster-name "${AKS_CLUSTER}" --name "${AKS_KATA_POOL}" --mode User \
-				--node-count "${AKS_KATA_NODE_COUNT}" --node-vm-size "${AKS_KATA_VM_SIZE}" \
+				--node-count "${AKS_KATA_NODE_COUNT}" ${scaling[@]+"${scaling[@]}"} \
+				--node-vm-size "${AKS_KATA_VM_SIZE}" \
 				--os-sku AzureLinux --workload-runtime KataVmIsolation --output none ;;
 		*)
 			die "node pool '${AKS_KATA_POOL}' exists with workload runtime '${pool_runtime}', not KataVmIsolation. Pick another AKS_KATA_POOL." ;;
