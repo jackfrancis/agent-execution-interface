@@ -68,9 +68,11 @@ AKS_KATA_POOL="${AKS_KATA_POOL:-kata}"
 # pool of AKS_KATA_NODE_COUNT.
 #
 # AKS_KATA_MIN_COUNT=0 lets the pool empty out when nothing runs: a node comes back
-# for the next Kata pod in about two minutes. It only reaches zero if every other
-# pod on it can move to the system pool. Nothing keeps ordinary pods (the AEI
-# controller, an app) off the Kata pool, so the default stays at 1.
+# for the next Kata pod in about two minutes. It only reaches zero when nothing but
+# agent runs and DaemonSets is on it. The AKS_KATA_TAINT below arranges that by
+# keeping every pod without the toleration (the AEI controller, an app) on the
+# system pool; with AKS_KATA_TAINT= (no taint) such pods can hold a node. The default
+# stays at 1, so a run does not wait for a node to start.
 #
 # What "cannot be scheduled" means for AEI: its runtime pods set no resource
 # requests, so the scheduler counts only the RuntimeClass's fixed 600Mi of memory
@@ -83,6 +85,15 @@ AKS_KATA_AUTOSCALE="${AKS_KATA_AUTOSCALE:-true}"
 AKS_KATA_MIN_COUNT="${AKS_KATA_MIN_COUNT:-1}"
 AKS_KATA_MAX_COUNT="${AKS_KATA_MAX_COUNT:-3}"
 AKS_KATA_VM_SIZE="${AKS_KATA_VM_SIZE:-Standard_D4s_v7}"
+# The taint put on the Kata pool's nodes when the pool is created, reserving them
+# for agent runs: pods without a matching toleration (the AEI controller, add-ons,
+# anything else) stay on the system pool, so the Kata pool holds only runs. The
+# printed `make deploy` command passes it as RUNTIME_TOLERATIONS, which makes the
+# 'isolated' class's runs tolerate it. Format: key=value:Effect, as for
+# `az aks nodepool add --node-taints` (the kubernetes.azure.com/ prefix is reserved
+# by AKS). Empty means no taint: any pod may then land on the Kata pool.
+# Applied at creation only; an existing pool keeps the taints it has.
+AKS_KATA_TAINT="${AKS_KATA_TAINT-aei.dev/agent-runs=true:NoSchedule}"
 # The RuntimeClass AKS provides for Pod Sandboxing; passed to AEI as ISOLATION_CLASS.
 AKS_RUNTIME_CLASS="${AKS_RUNTIME_CLASS:-kata-vm-isolation}"
 
@@ -203,6 +214,30 @@ acr_exists()     { ! dry && az acr show --subscription "${SUB}" -g "${AKS_RESOUR
 
 kc() { kubectl --kubeconfig "${AKS_KUBECONFIG}" "$@"; }
 
+# The taints on the Kata pool as it really is: AKS_KATA_TAINT for a pool this run
+# creates, the pool's own for one it reuses. Comma-separated key=value:Effect.
+POOL_TAINTS=""
+
+# tolerations_yaml prints pod-spec tolerations matching POOL_TAINTS, indented for
+# the smoke pod, or nothing when the pool has no taints.
+tolerations_yaml() {
+	[ -n "${POOL_TAINTS}" ] || return 0
+	echo "  tolerations:"
+	local t kv effect
+	local IFS=,
+	for t in ${POOL_TAINTS}; do
+		kv="${t%%:*}"
+		effect=""
+		case "${t}" in *:*) effect="${t##*:}" ;; esac
+		case "${kv}" in
+			*=*) printf '    - {key: "%s", operator: Equal, value: "%s"' "${kv%%=*}" "${kv#*=}" ;;
+			*)   printf '    - {key: "%s", operator: Exists' "${kv}" ;;
+		esac
+		if [ -n "${effect}" ]; then printf ', effect: %s' "${effect}"; fi
+		printf '}\n'
+	done
+}
+
 create() {
 	preflight
 	require_kata_flag
@@ -273,23 +308,31 @@ create() {
 		scaling=(--enable-cluster-autoscaler --min-count "${AKS_KATA_MIN_COUNT}" --max-count "${AKS_KATA_MAX_COUNT}")
 		sizing="${AKS_KATA_NODE_COUNT} x ${AKS_KATA_VM_SIZE}, autoscaling ${AKS_KATA_MIN_COUNT}-${AKS_KATA_MAX_COUNT}"
 	fi
-	say "Kata pool '${AKS_KATA_POOL}' = ${sizing} (KataVmIsolation, AzureLinux)"
+	local taint=()
+	[ -z "${AKS_KATA_TAINT}" ] || taint=(--node-taints "${AKS_KATA_TAINT}")
+	say "Kata pool '${AKS_KATA_POOL}' = ${sizing} (KataVmIsolation, AzureLinux), taint '${AKS_KATA_TAINT:-none}'"
 	local pool_runtime=""
 	dry || pool_runtime="$(az aks nodepool show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" --cluster-name "${AKS_CLUSTER}" \
 		-n "${AKS_KATA_POOL}" --query workloadRuntime -o tsv 2>/dev/null || true)"
 	case "${pool_runtime}" in
 		KataVmIsolation|KataMshvVmIsolation)
-			# Reused as it is: resizing or re-scaling a pool that may be running agents
-			# is not something a re-run should do on its own.
+			# Reused as it is: resizing, re-scaling or re-tainting a pool that may be
+			# running agents is not something a re-run should do on its own. The pool
+			# keeps its own taints, and everything after this point (the smoke pod,
+			# the printed deploy command) follows what the pool actually has.
+			POOL_TAINTS="$(az aks nodepool show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" --cluster-name "${AKS_CLUSTER}" \
+				-n "${AKS_KATA_POOL}" --query "join(',', nodeTaints || \`[]\`)" -o tsv 2>/dev/null || true)"
 			echo "    exists; reusing as it is: $(az aks nodepool show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" \
 				--cluster-name "${AKS_CLUSTER}" -n "${AKS_KATA_POOL}" -o tsv \
-				--query "join('', ['count=', to_string(count), ', autoscaling=', to_string(enableAutoScaling), ', min=', to_string(minCount), ', max=', to_string(maxCount)])" 2>/dev/null || true)" ;;
+				--query "join('', ['count=', to_string(count), ', autoscaling=', to_string(enableAutoScaling), ', min=', to_string(minCount), ', max=', to_string(maxCount)])" 2>/dev/null || true), taints=${POOL_TAINTS:-none}" ;;
 		"")
 			run az aks nodepool add --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" \
 				--cluster-name "${AKS_CLUSTER}" --name "${AKS_KATA_POOL}" --mode User \
 				--node-count "${AKS_KATA_NODE_COUNT}" ${scaling[@]+"${scaling[@]}"} \
 				--node-vm-size "${AKS_KATA_VM_SIZE}" \
-				--os-sku AzureLinux --workload-runtime KataVmIsolation --output none ;;
+				--os-sku AzureLinux --workload-runtime KataVmIsolation \
+				${taint[@]+"${taint[@]}"} --output none
+			POOL_TAINTS="${AKS_KATA_TAINT}" ;;
 		*)
 			die "node pool '${AKS_KATA_POOL}' exists with workload runtime '${pool_runtime}', not KataVmIsolation. Pick another AKS_KATA_POOL." ;;
 	esac
@@ -336,9 +379,10 @@ create() {
 	next_steps "${acr}" "${login_server}"
 }
 
-# verify checks the two things AEI's isolated class depends on: the RuntimeClass
-# exists, and a pod that names it (and nothing else, as AEI's runtime pods do) runs
-# on a Kata node. It also reports whether the RuntimeClass steers pods there itself.
+# verify checks what AEI's isolated class depends on: the RuntimeClass exists, and
+# a pod shaped like AEI's runtime pods (the RuntimeClass, the pool's tolerations,
+# and nothing else) runs on a Kata node. It also reports whether the RuntimeClass
+# steers pods there itself.
 verify() {
 	say "waiting for nodes"
 	kc wait --for=condition=Ready nodes --all --timeout=300s
@@ -360,7 +404,7 @@ verify() {
 		echo "    none either, so an isolated run may be scheduled onto the '${AKS_SYSTEM_POOL}' pool and fail to start."
 	fi
 
-	say "smoke: a pod with only runtimeClassName: ${AKS_RUNTIME_CLASS}"
+	say "smoke: a pod with only runtimeClassName: ${AKS_RUNTIME_CLASS}${POOL_TAINTS:+ and a toleration for ${POOL_TAINTS}}"
 	kc -n default delete pod aei-kata-smoke --ignore-not-found >/dev/null 2>&1 || true
 	kc -n default apply -f - <<EOF
 apiVersion: v1
@@ -369,6 +413,7 @@ metadata:
   name: aei-kata-smoke
 spec:
   runtimeClassName: ${AKS_RUNTIME_CLASS}
+$(tolerations_yaml)
   restartPolicy: Never
   containers:
     - name: smoke
@@ -404,7 +449,7 @@ next_steps() {
 	fi
 	echo "  make push IMG=${img} PLATFORM=linux/amd64"
 	echo "  make install-agent-sandbox KUBECONFIG=${AKS_KUBECONFIG}"
-	echo "  make deploy KUBECONFIG=${AKS_KUBECONFIG} IMG=${img} PROVIDERS=agent-sandbox ISOLATION_CLASS=${AKS_RUNTIME_CLASS}"
+	echo "  make deploy KUBECONFIG=${AKS_KUBECONFIG} IMG=${img} PROVIDERS=agent-sandbox ISOLATION_CLASS=${AKS_RUNTIME_CLASS}${POOL_TAINTS:+ RUNTIME_TOLERATIONS=${POOL_TAINTS}}"
 	echo "  make public-key KUBECONFIG=${AKS_KUBECONFIG}"
 	echo
 	echo "The cluster bills while it exists. Remove it with:"

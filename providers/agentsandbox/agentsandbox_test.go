@@ -255,3 +255,31 @@ func TestRegisteredUnderName(t *testing.T) {
 		t.Fatalf("agent-sandbox not registered; got %v", aei.Names())
 	}
 }
+
+// TestTolerationsFromClassParameter proves the class's "tolerations" parameter
+// reaches the Sandbox's pod, and that a malformed value fails the class.
+func TestTolerationsFromClassParameter(t *testing.T) {
+	opts, err := optionsFromConfig(aei.Config{Params: map[string]string{"tolerations": "aei.dev/agent-runs=true:NoSchedule"}})
+	if err != nil {
+		t.Fatalf("optionsFromConfig: %v", err)
+	}
+	l := testLauncher()
+	l.opts.Tolerations = opts.Tolerations
+	u := l.sandbox(aei.RunSpec{ID: "r"}, aei.Credential{Value: "tok"}, l.now())
+
+	tols, found, err := unstructured.NestedSlice(u.Object, "spec", "podTemplate", "spec", "tolerations")
+	if err != nil || !found || len(tols) != 1 {
+		t.Fatalf("pod tolerations: found=%v err=%v %v", found, err, tols)
+	}
+	got := tols[0].(map[string]any)
+	want := map[string]any{"key": "aei.dev/agent-runs", "operator": "Equal", "value": "true", "effect": "NoSchedule"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("toleration %s = %v, want %v", k, got[k], v)
+		}
+	}
+
+	if _, err := optionsFromConfig(aei.Config{Params: map[string]string{"tolerations": "key:Sometimes"}}); err == nil {
+		t.Error("a malformed tolerations parameter must be an error")
+	}
+}

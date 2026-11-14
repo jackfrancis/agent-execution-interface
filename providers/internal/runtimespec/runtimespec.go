@@ -78,6 +78,9 @@ type Options struct {
 	ServiceAccount string
 	ControlURL     string
 	BrokerURL      string
+	// Tolerations are put on every run's pod (see ParseTolerations): the admin's
+	// placement policy for the class, e.g. onto a node pool tainted for agent runs.
+	Tolerations []corev1.Toleration
 }
 
 // EnvVars adapts the substrate-neutral aei.Injection map (docs/runtime-abi.md §1)
@@ -121,6 +124,7 @@ func PodSpec(opts Options, spec aei.RunSpec, cred aei.Credential, dispatchedAt t
 		RestartPolicy:      corev1.RestartPolicyNever,
 		ServiceAccountName: opts.ServiceAccount,
 		Containers:         []corev1.Container{Container(opts, spec, cred, dispatchedAt)},
+		Tolerations:        opts.Tolerations,
 	}
 	if iso := spec.Isolation; iso != "" {
 		ps.RuntimeClassName = &iso
