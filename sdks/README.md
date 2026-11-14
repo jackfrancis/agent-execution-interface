@@ -38,14 +38,15 @@ Hand-authoring an SDK per language would not scale. It does not have to, because
   POSIX-sh + curl; the app wire is the same shape).
 - **The types are generated from one schema.** The `AgentRun` CRD's
   `openAPIV3Schema` is the single source of truth, and it is itself generated from
-  the controller's Go structs (`controller-gen`). Feed it to any schema code
-  generator to emit typed models. [`generate.sh`](generate.sh) does exactly this:
+  the controller's Go structs (`make -C controller generate`, a pinned
+  `controller-gen`). Feed it to any schema code generator to emit typed models.
+  [`generate.sh`](generate.sh) does exactly this:
 
   ```sh
   ./generate.sh go        agentrun.go       # quicktype
   ./generate.sh typescript agentrun.ts      # quicktype
   ./generate.sh rust      agentrun.rs       # quicktype (also swift, csharp, kotlin, …)
-  ./generate.sh python    aei/_agentrun.py  # datamodel-code-generator → pydantic v2
+  ./generate.sh python                      # writes python/aei/_agentrun.py; needs pip install -e 'python[gen]'
   ```
 
   One schema in, typed models out — descriptions become doc comments, enums and
