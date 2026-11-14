@@ -35,7 +35,8 @@ fi
 #    throwaway dir keeps the generated file's header deterministic across runs.
 schema_dir="$(mktemp -d)"
 schema="$schema_dir/agentrun.schema.json"
-trap 'rm -rf "$schema_dir"' EXIT
+tmp_out=""
+trap 'rm -rf "$schema_dir"; [[ -z "$tmp_out" ]] || rm -f "$tmp_out"' EXIT
 python3 - "$crd" >"$schema" <<'PY'
 import json, sys, yaml
 crd = yaml.safe_load(open(sys.argv[1]))
@@ -52,19 +53,29 @@ case "$lang" in
     # pydantic v2 models; the veneer (aei/models.py) adds ergonomics on top.
     # --base-class supplies populate_by_name + protected_namespaces=() (see
     # aei/_base.py), so the generated file needs no hand edits.
-    exec datamodel-codegen \
+    #
+    # The output depends on the generator and formatter versions, so the SDK's `gen`
+    # extra pins all three (pip install -e 'python[gen]'), and the formatters are named
+    # because the generator's default is about to change. Not exec'd, so the EXIT trap
+    # still removes the temporary schema. It always writes inside the package and moves
+    # the file afterwards, because isort decides that `aei` is first-party from the
+    # output's location: written anywhere else, the imports are grouped differently.
+    tmp_out="$here/python/aei/.agentrun.$$.py"
+    datamodel-codegen \
       --input "$schema" --input-file-type jsonschema \
       --output-model-type pydantic_v2.BaseModel \
       --base-class aei._base.GeneratedModel \
       --snake-case-field --use-double-quotes \
       --use-schema-description --use-field-description \
       --disable-timestamp \
-      --output "${out:-$here/python/aei/_agentrun.py}"
+      --formatters black isort \
+      --output "$tmp_out"
+    mv "$tmp_out" "${out:-$here/python/aei/_agentrun.py}"
     ;;
   *)
     # quicktype covers a broad language matrix from the same JSON Schema.
     args=(-y quicktype --src "$schema" --src-lang schema --lang "$lang" --top-level AgentRun)
     [[ -n "$out" ]] && args+=(-o "$out")
-    exec npx "${args[@]}"
+    npx "${args[@]}"
     ;;
 esac

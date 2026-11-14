@@ -35,7 +35,13 @@ class AeiClient:
 
     def dispatch(self, spec: AgentRunSpec, *, app: str | None = None) -> str:
         """Submit a run; returns its id. No Kubernetes object is created — the run
-        exists only as control-plane state addressable by this id."""
+        exists only as control-plane state addressable by this id.
+
+        The dispatch API reads only task_ref, parameters, session, timeout_seconds
+        and identity.subject/scopes from the spec. The other fields (image,
+        provider_class_name, isolation_class, requirements, identity.audience) are
+        fixed by the app's AgentApp and are ignored here; they apply only to a
+        declarative AgentRun object."""
         body = {"app": app or self._app, **spec.to_spec()}
         resp = self._http().post(f"{self._endpoint}{_BASE}/dispatch", json=body, headers=self._auth(), timeout=30)
         resp.raise_for_status()

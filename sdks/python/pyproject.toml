@@ -15,7 +15,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "pyyaml>=6", "jsonschema>=4"]
 # `../generate.sh python` regenerates aei/_agentrun.py from the CRD schema.
-gen = ["datamodel-code-generator>=0.25"]
+# Pinned exactly: the generated file's content and formatting depend on all three.
+gen = ["datamodel-code-generator==0.90.0", "black==26.10.1", "isort==8.0.1"]
 
 [tool.setuptools.packages.find]
 include = ["aei*"]
