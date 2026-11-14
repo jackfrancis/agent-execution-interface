@@ -13,6 +13,7 @@ import pydantic
 import pytest
 
 from aei import AgentRunSpec, Identity, Requirements, Result
+from aei import _agentrun as generated
 
 yaml = pytest.importorskip("yaml")
 jsonschema = pytest.importorskip("jsonschema")
@@ -27,13 +28,41 @@ def _crd_path() -> Path:
     return root / "controller" / "config" / "crd" / "agents.x-k8s.io_agentruns.yaml"
 
 
-def _spec_schema() -> dict:
+def _root_schema() -> dict:
     path = _crd_path()
     if not path.exists():
         pytest.skip(f"AgentRun CRD not found at {path}; set AEI_CRD to override")
     crd = yaml.safe_load(path.read_text())
     version = next(v for v in crd["spec"]["versions"] if v["name"] == "v1alpha1")
-    return version["schema"]["openAPIV3Schema"]["properties"]["spec"]
+    return version["schema"]["openAPIV3Schema"]
+
+
+def _spec_schema() -> dict:
+    return _root_schema()["properties"]["spec"]
+
+
+@pytest.mark.parametrize(
+    ("model", "path"),
+    [
+        (generated.AgentRun, ()),
+        (generated.Spec, ("spec",)),
+        (generated.Identity, ("spec", "identity")),
+        (generated.Requirements, ("spec", "requirements")),
+        (generated.Status, ("status",)),
+        (generated.Handle, ("status", "handle")),
+        (generated.Timing, ("status", "timing")),
+        (generated.Condition, ("status", "conditions", "items")),
+    ],
+)
+def test_generated_mirror_has_every_schema_property(model, path):
+    # The other tests only prove model output is *accepted* by the schema, which a
+    # mirror missing fields still satisfies. This one fails when _agentrun.py is
+    # stale in either direction: regenerate it with `sdks/generate.sh python`.
+    node = _root_schema()
+    for key in path:
+        node = node["items"] if key == "items" else node["properties"][key]
+    wire_names = {field.alias or name for name, field in model.model_fields.items()}
+    assert wire_names == set(node["properties"])
 
 
 def test_fully_populated_spec_validates_against_crd():

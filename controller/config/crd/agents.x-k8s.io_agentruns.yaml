@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.21.0
+    controller-gen.kubebuilder.io/version: v0.23.0
   name: agentruns.agents.x-k8s.io
 spec:
   group: agents.x-k8s.io
@@ -90,22 +90,6 @@ spec:
                   ProviderClassName references an AgentProviderClass by name; empty selects the
                   cluster default (the class annotated IsDefaultClassAnnotation).
                 type: string
-              providerOptions:
-                additionalProperties:
-                  type: string
-                description: |-
-                  ProviderOptions are substrate-specific settings for this run, keyed
-                  "<provider>/<option>" (e.g. "agent-substrate/durableDir") — the escape hatch that
-                  keeps a substrate's distinctive power reachable instead of flattened away because
-                  other substrates lack it (docs/design.md). The provider reads only what is
-                  addressed to it and rejects an option it does not implement; options for another
-                  provider are ignored. They widen what an app may ASK FOR, never what it may DO:
-                  placement, isolation and endpoints stay AgentProviderClass parameters.
-                type: object
-                x-kubernetes-validations:
-                - message: each providerOptions key must be namespaced by provider,
-                    e.g. agent-substrate/durableDir
-                  rule: self.all(k, k.contains('/'))
               requirements:
                 description: Requirements are app-declared semantics admission enforces
                   against the class.

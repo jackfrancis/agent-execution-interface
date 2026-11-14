@@ -57,6 +57,12 @@ class Spec(GeneratedModel):
     """
     Identity is the per-run credential to mint (delegated authorization).
     """
+    image: str | None = None
+    """
+    Image is the runtime (agent) container image to run, supplied by the app so
+    the provider class stays a generic substrate binding; empty falls back to a
+    class default image where one is configured.
+    """
     isolation_class: str | None = Field(None, alias="isolationClass")
     """
     IsolationClass names the required isolation; empty defaults from the class.
@@ -73,6 +79,14 @@ class Spec(GeneratedModel):
     requirements: Requirements | None = None
     """
     Requirements are app-declared semantics admission enforces against the class.
+    """
+    session: str | None = None
+    """
+    Session, when set, binds this run to a durable conversation/session — an
+    advisory affinity hint a warm provider (agent-substrate) uses to route every
+    run of a session to the same standing actor, keeping the runtime's per-session
+    working set warm across turns. A stateless provider ignores it; correctness
+    never depends on it, only latency. Empty ⇒ a one-shot run.
     """
     task_ref: str | None = Field(None, alias="taskRef")
     """
