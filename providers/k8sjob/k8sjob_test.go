@@ -198,3 +198,24 @@ func TestRegisteredUnderName(t *testing.T) {
 		t.Fatalf("k8s-job not registered; got %v", aei.Names())
 	}
 }
+
+// TestTolerationsFromClassParameter proves the class's "tolerations" parameter
+// reaches the Job's pod, and that a malformed value fails the class.
+func TestTolerationsFromClassParameter(t *testing.T) {
+	opts, err := optionsFromConfig(aei.Config{Params: map[string]string{"tolerations": "aei.dev/agent-runs:NoSchedule"}})
+	if err != nil {
+		t.Fatalf("optionsFromConfig: %v", err)
+	}
+	l := testLauncher()
+	l.opts.Tolerations = opts.Tolerations
+	job := l.job(aei.RunSpec{ID: "r"}, aei.Credential{Value: "tok"}, l.now())
+
+	tols := job.Spec.Template.Spec.Tolerations
+	if len(tols) != 1 || tols[0].Key != "aei.dev/agent-runs" || string(tols[0].Operator) != "Exists" || string(tols[0].Effect) != "NoSchedule" {
+		t.Errorf("pod tolerations = %+v", tols)
+	}
+
+	if _, err := optionsFromConfig(aei.Config{Params: map[string]string{"tolerations": "=v:NoSchedule"}}); err == nil {
+		t.Error("a malformed tolerations parameter must be an error")
+	}
+}
