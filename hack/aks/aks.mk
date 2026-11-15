@@ -16,6 +16,8 @@
 #                                       automatic Kubernetes / node OS image upgrades
 #     AKS_KUBECONFIG=~/.kube/aei-aks-<cluster>.kubeconfig
 #     AKS_CREATE_ACR=true | AKS_ATTACH_ACR=<existing registry> | AKS_ACR_NAME=<name>
+#     AKS_PUBLIC_IP=<name> [AKS_PUBLIC_IP_DNS_LABEL=<label>]   a static public IP for an
+#                                       app's LoadBalancer Service (default: none)
 #     AKS_DRY_RUN=1                     print the az commands, run nothing
 # Use AKS_DRY_RUN=1, not `make -n`, to preview.
 

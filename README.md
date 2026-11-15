@@ -112,7 +112,20 @@ It creates, or reuses if they exist:
   secrets (`AKS_CREATE_ACR=false` skips it, `AKS_ATTACH_ACR=<registry>` attaches one
   you already have);
 - a kubeconfig file of its own (`AKS_KUBECONFIG`, default
-  `~/.kube/aei-aks-<cluster>.kubeconfig`). Your default kubeconfig is not touched.
+  `~/.kube/aei-aks-<cluster>.kubeconfig`). Your default kubeconfig is not touched;
+- only with `AKS_PUBLIC_IP=<name>`: a static public IP for an app that must be
+  reachable at an address that does not change (a DNS record, an OAuth callback, a
+  webhook). `AKS_PUBLIC_IP_DNS_LABEL=<label>` also gives it the name
+  `<label>.<location>.cloudapp.azure.com`, which is known before the address is.
+  It lives in the resource group, not in the cluster's node resource group, so it
+  outlasts any one Service; the cluster's identity gets Network Contributor on it,
+  and `create-aks` prints the two Service annotations that put it on a
+  `LoadBalancer` Service. To limit who can connect, use the annotations
+  `service.beta.kubernetes.io/azure-allowed-ip-ranges` and
+  `.../azure-allowed-service-tags`, which only the network security group enforces;
+  `spec.loadBalancerSourceRanges` is also enforced by kube-proxy on the nodes, so
+  combined with a service tag it drops the tag's sources. AEI itself needs no public
+  address.
 
 It then checks that a pod shaped like AEI's runtime pods (the RuntimeClass plus a
 toleration for the Kata pool's taint, nothing else) runs on the Kata pool, and
@@ -153,8 +166,16 @@ run on them.
 `make delete-aks` prints what it would delete and stops; add
 `AKS_CONFIRM_DELETE=<resource group>` to carry it out. It deletes only what
 `create-aks` created (marked with an `aei-created-by` tag): the whole resource group
-if `create-aks` made it, otherwise just the cluster and registry it added to your
-existing group.
+if `create-aks` made it, otherwise just the cluster, registry and public IP it added
+to your existing group. Volumes your apps' claims provisioned (Azure Disks) and the
+load balancer are in the cluster's node resource group, which Azure deletes with the
+cluster.
+
+`create-aks` also reports the cluster's default StorageClass: AKS ships Azure Disk
+classes (`default`, the default, a Standard SSD disk like `managed-csi`; and
+`managed-csi-premium`). A disk attaches to
+one node at a time, so a claim on one is `ReadWriteOnce`, and with the Kata pool
+tainted an app's pod and its disk stay on the system pool.
 
 A Kata pod with no memory limit runs in a 512Mi VM with one vCPU. AEI's runtime pods
 set no limits today, so that is what each isolated run gets on this cluster.
