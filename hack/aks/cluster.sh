@@ -135,8 +135,9 @@ run() {
 }
 
 # run_when_idle is run for a change to an existing cluster. AKS takes one change at a
-# time per cluster and refuses the next with OperationNotAllowed while another is in
-# progress, and the other one need not be ours: a subscription's Azure Policy
+# time per cluster and refuses the next while another is in progress, as
+# OperationNotAllowed or EtagMismatch ("Another operation is in progress"); the other
+# one need not be ours: a subscription's Azure Policy
 # (deployIfNotExists) can install an add-on or extension on a new cluster a few
 # minutes after it is created. So on that error it waits and tries again, for up to
 # 20 minutes; any other error fails at once.
@@ -145,14 +146,16 @@ run_when_idle() {
 	printf ' %q' "$@"
 	printf '\n'
 	dry && return 0
-	local attempt out
+	local attempt out lower
 	for attempt in $(seq 1 40); do
 		if out="$("$@" 2>&1)"; then
 			[ -z "${out}" ] || printf '%s\n' "${out}"
 			return 0
 		fi
-		case "${out}" in
-			*OperationNotAllowed*|*"in-progress"*|*"another operation"*)
+		# Matched in lower case: AKS words the same refusal several ways.
+		lower="$(printf '%s' "${out}" | tr '[:upper:]' '[:lower:]')"
+		case "${lower}" in
+			*operationnotallowed*|*etagmismatch*|*"another operation"*|*"in progress"*|*"in-progress"*)
 				echo "    the cluster is busy with another operation; retrying in 30s (${attempt}/40):"
 				printf '%s\n' "${out}" | grep -m1 -E "Message:|ERROR:" | cut -c1-200 | sed 's/^/      /'
 				sleep 30 ;;
