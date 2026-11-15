@@ -38,8 +38,9 @@ How the two compare:
 | | `make create-aks` (script) | `main.bicep` |
 |---|---|---|
 | Resource group | creates it, tagged | must exist; create it yourself (tagged, so `delete-aks` removes the whole group) |
-| Preview | `AKS_DRY_RUN=1` prints az commands | `what-if` asks Azure for the real diff |
-| Re-run on an existing cluster | reuses an existing pool as it is (counts, taints) | re-applies every declared setting: a redeploy with other pool settings changes the live pools, and can be refused while the autoscaler or another operation is busy |
+| Preview | `AKS_DRY_RUN=1` prints az commands | `what-if` asks Azure for the diff; exact for a new group, but on a live cluster it lists every server-side default the template omits as a "Delete" (a redeploy does not actually remove them) |
+| Re-run on an existing cluster | reuses an existing pool as it is (counts, taints) | re-applies every declared setting. With the same parameters it changes nothing, and an autoscaled pool keeps its current count; a redeploy with other pool settings changes the live pools (not tested) |
+| Busy cluster | waits and retries for up to 20 minutes | a deployment (and `what-if`) is refused at preflight with OperationNotAllowed; re-run it once the other operation ends |
 | Order of operations | create cluster, add Kata pool, `az aks update` (attach registry, reconcile), retry while the cluster is busy | one deployment; Azure orders the resources |
 | Registry name default | `aei` + sha256 of subscription/group/cluster | `aei` + `uniqueString(group, cluster)`; pass `acrName` to match, or `AKS_ACR_NAME` to `delete-aks` when it keeps the group |
 | Existing registry (`AKS_ATTACH_ACR`) | yes | not modelled (`createAcr=false` and assign AcrPull yourself) |
@@ -49,14 +50,30 @@ How the two compare:
 Either way, the role assignments need Owner or User Access Administrator on the
 resource group.
 
-What has been checked: `az bicep build` and `az bicep lint` pass, and a `what-if`
-(at subscription scope, with a throwaway wrapper that declares the resource group, so
-nothing was created) shows the resource group plus registry, AcrPull assignment and
-cluster, and with `publicIpName` also the public IP and its Network Contributor
-assignment, with the pool settings and tags above. It has NOT been deployed. Still
-open: whether the `kata-vm-isolation` RuntimeClass appears when the Kata pool is part
-of the cluster's creation (the script follows the AKS docs and runs `az aks update`
-after adding the pool), and the effect of redeploying onto a running cluster.
+What has been checked (2026-11-15, westus2, defaults plus `publicIpName` and
+`publicIpDnsLabel`):
+
+- `az bicep build` and `az bicep lint` pass; `what-if` against a group that did not
+  exist yet listed exactly the resources above.
+- The deployment succeeded first time, in one step. The cluster has both pools as
+  declared (the Kata pool with `KataVmIsolation`, autoscaling 1-3 and its taint) and
+  the `stable` / `NodeImage` channels.
+- The `kata-vm-isolation` RuntimeClass was there without the `az aks update` the
+  script runs after adding the pool. A pod with only that RuntimeClass and the
+  toleration ran on the Kata pool in a Kata VM (guest kernel differs from the node's),
+  from an image in the new registry, pulled with no pull secret (AcrPull works).
+- A LoadBalancer Service with the two annotations got the static address (the
+  Network Contributor assignment works).
+- Minutes after creation, the subscription's Azure Policy installed the Defender
+  extension; while it did, `what-if` and a redeploy were refused (the busy-cluster
+  row above).
+- A redeploy with the same parameters succeeded in about two minutes with no change
+  and no node replaced. After the autoscaler had grown the Kata pool to two nodes
+  for 25 Kata pods, another redeploy (the template says `count: 1`) left both nodes
+  and every pod as they were.
+
+Not tested: redeploying with different pool settings (VM size, taints), which AKS
+may refuse on an existing pool or apply by replacing nodes.
 
 Why keep the script: the steps Bicep cannot do (preflight, kubeconfig, the smoke pod,
 the printed `make deploy` command) are most of `create-aks`, and its reuse-as-is
