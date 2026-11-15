@@ -112,6 +112,24 @@ AKS_ATTACH_ACR="${AKS_ATTACH_ACR:-}"
 AKS_ACR_NAME="${AKS_ACR_NAME:-}"
 AKS_ACR_SKU="${AKS_ACR_SKU:-Basic}"
 
+# A static public IP for an app on the cluster (optional; AEI itself needs none). An
+# app that must be reachable at an address that does not change, one you can give to
+# a DNS record, an OAuth app's callback or a webhook, puts it on a Service of type
+# LoadBalancer; `create` prints the two annotations that do that.
+#   AKS_PUBLIC_IP=<name>           create (or reuse) a Standard, static IPv4 address
+#                                  with this name. Empty (the default): none.
+#   AKS_PUBLIC_IP_DNS_LABEL=<label>  also give it the DNS name
+#                                  <label>.<location>.cloudapp.azure.com, known before
+#                                  the address is (the label must be unique in the
+#                                  region). Applied at creation only.
+# The address lives in AKS_RESOURCE_GROUP, not in the cluster's managed node resource
+# group, so it is not tied to any one Service: deleting and re-creating the Service
+# (a redeploy) keeps it. delete-aks removes it with the rest. The cluster's identity
+# is given Network Contributor on that one address, which the cloud provider needs to
+# use an address outside the node resource group.
+AKS_PUBLIC_IP="${AKS_PUBLIC_IP:-}"
+AKS_PUBLIC_IP_DNS_LABEL="${AKS_PUBLIC_IP_DNS_LABEL:-}"
+
 AKS_DRY_RUN="${AKS_DRY_RUN:-}"
 AKS_CONFIRM_DELETE="${AKS_CONFIRM_DELETE:-}"
 
@@ -241,10 +259,67 @@ default_acr_name() {
 group_tag()   { az group show --subscription "${SUB}" -n "${AKS_RESOURCE_GROUP}" --query "tags.\"${OWNER_TAG_KEY}\"" -o tsv 2>/dev/null || true; }
 cluster_tag() { az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query "tags.\"${OWNER_TAG_KEY}\"" -o tsv 2>/dev/null || true; }
 acr_tag()     { az acr show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1" --query "tags.\"${OWNER_TAG_KEY}\"" -o tsv 2>/dev/null || true; }
+ip_tag()      { az network public-ip show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1" --query "tags.\"${OWNER_TAG_KEY}\"" -o tsv 2>/dev/null || true; }
 
 group_exists()   { ! dry && [ "$(az group exists --subscription "${SUB}" -n "${AKS_RESOURCE_GROUP}" 2>/dev/null)" = true ]; }
 cluster_exists() { ! dry && az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" -o none 2>/dev/null; }
 acr_exists()     { ! dry && az acr show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1" -o none 2>/dev/null; }
+ip_exists()      { ! dry && az network public-ip show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1" -o none 2>/dev/null; }
+
+# public_ip creates (or reuses) AKS_PUBLIC_IP and lets the cluster use it. The role
+# goes to the cluster's own (control plane) identity, which is what the cloud
+# provider's load balancer code acts as, and is scoped to the one address.
+public_ip() {
+	[ -n "${AKS_PUBLIC_IP}" ] || return 0
+	say "static public IP '${AKS_PUBLIC_IP}'${AKS_PUBLIC_IP_DNS_LABEL:+ (DNS label '${AKS_PUBLIC_IP_DNS_LABEL}')}"
+	if ip_exists "${AKS_PUBLIC_IP}"; then
+		echo "    exists; reusing"
+	else
+		local dns=()
+		[ -z "${AKS_PUBLIC_IP_DNS_LABEL}" ] || dns=(--dns-name "${AKS_PUBLIC_IP_DNS_LABEL}")
+		run az network public-ip create --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" \
+			--name "${AKS_PUBLIC_IP}" --location "${AKS_LOCATION}" --sku Standard --version IPv4 \
+			--allocation-method Static ${dns[@]+"${dns[@]}"} --tags "${OWNER_TAG}" --output none
+	fi
+	if dry; then
+		run az role assignment create --assignee-object-id "<cluster identity>" --assignee-principal-type ServicePrincipal \
+			--role "Network Contributor" --scope "<public IP id>" --output none
+		return 0
+	fi
+	local principal ip_id
+	principal="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query identity.principalId -o tsv)"
+	ip_id="$(az network public-ip show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_PUBLIC_IP}" --query id -o tsv)"
+	[ -n "${principal}" ] || die "cluster '${AKS_CLUSTER}' has no system-assigned identity to give the public IP to"
+	if [ -n "$(az role assignment list --subscription "${SUB}" --assignee "${principal}" --scope "${ip_id}" \
+		--role "Network Contributor" --query '[].id' -o tsv 2>/dev/null)" ]; then
+		echo "    the cluster identity already has Network Contributor on it"
+	else
+		# A new cluster identity can take a minute to be visible to role assignment.
+		local i
+		for i in 1 2 3 4 5 6; do
+			if run az role assignment create --assignee-object-id "${principal}" --assignee-principal-type ServicePrincipal \
+				--role "Network Contributor" --scope "${ip_id}" --output none; then
+				break
+			fi
+			[ "${i}" != 6 ] || die "could not give the cluster identity Network Contributor on ${ip_id} (assigning roles needs Owner or User Access Administrator)"
+			echo "    retrying in 20s"
+			sleep 20
+		done
+	fi
+}
+
+# public_ip_field prints one field of AKS_PUBLIC_IP: ipAddress or dnsSettings.fqdn.
+public_ip_field() {
+	if dry; then
+		case "$1" in
+			ipAddress) echo "<address>" ;;
+			*) [ -z "${AKS_PUBLIC_IP_DNS_LABEL}" ] || echo "${AKS_PUBLIC_IP_DNS_LABEL}.${AKS_LOCATION}.cloudapp.azure.com" ;;
+		esac
+		return 0
+	fi
+	az network public-ip show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_PUBLIC_IP}" \
+		--query "$1" -o tsv 2>/dev/null || true
+}
 
 kc() { kubectl --kubeconfig "${AKS_KUBECONFIG}" "$@"; }
 
@@ -390,6 +465,8 @@ create() {
 		--node-os-upgrade-channel "${AKS_NODE_OS_UPGRADE_CHANNEL}" \
 		${attach[@]+"${attach[@]}"} --output none
 
+	public_ip
+
 	# Credentials go to a fresh temporary file that then replaces the target, so a
 	# stale or unrelated file at that path is never merged into.
 	say "writing kubeconfig to ${AKS_KUBECONFIG}"
@@ -468,6 +545,13 @@ EOF
 		echo "  kubectl --kubeconfig ${AKS_KUBECONFIG} -n default describe pod aei-kata-smoke" >&2
 		exit 1
 	fi
+
+	# Not something AEI uses; reported for apps that keep data on a volume. AKS ships
+	# Azure Disk StorageClasses: 'default' (the default; Standard SSD, like
+	# managed-csi) and managed-csi-premium. A disk attaches to one node at a time, so
+	# a claim on it is ReadWriteOnce.
+	say "default StorageClass (for apps' PersistentVolumeClaims)"
+	kc get storageclass -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}    {.metadata.name}: {.provisioner}, {.parameters.skuname}, reclaim {.reclaimPolicy}, binding {.volumeBindingMode}{"\n"}{end}'
 }
 
 next_steps() {
@@ -487,9 +571,22 @@ next_steps() {
 	echo "  make install-agent-sandbox KUBECONFIG=${AKS_KUBECONFIG}"
 	echo "  make deploy KUBECONFIG=${AKS_KUBECONFIG} IMG=${img} PROVIDERS=agent-sandbox ISOLATION_CLASS=${AKS_RUNTIME_CLASS}${POOL_TAINTS:+ RUNTIME_TOLERATIONS=${POOL_TAINTS}}"
 	echo "  make public-key KUBECONFIG=${AKS_KUBECONFIG}"
+	if [ -n "${AKS_PUBLIC_IP}" ]; then
+		local addr fqdn
+		addr="$(public_ip_field ipAddress)"
+		fqdn="$(public_ip_field dnsSettings.fqdn)"
+		echo
+		echo "Static public IP '${AKS_PUBLIC_IP}': ${addr}${fqdn:+ (${fqdn})}. A Service of type LoadBalancer"
+		echo "gets it with these two annotations:"
+		echo "  service.beta.kubernetes.io/azure-load-balancer-resource-group: ${AKS_RESOURCE_GROUP}"
+		echo "  service.beta.kubernetes.io/azure-pip-name: ${AKS_PUBLIC_IP}"
+		echo "To limit who can connect, add service.beta.kubernetes.io/azure-allowed-ip-ranges (CIDRs)"
+		echo "and/or .../azure-allowed-service-tags (service tags). Do not combine a service tag with"
+		echo "spec.loadBalancerSourceRanges: kube-proxy enforces that list too and drops the tagged sources."
+	fi
 	echo
 	echo "The cluster bills while it exists. Remove it with:"
-	echo "  make delete-aks AKS_SUBSCRIPTION=${SUB} AKS_RESOURCE_GROUP=${AKS_RESOURCE_GROUP} AKS_CLUSTER=${AKS_CLUSTER} AKS_CONFIRM_DELETE=${AKS_RESOURCE_GROUP}"
+	echo "  make delete-aks AKS_SUBSCRIPTION=${SUB} AKS_RESOURCE_GROUP=${AKS_RESOURCE_GROUP} AKS_CLUSTER=${AKS_CLUSTER}${AKS_PUBLIC_IP:+ AKS_PUBLIC_IP=${AKS_PUBLIC_IP}} AKS_CONFIRM_DELETE=${AKS_RESOURCE_GROUP}"
 }
 
 # delete removes only what carries the ownership tag. If `create` made the resource
@@ -504,13 +601,14 @@ delete() {
 	}
 
 	local acr="${AKS_ACR_NAME:-$(default_acr_name)}"
-	local own_group="" own_cluster="" own_acr=""
+	local own_group="" own_cluster="" own_acr="" own_ip=""
 	if dry; then
 		own_group=1
 	else
 		[ "$(group_tag)" != "${OWNER_TAG_VALUE}" ] || own_group=1
 		[ "$(cluster_tag)" != "${OWNER_TAG_VALUE}" ] || own_cluster=1
 		[ "$(acr_tag "${acr}")" != "${OWNER_TAG_VALUE}" ] || own_acr=1
+		[ -z "${AKS_PUBLIC_IP}" ] || [ "$(ip_tag "${AKS_PUBLIC_IP}")" != "${OWNER_TAG_VALUE}" ] || own_ip=1
 	fi
 
 	say "delete plan for resource group '${AKS_RESOURCE_GROUP}'"
@@ -522,6 +620,8 @@ delete() {
 		echo "    The group was NOT created by create-aks (no ${OWNER_TAG} tag): it is kept."
 		if [ -n "${own_cluster}" ]; then echo "      - delete AKS cluster '${AKS_CLUSTER}'"; else echo "      - keep AKS cluster '${AKS_CLUSTER}' (absent, or not created by create-aks)"; fi
 		if [ -n "${own_acr}" ]; then echo "      - delete container registry '${acr}'"; else echo "      - keep container registry '${acr}' (absent, or not created by create-aks)"; fi
+		if [ -n "${own_ip}" ]; then echo "      - delete public IP '${AKS_PUBLIC_IP}'"
+		elif [ -n "${AKS_PUBLIC_IP}" ]; then echo "      - keep public IP '${AKS_PUBLIC_IP}' (absent, or not created by create-aks)"; fi
 	fi
 	local kubeconfig_ours=""
 	if [ -f "${AKS_KUBECONFIG}" ] && grep -q "^current-context: ${AKS_CLUSTER}\$" "${AKS_KUBECONFIG}"; then
@@ -529,7 +629,7 @@ delete() {
 		echo "    The kubeconfig file ${AKS_KUBECONFIG} is removed."
 	fi
 
-	if [ -z "${own_group}${own_cluster}${own_acr}${kubeconfig_ours}" ]; then
+	if [ -z "${own_group}${own_cluster}${own_acr}${own_ip}${kubeconfig_ours}" ]; then
 		echo "nothing here was created by create-aks; nothing to delete"
 		return 0
 	fi
@@ -544,6 +644,8 @@ delete() {
 	else
 		[ -z "${own_cluster}" ] || run az aks delete --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" --yes
 		[ -z "${own_acr}" ] || run az acr delete --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${acr}" --yes
+		# After the cluster: its load balancer holds the address until the cluster is gone.
+		[ -z "${own_ip}" ] || run az network public-ip delete --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_PUBLIC_IP}"
 	fi
 	if [ -n "${kubeconfig_ours}" ] || dry; then
 		run rm -f "${AKS_KUBECONFIG}"
