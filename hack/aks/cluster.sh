@@ -134,6 +134,37 @@ run() {
 	dry || "$@"
 }
 
+# run_when_idle is run for a change to an existing cluster. AKS takes one change at a
+# time per cluster and refuses the next with OperationNotAllowed while another is in
+# progress, and the other one need not be ours: a subscription's Azure Policy
+# (deployIfNotExists) can install an add-on or extension on a new cluster a few
+# minutes after it is created. So on that error it waits and tries again, for up to
+# 20 minutes; any other error fails at once.
+run_when_idle() {
+	printf '+'
+	printf ' %q' "$@"
+	printf '\n'
+	dry && return 0
+	local attempt out
+	for attempt in $(seq 1 40); do
+		if out="$("$@" 2>&1)"; then
+			[ -z "${out}" ] || printf '%s\n' "${out}"
+			return 0
+		fi
+		case "${out}" in
+			*OperationNotAllowed*|*"in-progress"*|*"another operation"*)
+				echo "    the cluster is busy with another operation; retrying in 30s (${attempt}/40):"
+				printf '%s\n' "${out}" | grep -m1 -E "Message:|ERROR:" | cut -c1-200 | sed 's/^/      /'
+				sleep 30 ;;
+			*)
+				printf '%s\n' "${out}" >&2
+				return 1 ;;
+		esac
+	done
+	printf '%s\n' "${out}" >&2
+	die "the cluster stayed busy for 20 minutes; re-run create-aks once its other operation has finished"
+}
+
 SUB=""
 SUB_NAME=""
 
@@ -328,7 +359,7 @@ create() {
 		"")
 			# The requested settings are shown only here: a reused pool keeps its own.
 			echo "    creating: ${sizing} (KataVmIsolation, AzureLinux), taint '${AKS_KATA_TAINT:-none}'"
-			run az aks nodepool add --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" \
+			run_when_idle az aks nodepool add --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" \
 				--cluster-name "${AKS_CLUSTER}" --name "${AKS_KATA_POOL}" --mode User \
 				--node-count "${AKS_KATA_NODE_COUNT}" ${scaling[@]+"${scaling[@]}"} \
 				--node-vm-size "${AKS_KATA_VM_SIZE}" \
@@ -351,7 +382,7 @@ create() {
 	else
 		say "reconciling the cluster: upgrade channels ${AKS_AUTO_UPGRADE_CHANNEL}/${AKS_NODE_OS_UPGRADE_CHANNEL} (no registry: AKS_CREATE_ACR=${AKS_CREATE_ACR})"
 	fi
-	run az aks update --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" \
+	run_when_idle az aks update --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" \
 		--auto-upgrade-channel "${AKS_AUTO_UPGRADE_CHANNEL}" \
 		--node-os-upgrade-channel "${AKS_NODE_OS_UPGRADE_CHANNEL}" \
 		${attach[@]+"${attach[@]}"} --output none
