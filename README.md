@@ -91,7 +91,8 @@ make public-key KUBECONFIG=/path/to/kubeconfig
 
 AEI does not need AKS and does not manage clusters. `make create-aks` is a
 convenience for getting one that satisfies AEI, the way `make kind-up` is for the dev
-loop; everything Azure-specific is in [hack/aks/](hack/aks/).
+loop; everything Azure-specific is in [hack/aks/](hack/aks/). A Bicep prototype of
+the same resources, and how it compares, is in [hack/aks/README.md](hack/aks/README.md).
 
 ```sh
 make create-aks AKS_DRY_RUN=1     # print the az commands, create nothing
