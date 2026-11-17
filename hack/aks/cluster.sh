@@ -52,6 +52,19 @@ AKS_KUBERNETES_VERSION="${AKS_KUBERNETES_VERSION:-}"
 # an AKS planned-maintenance window (not set here) controls when.
 AKS_AUTO_UPGRADE_CHANNEL="${AKS_AUTO_UPGRADE_CHANNEL:-stable}"
 AKS_NODE_OS_UPGRADE_CHANNEL="${AKS_NODE_OS_UPGRADE_CHANNEL:-NodeImage}"
+# Microsoft Entra ID for the cluster's API: people sign in with Entra identities, and
+# Azure RBAC authorizes their Kubernetes requests. Many organizations' Azure Policy
+# refuses an AKS cluster without it (RequestDisallowedByPolicy, citing
+# Azure_KubernetesService_AuthN_Enabled_Microsoft_Entra_ID).
+#   AKS_ENTRA_ID=true (the default) | false
+#   AKS_ENTRA_ADMIN_GROUPS=<group object id>[,<id>...]   Entra groups made cluster
+#                          admins. Empty: none; use AKS_KUBECONFIG_CREDENTIALS=admin,
+#                          or give people an Azure RBAC role on the cluster.
+# Applied when the cluster is CREATED. A reused cluster keeps what it has: turning
+# Entra ID on cannot be undone, so create-aks never does it on its own. Local
+# accounts stay enabled, so the admin kubeconfig (below) works either way.
+AKS_ENTRA_ID="${AKS_ENTRA_ID:-true}"
+AKS_ENTRA_ADMIN_GROUPS="${AKS_ENTRA_ADMIN_GROUPS:-}"
 
 # System pool: the AEI controller and cluster add-ons. No agent run needs to land here.
 AKS_SYSTEM_POOL="${AKS_SYSTEM_POOL:-system}"
@@ -100,6 +113,17 @@ AKS_RUNTIME_CLASS="${AKS_RUNTIME_CLASS:-kata-vm-isolation}"
 # Where the cluster's credentials go. Always a file of its own, replaced whole on
 # every run; never merged into ~/.kube/config.
 AKS_KUBECONFIG="${AKS_KUBECONFIG:-${HOME}/.kube/aei-aks-${AKS_CLUSTER}.kubeconfig}"
+# Which credentials that file carries:
+#   admin (default)  the cluster's local admin certificate. Works without kubelogin
+#                    and without any role on the cluster, with or without Entra ID,
+#                    as long as the cluster's local accounts are enabled.
+#   user             with Entra ID: your Entra identity, through kubelogin (install
+#                    it with `az aks install-cli` or your package manager), signed in
+#                    as az is. You need an Azure RBAC role on the cluster (e.g.
+#                    "Azure Kubernetes Service RBAC Cluster Admin") or membership in
+#                    AKS_ENTRA_ADMIN_GROUPS. Without Entra ID: the cluster-user
+#                    certificate.
+AKS_KUBECONFIG_CREDENTIALS="${AKS_KUBECONFIG_CREDENTIALS:-admin}"
 
 # Registry. By default an Azure Container Registry is created in the resource group
 # and attached to the cluster (the kubelet identity gets AcrPull, so no pull secrets).
@@ -353,6 +377,12 @@ create() {
 	case "${AKS_KUBECONFIG}" in
 		"${HOME}/.kube/config") die "AKS_KUBECONFIG is your default kubeconfig; this file is replaced whole, so choose another path" ;;
 	esac
+	case "${AKS_ENTRA_ID}" in true|false) ;; *) die "AKS_ENTRA_ID must be true or false (got '${AKS_ENTRA_ID}')" ;; esac
+	case "${AKS_KUBECONFIG_CREDENTIALS}" in admin|user) ;; *) die "AKS_KUBECONFIG_CREDENTIALS must be admin or user (got '${AKS_KUBECONFIG_CREDENTIALS}')" ;; esac
+	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = user ] && [ "${AKS_ENTRA_ID}" = true ] && ! command -v kubelogin >/dev/null 2>&1; then
+		local msg="AKS_KUBECONFIG_CREDENTIALS=user on an Entra ID cluster needs kubelogin ('az aks install-cli', or your package manager); or use AKS_KUBECONFIG_CREDENTIALS=admin"
+		if dry; then echo "WARNING: ${msg}"; else die "${msg}"; fi
+	fi
 
 	local acr="" acr_create=""
 	if [ -n "${AKS_ATTACH_ACR}" ]; then
@@ -395,9 +425,27 @@ create() {
 		fi
 	fi
 
-	say "AKS cluster '${AKS_CLUSTER}': system pool '${AKS_SYSTEM_POOL}' = ${AKS_SYSTEM_NODE_COUNT} x ${AKS_SYSTEM_VM_SIZE}"
+	local entra=() entra_desc=", Entra ID off"
+	if [ "${AKS_ENTRA_ID}" = true ]; then
+		entra=(--enable-aad --enable-azure-rbac)
+		entra_desc=", Entra ID with Azure RBAC"
+		if [ -n "${AKS_ENTRA_ADMIN_GROUPS}" ]; then
+			entra=(--enable-aad --enable-azure-rbac --aad-admin-group-object-ids "${AKS_ENTRA_ADMIN_GROUPS}")
+			entra_desc="${entra_desc} (admin groups ${AKS_ENTRA_ADMIN_GROUPS})"
+		fi
+	fi
+	say "AKS cluster '${AKS_CLUSTER}': system pool '${AKS_SYSTEM_POOL}' = ${AKS_SYSTEM_NODE_COUNT} x ${AKS_SYSTEM_VM_SIZE}${entra_desc}"
 	if cluster_exists; then
-		echo "    exists; reusing"
+		if [ "$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query 'aadProfile.managed' -o tsv 2>/dev/null || true)" = true ]; then
+			echo "    exists (Entra ID on); reusing"
+		else
+			echo "    exists (Entra ID off); reusing as it is"
+			if [ "${AKS_ENTRA_ID}" = true ]; then
+				echo "    NOTE: create-aks does not turn Entra ID on for an existing cluster: it cannot be undone. To do it"
+				echo "    yourself: az aks update -g ${AKS_RESOURCE_GROUP} -n ${AKS_CLUSTER} --enable-aad --enable-azure-rbac"
+				echo "    If an Azure Policy here requires Entra ID, the 'az aks update' below may be refused until you do."
+			fi
+		fi
 	else
 		local version=()
 		[ -z "${AKS_KUBERNETES_VERSION}" ] || version=(--kubernetes-version "${AKS_KUBERNETES_VERSION}")
@@ -409,7 +457,7 @@ create() {
 			--node-vm-size "${AKS_SYSTEM_VM_SIZE}" --os-sku AzureLinux \
 			--auto-upgrade-channel "${AKS_AUTO_UPGRADE_CHANNEL}" \
 			--node-os-upgrade-channel "${AKS_NODE_OS_UPGRADE_CHANNEL}" \
-			--enable-managed-identity --no-ssh-key --tags "${OWNER_TAG}" --output none
+			--enable-managed-identity --no-ssh-key ${entra[@]+"${entra[@]}"} --tags "${OWNER_TAG}" --output none
 	fi
 
 	local scaling=() sizing="${AKS_KATA_NODE_COUNT} x ${AKS_KATA_VM_SIZE}, fixed size"
@@ -469,12 +517,27 @@ create() {
 
 	# Credentials go to a fresh temporary file that then replaces the target, so a
 	# stale or unrelated file at that path is never merged into.
-	say "writing kubeconfig to ${AKS_KUBECONFIG}"
+	local cluster_entra="${AKS_ENTRA_ID}"
+	dry || cluster_entra="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query 'aadProfile.managed' -o tsv 2>/dev/null || true)"
+	local cred=() cred_desc="the cluster-user certificate"
+	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = admin ]; then
+		cred=(--admin)
+		cred_desc="the cluster's local admin certificate"
+	elif [ "${cluster_entra}" = true ]; then
+		cred_desc="your Entra identity, via kubelogin"
+	fi
+	say "writing kubeconfig to ${AKS_KUBECONFIG} (${cred_desc})"
 	local tmp="${AKS_KUBECONFIG}.tmp.$$"
 	run mkdir -p "$(dirname "${AKS_KUBECONFIG}")"
 	run rm -f "${tmp}"
+	# --admin fails, with az saying why, on a cluster whose local accounts are disabled;
+	# use AKS_KUBECONFIG_CREDENTIALS=user there.
 	run az aks get-credentials --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" \
-		--file "${tmp}" --only-show-errors --output none
+		${cred[@]+"${cred[@]}"} --file "${tmp}" --only-show-errors --output none
+	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = user ] && [ "${cluster_entra}" = true ]; then
+		# Sign in the way az already is, instead of an interactive device-code prompt.
+		run kubelogin convert-kubeconfig --login azurecli --kubeconfig "${tmp}"
+	fi
 	run chmod 600 "${tmp}"
 	run mv -f "${tmp}" "${AKS_KUBECONFIG}"
 
@@ -624,7 +687,8 @@ delete() {
 		elif [ -n "${AKS_PUBLIC_IP}" ]; then echo "      - keep public IP '${AKS_PUBLIC_IP}' (absent, or not created by create-aks)"; fi
 	fi
 	local kubeconfig_ours=""
-	if [ -f "${AKS_KUBECONFIG}" ] && grep -q "^current-context: ${AKS_CLUSTER}\$" "${AKS_KUBECONFIG}"; then
+	# The context is <cluster> for user credentials and <cluster>-admin for admin ones.
+	if [ -f "${AKS_KUBECONFIG}" ] && grep -q "^current-context: ${AKS_CLUSTER}\(-admin\)\{0,1\}\$" "${AKS_KUBECONFIG}"; then
 		kubeconfig_ours=1
 		echo "    The kubeconfig file ${AKS_KUBECONFIG} is removed."
 	fi

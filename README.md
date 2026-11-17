@@ -108,12 +108,19 @@ It creates, or reuses if they exist:
 - a resource group and an AKS cluster with a small system pool and a user pool for
   agent runs with [Pod Sandboxing](https://learn.microsoft.com/azure/aks/use-pod-sandboxing)
   (`--workload-runtime KataVmIsolation`, Azure Linux, a nested-virtualization VM
-  size), the only nodes that pods with the `kata-vm-isolation` RuntimeClass run on;
+  size), the only nodes that pods with the `kata-vm-isolation` RuntimeClass run on.
+  A new cluster gets Microsoft Entra ID sign-in with Azure RBAC, which some
+  subscriptions' Azure Policy requires (`AKS_ENTRA_ID=false` turns it off;
+  `AKS_ENTRA_ADMIN_GROUPS=<group ids>` names admin groups). A reused cluster keeps
+  what it has: create-aks never turns Entra ID on for one, since that cannot be undone;
 - an Azure Container Registry attached to the cluster, so nodes pull without pull
   secrets (`AKS_CREATE_ACR=false` skips it, `AKS_ATTACH_ACR=<registry>` attaches one
   you already have);
 - a kubeconfig file of its own (`AKS_KUBECONFIG`, default
-  `~/.kube/aei-aks-<cluster>.kubeconfig`). Your default kubeconfig is not touched;
+  `~/.kube/aei-aks-<cluster>.kubeconfig`). Your default kubeconfig is not touched. It
+  holds the cluster's local admin certificate, which needs no kubelogin and no role
+  on the cluster; `AKS_KUBECONFIG_CREDENTIALS=user` holds your Entra identity instead,
+  through kubelogin, for which you need an Azure RBAC role on the cluster;
 - only with `AKS_PUBLIC_IP=<name>`: a static public IP for an app that must be
   reachable at an address that does not change (a DNS record, an OAuth callback, a
   webhook). `AKS_PUBLIC_IP_DNS_LABEL=<label>` also gives it the name

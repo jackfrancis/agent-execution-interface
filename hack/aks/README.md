@@ -13,7 +13,9 @@ the same defaults:
 - the AKS cluster: system pool (`Standard_D2s_v7`, Azure Linux) and Kata pool
   (`workloadRuntime: KataVmIsolation`, `Standard_D4s_v7`, autoscaling 1-3, taint
   `aei.dev/agent-runs=true:NoSchedule`), upgrade channels `stable` / `NodeImage`,
-  system-assigned identity, no SSH key;
+  system-assigned identity, no SSH key, Microsoft Entra ID with Azure RBAC
+  (`entraId`, `entraAdminGroups`; added after the check below, and not deployed from
+  this file since);
 - a Basic container registry, and AcrPull on it for the kubelet identity (what
   `--attach-acr` does);
 - only when `publicIpName` is set: a Standard static IPv4 public IP (with

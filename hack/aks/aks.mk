@@ -14,7 +14,12 @@
 #     AKS_KUBERNETES_VERSION=           (empty: the AKS default; a starting point)
 #     AKS_AUTO_UPGRADE_CHANNEL=stable   AKS_NODE_OS_UPGRADE_CHANNEL=NodeImage
 #                                       automatic Kubernetes / node OS image upgrades
+#     AKS_ENTRA_ID=true                 Microsoft Entra ID + Azure RBAC on a NEW cluster
+#                                       (some Azure Policies require it); false: off
+#     AKS_ENTRA_ADMIN_GROUPS=<ids>      Entra groups made cluster admins (default: none)
 #     AKS_KUBECONFIG=~/.kube/aei-aks-<cluster>.kubeconfig
+#     AKS_KUBECONFIG_CREDENTIALS=admin  the cluster's admin certificate; user: your Entra
+#                                       identity via kubelogin
 #     AKS_CREATE_ACR=true | AKS_ATTACH_ACR=<existing registry> | AKS_ACR_NAME=<name>
 #     AKS_PUBLIC_IP=<name> [AKS_PUBLIC_IP_DNS_LABEL=<label>]   a static public IP for an
 #                                       app's LoadBalancer Service (default: none)
