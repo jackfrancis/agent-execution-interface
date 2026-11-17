@@ -32,8 +32,15 @@ or secret; pass real values with `-p` on the command line, and do not commit a
 az group create -n aei -l westus2 --tags aei-created-by=make-create-aks
 az deployment group what-if -g aei -f hack/aks/main.bicep -p publicIpName=aei-ip   # preview
 az deployment group create  -g aei -f hack/aks/main.bicep -p publicIpName=aei-ip   # bills
-az aks get-credentials -g aei -n aei --file ~/.kube/aei-aks-aei.kubeconfig
+az aks get-credentials -g aei -n aei --admin --file ~/.kube/aei-aks-aei.kubeconfig
 ```
+
+`--admin` is the cluster's local admin certificate, as `create-aks` writes by default.
+Without it, on a cluster with Entra ID (`entraId`, the default), you get a kubeconfig
+for your Entra identity, which needs kubelogin (`kubelogin convert-kubeconfig --login
+azurecli`) and a Kubernetes role the template does not grant: membership in one of
+`entraAdminGroups`, or an Azure RBAC role on the cluster such as "Azure Kubernetes
+Service RBAC Cluster Admin".
 
 How the two compare:
 

@@ -379,7 +379,16 @@ create() {
 	esac
 	case "${AKS_ENTRA_ID}" in true|false) ;; *) die "AKS_ENTRA_ID must be true or false (got '${AKS_ENTRA_ID}')" ;; esac
 	case "${AKS_KUBECONFIG_CREDENTIALS}" in admin|user) ;; *) die "AKS_KUBECONFIG_CREDENTIALS must be admin or user (got '${AKS_KUBECONFIG_CREDENTIALS}')" ;; esac
-	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = user ] && [ "${AKS_ENTRA_ID}" = true ] && ! command -v kubelogin >/dev/null 2>&1; then
+	# The cluster's Entra ID mode as it will be: an existing cluster's own (AKS_ENTRA_ID
+	# applies only at creation), otherwise AKS_ENTRA_ID. Settled here, before anything
+	# changes, so that what depends on it (kubelogin, below) stops the run up front.
+	local exists="" cluster_entra="${AKS_ENTRA_ID}"
+	if cluster_exists; then
+		exists=1
+		cluster_entra="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query 'aadProfile.managed' -o tsv 2>/dev/null || true)"
+		[ "${cluster_entra}" = true ] || cluster_entra=false
+	fi
+	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = user ] && [ "${cluster_entra}" = true ] && ! command -v kubelogin >/dev/null 2>&1; then
 		local msg="AKS_KUBECONFIG_CREDENTIALS=user on an Entra ID cluster needs kubelogin ('az aks install-cli', or your package manager); or use AKS_KUBECONFIG_CREDENTIALS=admin"
 		if dry; then echo "WARNING: ${msg}"; else die "${msg}"; fi
 	fi
@@ -435,8 +444,8 @@ create() {
 		fi
 	fi
 	say "AKS cluster '${AKS_CLUSTER}': system pool '${AKS_SYSTEM_POOL}' = ${AKS_SYSTEM_NODE_COUNT} x ${AKS_SYSTEM_VM_SIZE}${entra_desc}"
-	if cluster_exists; then
-		if [ "$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query 'aadProfile.managed' -o tsv 2>/dev/null || true)" = true ]; then
+	if [ -n "${exists}" ]; then
+		if [ "${cluster_entra}" = true ]; then
 			echo "    exists (Entra ID on); reusing"
 		else
 			echo "    exists (Entra ID off); reusing as it is"
@@ -517,8 +526,6 @@ create() {
 
 	# Credentials go to a fresh temporary file that then replaces the target, so a
 	# stale or unrelated file at that path is never merged into.
-	local cluster_entra="${AKS_ENTRA_ID}"
-	dry || cluster_entra="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query 'aadProfile.managed' -o tsv 2>/dev/null || true)"
 	local cred=() cred_desc="the cluster-user certificate"
 	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = admin ]; then
 		cred=(--admin)
@@ -536,7 +543,17 @@ create() {
 		${cred[@]+"${cred[@]}"} --file "${tmp}" --only-show-errors --output none
 	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = user ] && [ "${cluster_entra}" = true ]; then
 		# Sign in the way az already is, instead of an interactive device-code prompt.
-		run kubelogin convert-kubeconfig --login azurecli --kubeconfig "${tmp}"
+		# kubelogin's azurecli mode drops the tenant the kubeconfig names and would ask
+		# for a token in az's active tenant, which need not be AKS_SUBSCRIPTION's; so the
+		# cluster's own Entra tenant is passed explicitly. (--tenant-id rather than
+		# --subscription: the latter needs kubelogin 0.2.19 or later.)
+		local tenant="<tenant>"
+		if ! dry; then
+			tenant="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query 'aadProfile.tenantId' -o tsv 2>/dev/null || true)"
+			[ -n "${tenant}" ] || tenant="$(az account show --subscription "${SUB}" --query tenantId -o tsv)"
+			[ -n "${tenant}" ] || die "could not find the Entra tenant of cluster '${AKS_CLUSTER}'"
+		fi
+		run kubelogin convert-kubeconfig --login azurecli --tenant-id "${tenant}" --kubeconfig "${tmp}"
 	fi
 	run chmod 600 "${tmp}"
 	run mv -f "${tmp}" "${AKS_KUBECONFIG}"
