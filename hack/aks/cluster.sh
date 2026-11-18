@@ -252,6 +252,38 @@ require_kata_flag() {
 	if dry; then echo "WARNING: ${msg}"; else die "${msg}"; fi
 }
 
+# kubelogin_identity sets its caller's `who` to the `kubelogin convert-kubeconfig`
+# arguments under which az answers kubectl as this run's account (AKS_SUBSCRIPTION's),
+# in the cluster's Entra tenant. --subscription does both, but needs kubelogin 0.2.19
+# or later, and only fits when the cluster's tenant is its subscription's. Otherwise
+# --tenant-id picks the tenant, and az signs in as its ACTIVE account: fine when that
+# is this run's account, refused when it is not (the tenant matching) and noted
+# otherwise. (az takes a subscription or a tenant, not both.) $1 is non-empty for an
+# existing cluster; a cluster create makes is in its subscription's tenant.
+kubelogin_identity() {
+	local cluster_tenant="" sub_tenant help mine active
+	if [ -n "$1" ]; then
+		cluster_tenant="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query 'aadProfile.tenantId' -o tsv)" \
+			|| die "could not read the Entra tenant of cluster '${AKS_CLUSTER}'; nothing was changed"
+	fi
+	sub_tenant="$(az account show --subscription "${SUB}" --query tenantId -o tsv)" || die "could not read the tenant of subscription ${SUB}"
+	[ -n "${cluster_tenant}" ] || cluster_tenant="${sub_tenant}"
+	help="$(kubelogin convert-kubeconfig --help 2>&1 || true)"
+	if [ "${cluster_tenant}" = "${sub_tenant}" ]; then
+		case "${help}" in
+			*--subscription*) who=(--subscription "${SUB}"); return 0 ;;
+		esac
+	fi
+	who=(--tenant-id "${cluster_tenant}")
+	mine="$(az account show --subscription "${SUB}" --query user.name -o tsv)"
+	active="$(az account show --query user.name -o tsv 2>/dev/null || true)"
+	[ "${mine}" != "${active}" ] || return 0
+	if [ "${cluster_tenant}" = "${sub_tenant}" ]; then
+		die "this kubelogin has no --subscription (it needs 0.2.19 or later), so kubectl would sign in as az's active account (${active:-none}) rather than ${mine}, which this run uses. Upgrade kubelogin, or run 'az account set --subscription ${SUB}', and re-run create-aks. Nothing was changed."
+	fi
+	echo "    NOTE: the cluster's Entra tenant (${cluster_tenant}) is not its subscription's; kubectl signs in to it as az's active account (${active:-none})."
+}
+
 # require_provider: a subscription must have a resource provider registered before
 # anything of that type can be created in it, and a subscription that has never held
 # a registry (or a cluster) has not. Registering is a one-time change to the
@@ -379,18 +411,37 @@ create() {
 	esac
 	case "${AKS_ENTRA_ID}" in true|false) ;; *) die "AKS_ENTRA_ID must be true or false (got '${AKS_ENTRA_ID}')" ;; esac
 	case "${AKS_KUBECONFIG_CREDENTIALS}" in admin|user) ;; *) die "AKS_KUBECONFIG_CREDENTIALS must be admin or user (got '${AKS_KUBECONFIG_CREDENTIALS}')" ;; esac
-	# The cluster's Entra ID mode as it will be: an existing cluster's own (AKS_ENTRA_ID
-	# applies only at creation), otherwise AKS_ENTRA_ID. Settled here, before anything
-	# changes, so that what depends on it (kubelogin, below) stops the run up front.
-	local exists="" cluster_entra="${AKS_ENTRA_ID}"
+	# What the credentials step depends on, settled here before anything changes, so a
+	# run that cannot finish stops up front: the cluster's Entra ID mode as it will be
+	# (an existing cluster's own, since AKS_ENTRA_ID applies only at creation; otherwise
+	# AKS_ENTRA_ID), and for an existing cluster whether its local accounts, which the
+	# admin credentials are, are disabled. A new cluster keeps local accounts enabled.
+	local exists="" cluster_entra="${AKS_ENTRA_ID}" state=""
 	if cluster_exists; then
 		exists=1
-		cluster_entra="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query 'aadProfile.managed' -o tsv 2>/dev/null || true)"
-		[ "${cluster_entra}" = true ] || cluster_entra=false
+		# aadProfile is present for either Entra ID integration: AKS-managed, or the
+		# retired legacy one, which signs in through kubelogin as well.
+		state="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" \
+			--query "join(' ', [to_string(aadProfile != null), to_string(disableLocalAccounts == \`true\`)])" -o tsv)" \
+			|| die "could not read the settings of cluster '${AKS_CLUSTER}' (az aks show failed above); nothing was changed"
+		case "${state}" in
+			"true true"|"true false"|"false true"|"false false") ;;
+			*) die "unexpected answer reading the settings of cluster '${AKS_CLUSTER}': '${state}'; nothing was changed" ;;
+		esac
+		cluster_entra="${state%% *}"
+		if [ "${state#* }" = true ] && [ "${AKS_KUBECONFIG_CREDENTIALS}" = admin ]; then
+			die "cluster '${AKS_CLUSTER}' has local accounts disabled, so admin credentials cannot be fetched. Use AKS_KUBECONFIG_CREDENTIALS=user (your Entra identity, through kubelogin). Nothing was changed."
+		fi
 	fi
 	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = user ] && [ "${cluster_entra}" = true ] && ! command -v kubelogin >/dev/null 2>&1; then
 		local msg="AKS_KUBECONFIG_CREDENTIALS=user on an Entra ID cluster needs kubelogin ('az aks install-cli', or your package manager); or use AKS_KUBECONFIG_CREDENTIALS=admin"
 		if dry; then echo "WARNING: ${msg}"; else die "${msg}"; fi
+	fi
+	# The account and tenant kubectl will sign in with (the credentials step's
+	# kubelogin conversion), also settled before anything changes.
+	local who=(--subscription "${SUB}")
+	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = user ] && [ "${cluster_entra}" = true ] && ! dry; then
+		kubelogin_identity "${exists}"
 	fi
 
 	local acr="" acr_create=""
@@ -451,7 +502,7 @@ create() {
 			echo "    exists (Entra ID off); reusing as it is"
 			if [ "${AKS_ENTRA_ID}" = true ]; then
 				echo "    NOTE: create-aks does not turn Entra ID on for an existing cluster: it cannot be undone. To do it"
-				echo "    yourself: az aks update -g ${AKS_RESOURCE_GROUP} -n ${AKS_CLUSTER} --enable-aad --enable-azure-rbac"
+				echo "    yourself: az aks update --subscription ${SUB} -g ${AKS_RESOURCE_GROUP} -n ${AKS_CLUSTER} --enable-aad --enable-azure-rbac"
 				echo "    If an Azure Policy here requires Entra ID, the 'az aks update' below may be refused until you do."
 			fi
 		fi
@@ -535,25 +586,21 @@ create() {
 	fi
 	say "writing kubeconfig to ${AKS_KUBECONFIG} (${cred_desc})"
 	local tmp="${AKS_KUBECONFIG}.tmp.$$"
-	run mkdir -p "$(dirname "${AKS_KUBECONFIG}")"
+	case "${tmp}" in /*) ;; *) tmp="${PWD}/${tmp}" ;; esac
+	run mkdir -p "$(dirname "${tmp}")"
 	run rm -f "${tmp}"
-	# --admin fails, with az saying why, on a cluster whose local accounts are disabled;
-	# use AKS_KUBECONFIG_CREDENTIALS=user there.
-	run az aks get-credentials --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" \
-		${cred[@]+"${cred[@]}"} --file "${tmp}" --only-show-errors --output none
+	# KUBECONFIG is the temporary file too, not only --file: for an Entra ID user
+	# kubeconfig, az itself then runs `kubelogin convert-kubeconfig` with no
+	# --kubeconfig (Azure CLI 2.93), and kubelogin converts whatever KUBECONFIG names,
+	# which would otherwise be the caller's own kubeconfig and its unrelated contexts.
+	run env KUBECONFIG="${tmp}" az aks get-credentials --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" \
+		--name "${AKS_CLUSTER}" ${cred[@]+"${cred[@]}"} --file "${tmp}" --only-show-errors --output none
 	if [ "${AKS_KUBECONFIG_CREDENTIALS}" = user ] && [ "${cluster_entra}" = true ]; then
-		# Sign in the way az already is, instead of an interactive device-code prompt.
-		# kubelogin's azurecli mode drops the tenant the kubeconfig names and would ask
-		# for a token in az's active tenant, which need not be AKS_SUBSCRIPTION's; so the
-		# cluster's own Entra tenant is passed explicitly. (--tenant-id rather than
-		# --subscription: the latter needs kubelogin 0.2.19 or later.)
-		local tenant="<tenant>"
-		if ! dry; then
-			tenant="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" --query 'aadProfile.tenantId' -o tsv 2>/dev/null || true)"
-			[ -n "${tenant}" ] || tenant="$(az account show --subscription "${SUB}" --query tenantId -o tsv)"
-			[ -n "${tenant}" ] || die "could not find the Entra tenant of cluster '${AKS_CLUSTER}'"
-		fi
-		run kubelogin convert-kubeconfig --login azurecli --tenant-id "${tenant}" --kubeconfig "${tmp}"
+		# Sign in the way az already is, instead of an interactive device-code prompt,
+		# and as the account and tenant this run used: kubelogin's azurecli mode drops the
+		# tenant the kubeconfig names, and az would otherwise answer with its active
+		# subscription's account and tenant, which need not be AKS_SUBSCRIPTION's.
+		run kubelogin convert-kubeconfig --login azurecli ${who[@]+"${who[@]}"} --kubeconfig "${tmp}"
 	fi
 	run chmod 600 "${tmp}"
 	run mv -f "${tmp}" "${AKS_KUBECONFIG}"
@@ -704,8 +751,13 @@ delete() {
 		elif [ -n "${AKS_PUBLIC_IP}" ]; then echo "      - keep public IP '${AKS_PUBLIC_IP}' (absent, or not created by create-aks)"; fi
 	fi
 	local kubeconfig_ours=""
-	# The context is <cluster> for user credentials and <cluster>-admin for admin ones.
-	if [ -f "${AKS_KUBECONFIG}" ] && grep -q "^current-context: ${AKS_CLUSTER}\(-admin\)\{0,1\}\$" "${AKS_KUBECONFIG}"; then
+	# Ours when it is what create wrote for THIS cluster: az names the user entry
+	# clusterUser_<group>_<cluster> (clusterAdmin_ for admin credentials; kubelogin keeps
+	# the name), which pins the group and cluster where the context name alone
+	# (<cluster>, or <cluster>-admin) does not; and its current context is that cluster's.
+	if [ -f "${AKS_KUBECONFIG}" ] \
+		&& grep -qxF -e "- name: clusterUser_${AKS_RESOURCE_GROUP}_${AKS_CLUSTER}" -e "- name: clusterAdmin_${AKS_RESOURCE_GROUP}_${AKS_CLUSTER}" "${AKS_KUBECONFIG}" \
+		&& grep -qxF -e "current-context: ${AKS_CLUSTER}" -e "current-context: ${AKS_CLUSTER}-admin" "${AKS_KUBECONFIG}"; then
 		kubeconfig_ours=1
 		echo "    The kubeconfig file ${AKS_KUBECONFIG} is removed."
 	fi

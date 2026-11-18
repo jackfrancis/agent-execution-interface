@@ -100,7 +100,7 @@ param publicIpName string = ''
 @description('DNS label: the IP also gets <label>.<location>.cloudapp.azure.com (AKS_PUBLIC_IP_DNS_LABEL). Empty: none.')
 param publicIpDnsLabel string = ''
 
-@description('Microsoft Entra ID sign-in with Azure RBAC for Kubernetes authorization (AKS_ENTRA_ID). Some subscriptions\' Azure Policy requires it. Turning it on later cannot be undone.')
+@description('Microsoft Entra ID sign-in with Azure RBAC for Kubernetes authorization (AKS_ENTRA_ID). Some subscriptions\' Azure Policy requires it. Turning it on later cannot be undone: pass false when redeploying a cluster created without it.')
 param entraId bool = true
 
 @description('Entra group object ids made cluster admins (AKS_ENTRA_ADMIN_GROUPS). Empty: none.')
