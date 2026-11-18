@@ -119,8 +119,9 @@ It creates, or reuses if they exist:
 - a kubeconfig file of its own (`AKS_KUBECONFIG`, default
   `~/.kube/aei-aks-<cluster>.kubeconfig`). Your default kubeconfig is not touched. It
   holds the cluster's local admin certificate, which needs no kubelogin and no role
-  on the cluster; `AKS_KUBECONFIG_CREDENTIALS=user` holds your Entra identity instead,
-  through kubelogin, for which you need an Azure RBAC role on the cluster;
+  on the cluster (a reused cluster with local accounts disabled is refused before
+  anything changes; [hack/aks/README.md](hack/aks/README.md#entra-id-user-credentials)
+  shows how to get a kubeconfig with your Entra identity instead);
 - only with `AKS_PUBLIC_IP=<name>`: a static public IP for an app that must be
   reachable at an address that does not change (a DNS record, an OAuth callback, a
   webhook). `AKS_PUBLIC_IP_DNS_LABEL=<label>` also gives it the name
