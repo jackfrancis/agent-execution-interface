@@ -673,7 +673,7 @@ next_steps() {
 # group is left alone. Nothing happens without AKS_CONFIRM_DELETE=<resource group>.
 delete() {
 	preflight
-	dry || [ "$(az group exists --subscription "${SUB}" -n "${AKS_RESOURCE_GROUP}" 2>/dev/null)" = true ] || {
+	dry || group_exists || {
 		echo "resource group '${AKS_RESOURCE_GROUP}' does not exist in this subscription; nothing to delete"
 		return 0
 	}
@@ -701,15 +701,19 @@ delete() {
 		if [ -n "${own_ip}" ]; then echo "      - delete public IP '${AKS_PUBLIC_IP}'"
 		elif [ -n "${AKS_PUBLIC_IP}" ]; then echo "      - keep public IP '${AKS_PUBLIC_IP}' (absent, or not created by create-aks)"; fi
 	fi
-	local kubeconfig_ours="" kc_user=""
+	local kubeconfig_ours="" kc_user="" server
 	# Ours only when it is what create writes for THIS cluster and holds nothing else:
-	# one context and one user entry; the user named as az names this group's and
-	# cluster's credentials (clusterAdmin_<group>_<cluster>, or clusterUser_ in a file
-	# written before create-aks fetched admin credentials), which pins the group and
-	# cluster where a context name does not; the context using that user; and the
-	# current context the cluster's (<cluster>-admin, or <cluster>). A file with more
-	# in it is someone's merged kubeconfig, and is kept.
+	# one cluster, one context and one user entry; the user named as az names this
+	# group's and cluster's credentials (clusterAdmin_<group>_<cluster>, or clusterUser_
+	# in a file written before create-aks fetched admin credentials); the context using
+	# that user; the current context the cluster's (<cluster>-admin, or <cluster>); and
+	# the API server this cluster's. Names alone do not pin it: the same group and
+	# cluster names in another subscription give an identical file (default path
+	# included) but for the server. The server is read here, before anything is
+	# deleted; if the cluster is already gone it cannot be checked, and the file is
+	# kept. A file with more in it is someone's merged kubeconfig, and is kept.
 	if [ -f "${AKS_KUBECONFIG}" ] \
+		&& [ "$(grep -c '^- cluster:' "${AKS_KUBECONFIG}")" = 1 ] \
 		&& [ "$(grep -c '^- context:' "${AKS_KUBECONFIG}")" = 1 ] \
 		&& [ "$(grep -c '^- name:' "${AKS_KUBECONFIG}")" = 1 ]; then
 		kc_user="$(sed -n 's/^- name: //p' "${AKS_KUBECONFIG}")"
@@ -717,14 +721,23 @@ delete() {
 			"clusterAdmin_${AKS_RESOURCE_GROUP}_${AKS_CLUSTER}"|"clusterUser_${AKS_RESOURCE_GROUP}_${AKS_CLUSTER}")
 				if grep -qxF "    user: ${kc_user}" "${AKS_KUBECONFIG}" \
 					&& grep -qxF -e "current-context: ${AKS_CLUSTER}-admin" -e "current-context: ${AKS_CLUSTER}" "${AKS_KUBECONFIG}"; then
-					kubeconfig_ours=1
+					if dry; then
+						kubeconfig_ours=1
+					else
+						# Public and private API server names; tsv prints an absent one as None.
+						for server in $(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" \
+							--query '[fqdn, privateFqdn]' -o tsv 2>/dev/null || true); do
+							[ "${server}" != None ] || continue
+							! grep -qxF "    server: https://${server}:443" "${AKS_KUBECONFIG}" || kubeconfig_ours=1
+						done
+					fi
 				fi ;;
 		esac
 	fi
 	if [ -n "${kubeconfig_ours}" ]; then
-		echo "    The kubeconfig file ${AKS_KUBECONFIG} is removed."
+		echo "    The kubeconfig file ${AKS_KUBECONFIG} is removed${AKS_DRY_RUN:+ (dry run: its API server is not checked)}."
 	elif [ -f "${AKS_KUBECONFIG}" ]; then
-		echo "    The kubeconfig file ${AKS_KUBECONFIG} is kept: it is not one create-aks wrote for this cluster alone."
+		echo "    The kubeconfig file ${AKS_KUBECONFIG} is kept: it is not one create-aks wrote for this cluster alone (or the cluster is gone, so its API server cannot be checked)."
 	fi
 
 	if [ -z "${own_group}${own_cluster}${own_acr}${own_ip}${kubeconfig_ours}" ]; then

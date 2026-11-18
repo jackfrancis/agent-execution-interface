@@ -9,10 +9,15 @@ knows about Azure. `make create-aks` / `make delete-aks` ([aks.mk](aks.mk),
 
 `create-aks` writes the cluster's local admin certificate. For a kubeconfig that signs
 in with your own Entra identity instead (for example on a cluster whose local accounts
-are disabled, where `create-aks` stops before changing anything), you need kubelogin
-(`az aks install-cli`, or your package manager) and a Kubernetes role on the cluster:
-membership in one of its admin groups (`AKS_ENTRA_ADMIN_GROUPS`, `entraAdminGroups`),
-or an Azure RBAC role on it such as "Azure Kubernetes Service RBAC Cluster Admin".
+are disabled, where `create-aks` stops before changing anything), you need:
+
+- kubelogin (`az aks install-cli`, or your package manager);
+- permission to download the user kubeconfig, an Azure role on the cluster resource
+  such as "Azure Kubernetes Service Cluster User Role" (Owner and Contributor include
+  it); without it, `az aks get-credentials` fails with AuthorizationFailed;
+- access inside the cluster, which is separate: membership in one of its admin groups
+  (`AKS_ENTRA_ADMIN_GROUPS`, `entraAdminGroups`), or an Azure RBAC role on it such as
+  "Azure Kubernetes Service RBAC Cluster Admin".
 
 ```sh
 KC=~/.kube/aei-aks-aei-user.kubeconfig
