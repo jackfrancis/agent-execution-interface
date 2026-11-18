@@ -100,6 +100,12 @@ param publicIpName string = ''
 @description('DNS label: the IP also gets <label>.<location>.cloudapp.azure.com (AKS_PUBLIC_IP_DNS_LABEL). Empty: none.')
 param publicIpDnsLabel string = ''
 
+@description('Microsoft Entra ID sign-in with Azure RBAC for Kubernetes authorization (AKS_ENTRA_ID). Some subscriptions\' Azure Policy requires it. Turning it on later cannot be undone: pass false when redeploying a cluster created without it.')
+param entraId bool = true
+
+@description('Entra group object ids made cluster admins (AKS_ENTRA_ADMIN_GROUPS). Empty: none.')
+param entraAdminGroups array = []
+
 // -------------------------------------------------------------------------------
 
 // The ownership marker cluster.sh puts on what it creates; delete-aks keys on it.
@@ -144,6 +150,12 @@ resource cluster 'Microsoft.ContainerService/managedClusters@2026-08-01' = {
       nodeOSUpgradeChannel: nodeOSUpgradeChannel
     }
     // No linuxProfile: nodes get no SSH key (cluster.sh passes --no-ssh-key).
+    // Local accounts stay enabled, so `az aks get-credentials --admin` keeps working.
+    aadProfile: entraId ? {
+      managed: true
+      enableAzureRBAC: true
+      adminGroupObjectIDs: entraAdminGroups
+    } : null
     agentPoolProfiles: [
       {
         name: systemPoolName

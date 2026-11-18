@@ -52,6 +52,19 @@ AKS_KUBERNETES_VERSION="${AKS_KUBERNETES_VERSION:-}"
 # an AKS planned-maintenance window (not set here) controls when.
 AKS_AUTO_UPGRADE_CHANNEL="${AKS_AUTO_UPGRADE_CHANNEL:-stable}"
 AKS_NODE_OS_UPGRADE_CHANNEL="${AKS_NODE_OS_UPGRADE_CHANNEL:-NodeImage}"
+# Microsoft Entra ID for the cluster's API: people sign in with Entra identities, and
+# Azure RBAC authorizes their Kubernetes requests. Many organizations' Azure Policy
+# refuses an AKS cluster without it (RequestDisallowedByPolicy, citing
+# Azure_KubernetesService_AuthN_Enabled_Microsoft_Entra_ID).
+#   AKS_ENTRA_ID=true (the default) | false
+#   AKS_ENTRA_ADMIN_GROUPS=<group object id>[,<id>...]   Entra groups made cluster
+#                          admins. Empty: none; the admin kubeconfig (below) needs
+#                          no group, and people can be given an Azure RBAC role.
+# Applied when the cluster is CREATED. A reused cluster keeps what it has: turning
+# Entra ID on cannot be undone, so create-aks never does it on its own. Local
+# accounts stay enabled, so the admin kubeconfig (below) works either way.
+AKS_ENTRA_ID="${AKS_ENTRA_ID:-true}"
+AKS_ENTRA_ADMIN_GROUPS="${AKS_ENTRA_ADMIN_GROUPS:-}"
 
 # System pool: the AEI controller and cluster add-ons. No agent run needs to land here.
 AKS_SYSTEM_POOL="${AKS_SYSTEM_POOL:-system}"
@@ -98,7 +111,11 @@ AKS_KATA_TAINT="${AKS_KATA_TAINT-aei.dev/agent-runs=true:NoSchedule}"
 AKS_RUNTIME_CLASS="${AKS_RUNTIME_CLASS:-kata-vm-isolation}"
 
 # Where the cluster's credentials go. Always a file of its own, replaced whole on
-# every run; never merged into ~/.kube/config.
+# every run; never merged into ~/.kube/config. It holds the cluster's local admin
+# certificate, which needs no kubelogin and no role on the cluster, with or without
+# Entra ID, as long as the cluster's local accounts are enabled (a reused cluster
+# with them disabled is refused before anything changes). For a kubeconfig with
+# your Entra identity instead, see "Entra ID user credentials" in hack/aks/README.md.
 AKS_KUBECONFIG="${AKS_KUBECONFIG:-${HOME}/.kube/aei-aks-${AKS_CLUSTER}.kubeconfig}"
 
 # Registry. By default an Azure Container Registry is created in the resource group
@@ -261,10 +278,26 @@ cluster_tag() { az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -
 acr_tag()     { az acr show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1" --query "tags.\"${OWNER_TAG_KEY}\"" -o tsv 2>/dev/null || true; }
 ip_tag()      { az network public-ip show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1" --query "tags.\"${OWNER_TAG_KEY}\"" -o tsv 2>/dev/null || true; }
 
-group_exists()   { ! dry && [ "$(az group exists --subscription "${SUB}" -n "${AKS_RESOURCE_GROUP}" 2>/dev/null)" = true ]; }
-cluster_exists() { ! dry && az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" -o none 2>/dev/null; }
-acr_exists()     { ! dry && az acr show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1" -o none 2>/dev/null; }
-ip_exists()      { ! dry && az network public-ip show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1" -o none 2>/dev/null; }
+# azure_has runs an `az ... show` and answers only what Azure confirms: the resource
+# is there (exit 0), or Azure reports it missing (exit 3: ResourceNotFound, or
+# ResourceGroupNotFound). Any other failure (throttling, a 5xx, the network) stops
+# the run instead of being taken as "absent", which would create, or keep, on a
+# wrong answer. Under AKS_DRY_RUN nothing is asked and everything is absent.
+azure_has() {
+	dry && return 1
+	local out rc=0
+	out="$("$@" -o none 2>&1)" || rc=$?
+	case "${rc}" in
+		0) return 0 ;;
+		3) return 1 ;;
+	esac
+	printf '%s\n' "${out}" >&2
+	die "could not tell whether it exists ('$*' failed with exit ${rc}, not 'not found'); stopping here. Re-run once Azure answers."
+}
+group_exists()   { azure_has az group show --subscription "${SUB}" -n "${AKS_RESOURCE_GROUP}"; }
+cluster_exists() { azure_has az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}"; }
+acr_exists()     { azure_has az acr show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1"; }
+ip_exists()      { azure_has az network public-ip show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "$1"; }
 
 # public_ip creates (or reuses) AKS_PUBLIC_IP and lets the cluster use it. The role
 # goes to the cluster's own (control plane) identity, which is what the cloud
@@ -353,6 +386,27 @@ create() {
 	case "${AKS_KUBECONFIG}" in
 		"${HOME}/.kube/config") die "AKS_KUBECONFIG is your default kubeconfig; this file is replaced whole, so choose another path" ;;
 	esac
+	case "${AKS_ENTRA_ID}" in true|false) ;; *) die "AKS_ENTRA_ID must be true or false (got '${AKS_ENTRA_ID}')" ;; esac
+	# For an existing cluster, read up front, before anything changes: whether it has
+	# Entra ID (aadProfile is present for either integration, AKS-managed or the
+	# retired legacy one), and whether its local accounts are disabled, in which case
+	# the admin kubeconfig this writes cannot be fetched and the run could not finish.
+	# A cluster create makes keeps local accounts enabled.
+	local exists="" cluster_entra="${AKS_ENTRA_ID}" state=""
+	if cluster_exists; then
+		exists=1
+		state="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" \
+			--query "join(' ', [to_string(aadProfile != null), to_string(disableLocalAccounts == \`true\`)])" -o tsv)" \
+			|| die "could not read the settings of cluster '${AKS_CLUSTER}' (az aks show failed above); nothing was changed"
+		case "${state}" in
+			"true true"|"true false"|"false true"|"false false") ;;
+			*) die "unexpected answer reading the settings of cluster '${AKS_CLUSTER}': '${state}'; nothing was changed" ;;
+		esac
+		cluster_entra="${state%% *}"
+		if [ "${state#* }" = true ]; then
+			die "cluster '${AKS_CLUSTER}' has local accounts disabled, so create-aks cannot fetch the admin kubeconfig it writes. Nothing was changed. Get a kubeconfig with your Entra identity yourself (see \"Entra ID user credentials\" in hack/aks/README.md)."
+		fi
+	fi
 
 	local acr="" acr_create=""
 	if [ -n "${AKS_ATTACH_ACR}" ]; then
@@ -395,9 +449,27 @@ create() {
 		fi
 	fi
 
-	say "AKS cluster '${AKS_CLUSTER}': system pool '${AKS_SYSTEM_POOL}' = ${AKS_SYSTEM_NODE_COUNT} x ${AKS_SYSTEM_VM_SIZE}"
-	if cluster_exists; then
-		echo "    exists; reusing"
+	local entra=() entra_desc=", Entra ID off"
+	if [ "${AKS_ENTRA_ID}" = true ]; then
+		entra=(--enable-aad --enable-azure-rbac)
+		entra_desc=", Entra ID with Azure RBAC"
+		if [ -n "${AKS_ENTRA_ADMIN_GROUPS}" ]; then
+			entra=(--enable-aad --enable-azure-rbac --aad-admin-group-object-ids "${AKS_ENTRA_ADMIN_GROUPS}")
+			entra_desc="${entra_desc} (admin groups ${AKS_ENTRA_ADMIN_GROUPS})"
+		fi
+	fi
+	say "AKS cluster '${AKS_CLUSTER}': system pool '${AKS_SYSTEM_POOL}' = ${AKS_SYSTEM_NODE_COUNT} x ${AKS_SYSTEM_VM_SIZE}${entra_desc}"
+	if [ -n "${exists}" ]; then
+		if [ "${cluster_entra}" = true ]; then
+			echo "    exists (Entra ID on); reusing"
+		else
+			echo "    exists (Entra ID off); reusing as it is"
+			if [ "${AKS_ENTRA_ID}" = true ]; then
+				echo "    NOTE: create-aks does not turn Entra ID on for an existing cluster: it cannot be undone. To do it"
+				echo "    yourself: az aks update --subscription ${SUB} -g ${AKS_RESOURCE_GROUP} -n ${AKS_CLUSTER} --enable-aad --enable-azure-rbac"
+				echo "    If an Azure Policy here requires Entra ID, the 'az aks update' below may be refused until you do."
+			fi
+		fi
 	else
 		local version=()
 		[ -z "${AKS_KUBERNETES_VERSION}" ] || version=(--kubernetes-version "${AKS_KUBERNETES_VERSION}")
@@ -409,7 +481,7 @@ create() {
 			--node-vm-size "${AKS_SYSTEM_VM_SIZE}" --os-sku AzureLinux \
 			--auto-upgrade-channel "${AKS_AUTO_UPGRADE_CHANNEL}" \
 			--node-os-upgrade-channel "${AKS_NODE_OS_UPGRADE_CHANNEL}" \
-			--enable-managed-identity --no-ssh-key --tags "${OWNER_TAG}" --output none
+			--enable-managed-identity --no-ssh-key ${entra[@]+"${entra[@]}"} --tags "${OWNER_TAG}" --output none
 	fi
 
 	local scaling=() sizing="${AKS_KATA_NODE_COUNT} x ${AKS_KATA_VM_SIZE}, fixed size"
@@ -469,12 +541,18 @@ create() {
 
 	# Credentials go to a fresh temporary file that then replaces the target, so a
 	# stale or unrelated file at that path is never merged into.
-	say "writing kubeconfig to ${AKS_KUBECONFIG}"
+	say "writing kubeconfig to ${AKS_KUBECONFIG} (the cluster's local admin certificate)"
 	local tmp="${AKS_KUBECONFIG}.tmp.$$"
-	run mkdir -p "$(dirname "${AKS_KUBECONFIG}")"
+	case "${tmp}" in /*) ;; *) tmp="${PWD}/${tmp}" ;; esac
+	run mkdir -p "$(dirname "${tmp}")"
 	run rm -f "${tmp}"
-	run az aks get-credentials --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" \
-		--file "${tmp}" --only-show-errors --output none
+	# KUBECONFIG names the temporary file too, not only --file: Azure CLI (2.93) runs
+	# `kubelogin convert-kubeconfig` on its own, with no --kubeconfig, when what it
+	# fetched signs in through kubelogin, and kubelogin then converts whatever KUBECONFIG
+	# names. An admin kubeconfig does not, but nothing here should reach the caller's
+	# own kubeconfig either way.
+	run env KUBECONFIG="${tmp}" az aks get-credentials --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" \
+		--name "${AKS_CLUSTER}" --admin --file "${tmp}" --only-show-errors --output none
 	run chmod 600 "${tmp}"
 	run mv -f "${tmp}" "${AKS_KUBECONFIG}"
 
@@ -595,7 +673,7 @@ next_steps() {
 # group is left alone. Nothing happens without AKS_CONFIRM_DELETE=<resource group>.
 delete() {
 	preflight
-	dry || [ "$(az group exists --subscription "${SUB}" -n "${AKS_RESOURCE_GROUP}" 2>/dev/null)" = true ] || {
+	dry || group_exists || {
 		echo "resource group '${AKS_RESOURCE_GROUP}' does not exist in this subscription; nothing to delete"
 		return 0
 	}
@@ -623,10 +701,43 @@ delete() {
 		if [ -n "${own_ip}" ]; then echo "      - delete public IP '${AKS_PUBLIC_IP}'"
 		elif [ -n "${AKS_PUBLIC_IP}" ]; then echo "      - keep public IP '${AKS_PUBLIC_IP}' (absent, or not created by create-aks)"; fi
 	fi
-	local kubeconfig_ours=""
-	if [ -f "${AKS_KUBECONFIG}" ] && grep -q "^current-context: ${AKS_CLUSTER}\$" "${AKS_KUBECONFIG}"; then
-		kubeconfig_ours=1
-		echo "    The kubeconfig file ${AKS_KUBECONFIG} is removed."
+	local kubeconfig_ours="" kc_user="" server
+	# Ours only when it is what create writes for THIS cluster and holds nothing else:
+	# one cluster, one context and one user entry; the user named as az names this
+	# group's and cluster's credentials (clusterAdmin_<group>_<cluster>, or clusterUser_
+	# in a file written before create-aks fetched admin credentials); the context using
+	# that user; the current context the cluster's (<cluster>-admin, or <cluster>); and
+	# the API server this cluster's. Names alone do not pin it: the same group and
+	# cluster names in another subscription give an identical file (default path
+	# included) but for the server. The server is read here, before anything is
+	# deleted; if the cluster is already gone it cannot be checked, and the file is
+	# kept. A file with more in it is someone's merged kubeconfig, and is kept.
+	if [ -f "${AKS_KUBECONFIG}" ] \
+		&& [ "$(grep -c '^- cluster:' "${AKS_KUBECONFIG}")" = 1 ] \
+		&& [ "$(grep -c '^- context:' "${AKS_KUBECONFIG}")" = 1 ] \
+		&& [ "$(grep -c '^- name:' "${AKS_KUBECONFIG}")" = 1 ]; then
+		kc_user="$(sed -n 's/^- name: //p' "${AKS_KUBECONFIG}")"
+		case "${kc_user}" in
+			"clusterAdmin_${AKS_RESOURCE_GROUP}_${AKS_CLUSTER}"|"clusterUser_${AKS_RESOURCE_GROUP}_${AKS_CLUSTER}")
+				if grep -qxF "    user: ${kc_user}" "${AKS_KUBECONFIG}" \
+					&& grep -qxF -e "current-context: ${AKS_CLUSTER}-admin" -e "current-context: ${AKS_CLUSTER}" "${AKS_KUBECONFIG}"; then
+					if dry; then
+						kubeconfig_ours=1
+					else
+						# Public and private API server names; tsv prints an absent one as None.
+						for server in $(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" \
+							--query '[fqdn, privateFqdn]' -o tsv 2>/dev/null || true); do
+							[ "${server}" != None ] || continue
+							! grep -qxF "    server: https://${server}:443" "${AKS_KUBECONFIG}" || kubeconfig_ours=1
+						done
+					fi
+				fi ;;
+		esac
+	fi
+	if [ -n "${kubeconfig_ours}" ]; then
+		echo "    The kubeconfig file ${AKS_KUBECONFIG} is removed${AKS_DRY_RUN:+ (dry run: its API server is not checked)}."
+	elif [ -f "${AKS_KUBECONFIG}" ]; then
+		echo "    The kubeconfig file ${AKS_KUBECONFIG} is kept: it is not one create-aks wrote for this cluster alone (or the cluster is gone, so its API server cannot be checked)."
 	fi
 
 	if [ -z "${own_group}${own_cluster}${own_acr}${own_ip}${kubeconfig_ours}" ]; then
@@ -647,9 +758,7 @@ delete() {
 		# After the cluster: its load balancer holds the address until the cluster is gone.
 		[ -z "${own_ip}" ] || run az network public-ip delete --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_PUBLIC_IP}"
 	fi
-	if [ -n "${kubeconfig_ours}" ] || dry; then
-		run rm -f "${AKS_KUBECONFIG}"
-	fi
+	[ -z "${kubeconfig_ours}" ] || run rm -f "${AKS_KUBECONFIG}"
 	say "deleted${AKS_DRY_RUN:+ (dry run: nothing was deleted)}"
 }
 

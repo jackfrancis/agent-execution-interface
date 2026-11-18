@@ -5,6 +5,34 @@ knows about Azure. `make create-aks` / `make delete-aks` ([aks.mk](aks.mk),
 [cluster.sh](cluster.sh)) are the supported path; the top-level
 [README](../../README.md#example-an-aks-cluster) describes them.
 
+## Entra ID user credentials
+
+`create-aks` writes the cluster's local admin certificate. For a kubeconfig that signs
+in with your own Entra identity instead (for example on a cluster whose local accounts
+are disabled, where `create-aks` stops before changing anything), you need:
+
+- kubelogin (`az aks install-cli`, or your package manager);
+- permission to download the user kubeconfig, an Azure role on the cluster resource
+  such as "Azure Kubernetes Service Cluster User Role" (Owner and Contributor include
+  it); without it, `az aks get-credentials` fails with AuthorizationFailed;
+- access inside the cluster, which is separate: membership in one of its admin groups
+  (`AKS_ENTRA_ADMIN_GROUPS`, `entraAdminGroups`), or an Azure RBAC role on it such as
+  "Azure Kubernetes Service RBAC Cluster Admin".
+
+```sh
+KC=~/.kube/aei-aks-aei-user.kubeconfig
+KUBECONFIG=$KC az aks get-credentials --subscription <subscription> -g aei -n aei --file $KC
+KUBECONFIG=$KC kubelogin convert-kubeconfig --login azurecli --kubeconfig $KC
+```
+
+Set `KUBECONFIG` on both: after fetching such a kubeconfig, Azure CLI runs
+`kubelogin convert-kubeconfig` itself, without `--kubeconfig` (so the second command
+may find nothing left to do), and kubelogin converts whatever `KUBECONFIG` names,
+which would otherwise be your own kubeconfig. The `azurecli` login signs kubectl in as
+az's active account, and works only with AKS-managed Entra ID, not the retired legacy
+integration. `create-aks` does not run these commands, and they have not been tested
+here.
+
 ## Bicep instead of the script (prototype)
 
 [main.bicep](main.bicep) declares the same Azure resources `create-aks` creates, with
@@ -13,7 +41,9 @@ the same defaults:
 - the AKS cluster: system pool (`Standard_D2s_v7`, Azure Linux) and Kata pool
   (`workloadRuntime: KataVmIsolation`, `Standard_D4s_v7`, autoscaling 1-3, taint
   `aei.dev/agent-runs=true:NoSchedule`), upgrade channels `stable` / `NodeImage`,
-  system-assigned identity, no SSH key;
+  system-assigned identity, no SSH key, Microsoft Entra ID with Azure RBAC
+  (`entraId`, `entraAdminGroups`; added after the check below, and not deployed from
+  this file since);
 - a Basic container registry, and AcrPull on it for the kubelet identity (what
   `--attach-acr` does);
 - only when `publicIpName` is set: a Standard static IPv4 public IP (with
@@ -26,12 +56,22 @@ variables (see the `@description` of each). The file names no subscription, tena
 or secret; pass real values with `-p` on the command line, and do not commit a
 `.bicepparam` file that holds them.
 
+**Redeploying a cluster made before `entraId` existed:** the template now turns
+Microsoft Entra ID on by default, and on an existing cluster that cannot be undone.
+For a cluster without Entra ID that should stay that way, pass `-p entraId=false` on
+every deployment; `what-if` shows the change (an `aadProfile` added) if you forget.
+
 ```sh
 az group create -n aei -l westus2 --tags aei-created-by=make-create-aks
 az deployment group what-if -g aei -f hack/aks/main.bicep -p publicIpName=aei-ip   # preview
 az deployment group create  -g aei -f hack/aks/main.bicep -p publicIpName=aei-ip   # bills
-az aks get-credentials -g aei -n aei --file ~/.kube/aei-aks-aei.kubeconfig
+az aks get-credentials -g aei -n aei --admin --file ~/.kube/aei-aks-aei.kubeconfig
 ```
+
+`--admin` is the cluster's local admin certificate, which `create-aks` writes too.
+Without it, on a cluster with Entra ID (`entraId`, the default), you get a kubeconfig
+for your Entra identity instead: see [Entra ID user credentials](#entra-id-user-credentials)
+for what that needs, and set `KUBECONFIG` on that command as shown there.
 
 How the two compare:
 
