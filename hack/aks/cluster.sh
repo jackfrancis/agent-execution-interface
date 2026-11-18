@@ -758,9 +758,7 @@ delete() {
 		# After the cluster: its load balancer holds the address until the cluster is gone.
 		[ -z "${own_ip}" ] || run az network public-ip delete --subscription "${SUB}" --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_PUBLIC_IP}"
 	fi
-	if [ -n "${kubeconfig_ours}" ] || dry; then
-		run rm -f "${AKS_KUBECONFIG}"
-	fi
+	[ -z "${kubeconfig_ours}" ] || run rm -f "${AKS_KUBECONFIG}"
 	say "deleted${AKS_DRY_RUN:+ (dry run: nothing was deleted)}"
 }
 
