@@ -129,7 +129,7 @@ func TestProviderPanicFailsRunAndPlaneContinues(t *testing.T) {
 		{"dispatch", panicAsync{in: "Dispatch"}, "Dispatch"},
 		{"await", panicAsync{in: "Await"}, "Await"},
 		{"launch", panicSync{}, "Launch"},
-		{"mint", &panicPull{}, "mint"},
+		{"mint", &panicPull{}, "PullsCredential"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name+"/submit", func(t *testing.T) {
@@ -451,7 +451,7 @@ func TestHungMintGivesUpSlot(t *testing.T) {
 	if st := mustTerminal(t, p, good); st.Phase != phaseSucceeded {
 		t.Fatalf("healthy run behind a hung mint = %+v, want Succeeded", st)
 	}
-	if st := mustTerminal(t, p, id); st.Phase != phaseFailed || !strings.Contains(st.Err, "run credential not ready") {
+	if st := mustTerminal(t, p, id); st.Phase != phaseFailed || !strings.Contains(st.Err, "PullsCredential not ready") {
 		t.Fatalf("hung-mint run = %+v, want Failed at the create timeout", st)
 	}
 }
@@ -632,7 +632,7 @@ func TestOutstandingMintsBounded(t *testing.T) {
 		t.Fatalf("peak outstanding credential calls = %d, want 2 (2*MaxConcurrentCreates)", peak)
 	}
 	close(hung.release)
-	waitFor(t, func() bool { return len(p.mints) == 0 })
+	waitFor(t, func() bool { return len(p.capabilityCalls) == 0 })
 	good, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{})
 	if err != nil {
 		t.Fatal(err)
@@ -675,6 +675,57 @@ func TestPlainLaunchGetsFallbackDeadline(t *testing.T) {
 	if st := mustTerminal(t, p, good); st.Phase != phaseSucceeded {
 		t.Fatalf("healthy run after = %+v, want Succeeded", st)
 	}
+}
+
+// stallStore is a Store whose ticket writes block until release, standing in
+// for a ticket-store outage; everything else is the in-memory store.
+type stallStore struct {
+	*memStore
+	release chan struct{}
+	writes  atomic.Int32
+}
+
+func (s *stallStore) PutTicket(id string, c Claims, expires time.Time) {
+	s.writes.Add(1)
+	<-s.release
+	s.memStore.PutTicket(id, c, expires)
+}
+
+// A ticket-store outage does not stop runs whose credential the authority signs
+// locally: with every ticket permit held by stalled writes, a pushed-token run
+// (a Kubernetes Job) still mints and dispatches, while more pull runs are bounded.
+func TestTicketStoreOutageDoesNotBlockTokenRuns(t *testing.T) {
+	store := &stallStore{memStore: newMemStore(), release: make(chan struct{})}
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, Store: store, MaxConcurrentCreates: 1, CreateTimeout: 30 * time.Millisecond})
+
+	for range 3 { // two stall in the store and keep both ticket permits; the third waits for one
+		id, err := p.Submit(context.Background(), &fakePull{fakeWatch{result: aei.Result{ResultRef: "pulled"}}}, aei.RunSpec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := mustTerminal(t, p, id); st.Phase != phaseFailed || !strings.Contains(st.Err, "redemption ticket not ready") {
+			t.Fatalf("pull run during the outage = %+v, want Failed waiting on the ticket store", st)
+		}
+	}
+	if w := store.writes.Load(); w != 2 {
+		t.Fatalf("ticket writes outstanding = %d, want 2 (2*MaxConcurrentCreates)", w)
+	}
+
+	g := &gated{}
+	job, err := p.Submit(context.Background(), g, aei.RunSpec{ID: "job", Deadline: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := mustTerminal(t, p, job); st.Phase != phaseSucceeded {
+		t.Fatalf("token run during the ticket-store outage = %+v, want Succeeded", st)
+	}
+	g.mu.Lock()
+	cred := g.creds["job"]
+	g.mu.Unlock()
+	if cred.Kind != aei.Token || cred.Value == "" {
+		t.Fatalf("job credential = %+v, want a signed token", cred)
+	}
+	close(store.release) // only now does the store recover
 }
 
 func waitFor(t *testing.T, cond func() bool) {

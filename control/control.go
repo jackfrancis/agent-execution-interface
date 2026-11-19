@@ -201,12 +201,15 @@ type Plane struct {
 	creates       chan struct{}
 	admit         chan struct{}
 	createTimeout time.Duration
-	// mints holds one token per credential call in flight, including ones a run
-	// abandoned at its create timeout (cap 2*MaxConcurrentCreates, leaving room
-	// for the next creates beside calls still stuck in a slow backend). launchDeadline
-	// is the run deadline given to a plain provider's Launch when the run has none.
-	mints          chan struct{}
-	launchDeadline time.Duration
+	// Permits for credential calls in flight, one pool per backend, each counting
+	// calls a run abandoned at its create timeout until they return (cap
+	// 2*MaxConcurrentCreates, leaving room for the next creates beside calls stuck
+	// in a slow backend). launchDeadline is the run deadline given to a plain
+	// provider's Launch when the run has none.
+	capabilityCalls chan struct{} // a provider's PullsCredential
+	ticketCalls     chan struct{} // Store.PutTicket (pull credential)
+	tokenCalls      chan struct{} // TokenAuthority.Mint (pushed credential)
+	launchDeadline  time.Duration
 
 	mu      sync.Mutex
 	waiters map[string]chan aei.Result // runID -> completion channel (same-replica wake)
@@ -240,20 +243,22 @@ func New(cfg Config) *Plane {
 		queued = DefaultMaxQueued
 	}
 	return &Plane{
-		auth:           auth,
-		creds:          cfg.Credentials,
-		tokenTTL:       orDur(cfg.TokenTTL, 15*time.Minute),
-		ticketTTL:      orDur(cfg.TicketTTL, 5*time.Minute),
-		now:            now,
-		log:            log,
-		store:          store,
-		obs:            obs,
-		creates:        make(chan struct{}, creates),
-		admit:          make(chan struct{}, creates+queued),
-		createTimeout:  orDur(cfg.CreateTimeout, DefaultCreateTimeout),
-		mints:          make(chan struct{}, 2*creates),
-		launchDeadline: defaultLaunchDeadline,
-		waiters:        map[string]chan aei.Result{},
+		auth:            auth,
+		creds:           cfg.Credentials,
+		tokenTTL:        orDur(cfg.TokenTTL, 15*time.Minute),
+		ticketTTL:       orDur(cfg.TicketTTL, 5*time.Minute),
+		now:             now,
+		log:             log,
+		store:           store,
+		obs:             obs,
+		creates:         make(chan struct{}, creates),
+		admit:           make(chan struct{}, creates+queued),
+		createTimeout:   orDur(cfg.CreateTimeout, DefaultCreateTimeout),
+		capabilityCalls: make(chan struct{}, 2*creates),
+		ticketCalls:     make(chan struct{}, 2*creates),
+		tokenCalls:      make(chan struct{}, 2*creates),
+		launchDeadline:  defaultLaunchDeadline,
+		waiters:         map[string]chan aei.Result{},
 	}
 }
 
@@ -525,46 +530,62 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 }
 
 // mintWithin mints the run credential, giving up when ctx ends. Minting takes no
-// context (a provider's PullsCredential, the TokenAuthority, the Store), so a
-// call still blocked at that point is abandoned: its credential, if it is ever
-// produced, is never handed out and expires unused. An abandoned call keeps its
-// place in p.mints until it returns, so at most 2*MaxConcurrentCreates mint calls
-// are ever outstanding: a credential backend outage cannot pile up goroutines or
-// requests against it. Once that many are stuck, runs fail at their create
-// timeout until the backend answers.
+// context, so each step runs through bounded: a call still blocked when ctx ends
+// is abandoned (its credential, if ever produced, is never handed out and expires
+// unused) but keeps its permit until it returns. Each credential backend has its
+// own permits (2*MaxConcurrentCreates), so outstanding calls stay bounded and an
+// outage in one cannot stall the others: a stalled ticket store does not block
+// runs whose token the authority signs, and vice versa. The provider's
+// PullsCredential, which decides between them, has permits of its own.
 func (p *Plane) mintWithin(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec) (aei.Credential, error) {
-	select {
-	case p.mints <- struct{}{}:
-	case <-ctx.Done():
-		return aei.Credential{}, fmt.Errorf("control: run credential not ready (earlier credential calls still outstanding): %w", ctx.Err())
+	claims := p.claims(spec)
+	pulls := false
+	if pl, ok := launcher.(aei.PullCredentialLauncher); ok {
+		if err := p.bounded(ctx, p.capabilityCalls, spec.ID, "PullsCredential", func() { pulls = pl.PullsCredential() }); err != nil {
+			return aei.Credential{}, err
+		}
 	}
-	type minted struct {
-		cred aei.Credential
-		err  error
+	if pulls {
+		var id string
+		if err := p.bounded(ctx, p.ticketCalls, spec.ID, "redemption ticket", func() { id = p.issueTicket(claims) }); err != nil {
+			return aei.Credential{}, err
+		}
+		return aei.Credential{Value: id, Kind: aei.Ticket}, nil
 	}
-	ch := make(chan minted, 1)
-	go func() {
-		defer func() { <-p.mints }()
-		c, err := p.guardMint(launcher, spec)
-		ch <- minted{c, err}
-	}()
-	select {
-	case m := <-ch:
-		return m.cred, m.err
-	case <-ctx.Done():
-		return aei.Credential{}, fmt.Errorf("control: run credential not ready: %w", ctx.Err())
+	var tok string
+	if err := p.bounded(ctx, p.tokenCalls, spec.ID, "run token", func() { tok = p.mintToken(claims) }); err != nil {
+		return aei.Credential{}, err
 	}
+	return aei.Credential{Value: tok, Kind: aei.Token}, nil
 }
 
-// guardMint mints the run credential, converting a panic (a provider's
-// PullsCredential, or the authority) into an error so the run fails cleanly.
-func (p *Plane) guardMint(launcher aei.Launcher, spec aei.RunSpec) (cred aei.Credential, err error) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			err = p.panicked(spec.ID, "mint", rec)
-		}
+// bounded runs f, which takes no context, holding one of permits until f returns,
+// and waits for it only until ctx ends. A panic in f is returned as an error.
+// Results f writes are safe to read once bounded returns nil (the channel send
+// orders them); after a timeout the caller must not read them.
+func (p *Plane) bounded(ctx context.Context, permits chan struct{}, runID, what string, f func()) error {
+	select {
+	case permits <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("control: %s not ready (earlier calls still outstanding): %w", what, ctx.Err())
+	}
+	ch := make(chan error, 1)
+	go func() {
+		defer func() { <-permits }()
+		defer func() {
+			if rec := recover(); rec != nil {
+				ch <- p.panicked(runID, what, rec)
+			}
+		}()
+		f()
+		ch <- nil
 	}()
-	return p.mint(launcher, spec), nil
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("control: %s not ready: %w", what, ctx.Err())
+	}
 }
 
 // guardCreate calls a provider's Dispatch or Launch, converting a panic into an
@@ -649,17 +670,22 @@ type Claims struct {
 // mint produces the credential handed to the provider: a pushed token, or (for a
 // PullCredentialLauncher) a single-use ticket the runtime redeems for the token.
 func (p *Plane) mint(launcher aei.Launcher, spec aei.RunSpec) aei.Credential {
-	claims := Claims{
+	claims := p.claims(spec)
+	if pl, ok := launcher.(aei.PullCredentialLauncher); ok && pl.PullsCredential() {
+		return aei.Credential{Value: p.issueTicket(claims), Kind: aei.Ticket}
+	}
+	return aei.Credential{Value: p.mintToken(claims), Kind: aei.Token}
+}
+
+// claims are the run credential's payload for spec.
+func (p *Plane) claims(spec aei.RunSpec) Claims {
+	return Claims{
 		RunID:    spec.ID,
 		Subject:  spec.Identity.Subject,
 		Scopes:   spec.Identity.Scopes,
 		Audience: spec.Identity.Audience,
 		Exp:      p.now().Add(p.tokenTTL).Unix(),
 	}
-	if pl, ok := launcher.(aei.PullCredentialLauncher); ok && pl.PullsCredential() {
-		return aei.Credential{Value: p.issueTicket(claims), Kind: aei.Ticket}
-	}
-	return aei.Credential{Value: p.mintToken(claims), Kind: aei.Token}
 }
 
 func (p *Plane) issueTicket(c Claims) string {

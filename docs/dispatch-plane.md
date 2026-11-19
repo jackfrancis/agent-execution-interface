@@ -95,8 +95,10 @@ no slot. Minting the run credential and the provider's `Dispatch` together get
 at most `--create-timeout` (default 2m); past it the create is abandoned and the
 run fails, so one unavailable substrate or credential backend cannot stall the
 others; a `Dispatch` that has already accepted the workload is watched, not
-failed. At most twice `--max-concurrent-creates` credential calls are outstanding,
-including ones abandoned at the timeout. (A provider without the async capability
+failed. Each credential backend (the ticket store, the signing authority, and a
+provider's `PullsCredential`) has at most twice `--max-concurrent-creates` calls
+outstanding, including ones abandoned at the timeout, so an outage in one does not
+stop runs that need only another. (A provider without the async capability
 blocks in `Launch` for the whole run, so it holds its slot until `Launch` returns,
 bounded by the run deadline, or 15m if the run has none.)
 The run credential is minted, and the provider handed the run's remaining time,
