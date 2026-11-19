@@ -162,6 +162,12 @@ const (
 	DefaultCreateTimeout        = 2 * time.Minute
 )
 
+// defaultLaunchDeadline bounds a run with no deadline whose provider blocks in
+// Launch (no async capability): such a Launch holds its create slot until it
+// returns. It matches the 15m default run deadline planned in archive item 12,
+// which gives every run a deadline and makes this fallback unreachable.
+const defaultLaunchDeadline = 15 * time.Minute
+
 // ErrOverloaded is returned by Submit when MaxQueued runs are already waiting for a
 // create slot (on either path). Nothing about the run is recorded; the caller may
 // retry later. The
@@ -195,6 +201,12 @@ type Plane struct {
 	creates       chan struct{}
 	admit         chan struct{}
 	createTimeout time.Duration
+	// mints holds one token per credential call in flight, including ones a run
+	// abandoned at its create timeout (cap 2*MaxConcurrentCreates, leaving room
+	// for the next creates beside calls still stuck in a slow backend). launchDeadline
+	// is the run deadline given to a plain provider's Launch when the run has none.
+	mints          chan struct{}
+	launchDeadline time.Duration
 
 	mu      sync.Mutex
 	waiters map[string]chan aei.Result // runID -> completion channel (same-replica wake)
@@ -228,18 +240,20 @@ func New(cfg Config) *Plane {
 		queued = DefaultMaxQueued
 	}
 	return &Plane{
-		auth:          auth,
-		creds:         cfg.Credentials,
-		tokenTTL:      orDur(cfg.TokenTTL, 15*time.Minute),
-		ticketTTL:     orDur(cfg.TicketTTL, 5*time.Minute),
-		now:           now,
-		log:           log,
-		store:         store,
-		obs:           obs,
-		creates:       make(chan struct{}, creates),
-		admit:         make(chan struct{}, creates+queued),
-		createTimeout: orDur(cfg.CreateTimeout, DefaultCreateTimeout),
-		waiters:       map[string]chan aei.Result{},
+		auth:           auth,
+		creds:          cfg.Credentials,
+		tokenTTL:       orDur(cfg.TokenTTL, 15*time.Minute),
+		ticketTTL:      orDur(cfg.TicketTTL, 5*time.Minute),
+		now:            now,
+		log:            log,
+		store:          store,
+		obs:            obs,
+		creates:        make(chan struct{}, creates),
+		admit:          make(chan struct{}, creates+queued),
+		createTimeout:  orDur(cfg.CreateTimeout, DefaultCreateTimeout),
+		mints:          make(chan struct{}, 2*creates),
+		launchDeadline: defaultLaunchDeadline,
+		waiters:        map[string]chan aei.Result{},
 	}
 }
 
@@ -425,6 +439,15 @@ func (p *Plane) finishRun(runID string, res aei.Result) {
 // also carried in the Result.
 func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, done chan aei.Result, created func()) (aei.Result, error) {
 	undispatched := func(err error) (aei.Result, error) { return aei.Result{Err: err}, err }
+	async, isAsync := launcher.(aei.AsyncLauncher)
+	if _, ok := ctx.Deadline(); !ok && !isAsync {
+		// A plain provider's Launch holds its create slot until it returns, so it
+		// must not run without a deadline, or one that waits on ctx could hold the
+		// slot forever.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.launchDeadline)
+		defer cancel()
+	}
 	select {
 	case p.creates <- struct{}{}:
 	case <-ctx.Done():
@@ -433,16 +456,6 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 	}
 	endCreate := sync.OnceFunc(func() { <-p.creates; created() })
 
-	// Hand the provider what is left of the run's budget, not the full Deadline:
-	// time spent queued already counts against the plane's deadline, and a
-	// workload that outlives it could overlap a retry.
-	if dl, ok := ctx.Deadline(); ok {
-		spec.Deadline = time.Until(dl)
-		if spec.Deadline <= 0 {
-			endCreate()
-			return undispatched(fmt.Errorf("control: no dispatch slot before the deadline: %w", context.DeadlineExceeded))
-		}
-	}
 	// One create budget, started now that the slot is held, covers preparing the
 	// credential and the provider's Dispatch, so neither a stuck credential
 	// backend nor a stuck provider can hold the slot past CreateTimeout.
@@ -460,13 +473,27 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		return undispatched(createErr(err))
 	}
 
-	if async, ok := launcher.(aei.AsyncLauncher); ok {
+	// Hand the provider what is left of the run's budget, measured now, just
+	// before the create: time spent queued and minting already counts against
+	// the plane's deadline, and a workload that outlived it could overlap a retry.
+	if dl, ok := ctx.Deadline(); ok {
+		spec.Deadline = time.Until(dl)
+		if spec.Deadline <= 0 {
+			endCreate()
+			return undispatched(fmt.Errorf("control: run deadline passed before dispatch: %w", context.DeadlineExceeded))
+		}
+	}
+
+	if isAsync {
 		h, err := p.guardCreate(spec.ID, "Dispatch", func() (aei.Handle, error) { return async.Dispatch(createCtx, spec, cred) })
-		err = createErr(err)
 		cancelCreate()
 		endCreate()
 		if err != nil {
-			return undispatched(err)
+			// Only a failed Dispatch is attributed to the timeout. A provider that
+			// accepted the workload as the timer fired returns a handle and no
+			// error; that run goes on to be watched, since a retry would start a
+			// second workload beside it.
+			return undispatched(createErr(err))
 		}
 		watch := make(chan aei.Result, 1)
 		go func() { watch <- p.await(ctx, async, spec.ID, h) }()
@@ -480,7 +507,8 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 	// A plain provider's Launch is the whole run: it cannot be cut off at the
 	// create timeout without killing the run, and there is no signal for when its
 	// workload exists. So it holds its create slot (and admission) until it
-	// returns, bounded only by the run deadline, even if the callback wins first.
+	// returns, bounded by the run deadline (defaultLaunchDeadline if the run has
+	// none), even if the callback wins first.
 	cancelCreate()
 	launch := make(chan aei.Result, 1)
 	go func() {
@@ -499,14 +527,24 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 // mintWithin mints the run credential, giving up when ctx ends. Minting takes no
 // context (a provider's PullsCredential, the TokenAuthority, the Store), so a
 // call still blocked at that point is abandoned: its credential, if it is ever
-// produced, is never handed out and expires unused.
+// produced, is never handed out and expires unused. An abandoned call keeps its
+// place in p.mints until it returns, so at most 2*MaxConcurrentCreates mint calls
+// are ever outstanding: a credential backend outage cannot pile up goroutines or
+// requests against it. Once that many are stuck, runs fail at their create
+// timeout until the backend answers.
 func (p *Plane) mintWithin(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec) (aei.Credential, error) {
+	select {
+	case p.mints <- struct{}{}:
+	case <-ctx.Done():
+		return aei.Credential{}, fmt.Errorf("control: run credential not ready (earlier credential calls still outstanding): %w", ctx.Err())
+	}
 	type minted struct {
 		cred aei.Credential
 		err  error
 	}
 	ch := make(chan minted, 1)
 	go func() {
+		defer func() { <-p.mints }()
 		c, err := p.guardMint(launcher, spec)
 		ch <- minted{c, err}
 	}()

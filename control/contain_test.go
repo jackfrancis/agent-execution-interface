@@ -540,6 +540,143 @@ func TestProviderGetsRemainingDeadline(t *testing.T) {
 	}
 }
 
+// lateAccept is an AsyncLauncher whose Dispatch accepts the workload exactly as
+// its context ends, returning a valid handle and no error.
+type lateAccept struct{}
+
+func (lateAccept) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	return aei.Handle{}, nil
+}
+func (lateAccept) Dispatch(ctx context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	<-ctx.Done()
+	return aei.Handle{Ref: spec.ID}, nil
+}
+func (lateAccept) Await(context.Context, aei.Handle) (aei.Result, error) {
+	return aei.Result{ResultRef: "watched"}, nil
+}
+
+// A Dispatch that succeeds as the create timer fires is a dispatched run: the
+// plane watches it rather than failing it (a retry would start a second workload).
+func TestDispatchAcceptedAtCreateTimeoutIsWatched(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, CreateTimeout: 30 * time.Millisecond})
+	id, err := p.Submit(context.Background(), lateAccept{}, aei.RunSpec{Deadline: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := mustTerminal(t, p, id); st.Phase != phaseSucceeded || st.ResultRef != "watched" {
+		t.Fatalf("run = %+v, want Succeeded via the watch", st)
+	}
+}
+
+// slowMint is a gated provider whose credential step takes delay.
+type slowMint struct {
+	*gated
+	delay time.Duration
+}
+
+func (s slowMint) PullsCredential() bool { time.Sleep(s.delay); return true }
+
+// The provider's budget is measured after minting, just before Dispatch.
+func TestRemainingBudgetMeasuredAfterMint(t *testing.T) {
+	g := &gated{}
+	p := New(Config{Secret: []byte("k"), Logger: quietLog})
+	id, err := p.Submit(context.Background(), slowMint{g, 150 * time.Millisecond}, aei.RunSpec{ID: "slow-mint", Deadline: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, p, id)
+	g.mu.Lock()
+	got := g.deadlines["slow-mint"]
+	g.mu.Unlock()
+	if got <= 0 || got > 160*time.Millisecond {
+		t.Fatalf("Dispatch got Deadline %v after a 150ms mint on a 300ms run, want <= 150ms", got)
+	}
+}
+
+// countingPull's credential step blocks until release, counting calls in flight.
+type countingPull struct {
+	fakeWatch
+	release        chan struct{}
+	inflight, peak atomic.Int32
+}
+
+func (c *countingPull) PullsCredential() bool {
+	n := c.inflight.Add(1)
+	defer c.inflight.Add(-1)
+	for {
+		old := c.peak.Load()
+		if n <= old || c.peak.CompareAndSwap(old, n) {
+			break
+		}
+	}
+	<-c.release
+	return true
+}
+
+// Credential calls abandoned at the create timeout stay bounded: repeated runs
+// against a hung credential step leave at most 2*MaxConcurrentCreates calls
+// outstanding, and minting recovers once the backend answers.
+func TestOutstandingMintsBounded(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 30 * time.Millisecond})
+	hung := &countingPull{release: make(chan struct{})}
+	for range 5 {
+		id, err := p.Submit(context.Background(), hung, aei.RunSpec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := mustTerminal(t, p, id); st.Phase != phaseFailed {
+			t.Fatalf("run against a hung credential step = %+v, want Failed", st)
+		}
+	}
+	if peak := hung.peak.Load(); peak != 2 {
+		t.Fatalf("peak outstanding credential calls = %d, want 2 (2*MaxConcurrentCreates)", peak)
+	}
+	close(hung.release)
+	waitFor(t, func() bool { return len(p.mints) == 0 })
+	good, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := mustTerminal(t, p, good); st.Phase != phaseSucceeded {
+		t.Fatalf("run after the backend recovered = %+v, want Succeeded", st)
+	}
+}
+
+// ctxLaunch is a plain Launcher that runs until its context ends, recording the
+// Deadline it was handed.
+type ctxLaunch struct{ handed chan time.Duration }
+
+func (c ctxLaunch) Launch(ctx context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	c.handed <- spec.Deadline
+	<-ctx.Done()
+	return aei.Handle{}, ctx.Err()
+}
+
+// A plain provider's Launch holds its create slot until it returns, so a run with
+// no deadline still gets one; one that waits on ctx then ends and frees the slot.
+func TestPlainLaunchGetsFallbackDeadline(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1})
+	p.launchDeadline = 100 * time.Millisecond
+	l := ctxLaunch{handed: make(chan time.Duration, 1)}
+	id, err := p.Submit(context.Background(), l, aei.RunSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := <-l.handed; d <= 0 || d > 100*time.Millisecond {
+		t.Errorf("Launch was handed Deadline %v, want the fallback (<= 100ms)", d)
+	}
+	if st := mustTerminal(t, p, id); st.Phase != phaseFailed {
+		t.Fatalf("deadline-less plain run = %+v, want Failed at the fallback deadline", st)
+	}
+	good, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := mustTerminal(t, p, good); st.Phase != phaseSucceeded {
+		t.Fatalf("healthy run after = %+v, want Succeeded", st)
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
