@@ -94,20 +94,37 @@ type PublicKeyAuthority interface {
 // Observer records a run's terminal outcome for metrics. It is the pluggable
 // observability seam — the metrics analog of CredentialSource (/vend) and
 // TokenAuthority (mint/verify). The control plane calls ObserveRun exactly once
-// per run on the data-plane (Submit) path, with the run's taskRef, terminal phase
-// ("Succeeded" or "Failed"), and the provider-reported timing breakdown. The
-// reference default is a no-op; a platform supplies a Prometheus implementation
-// (exposed at /metrics) without changing the plane. Implementations MUST be safe
-// for concurrent use.
+// per run on the data-plane (Submit) path, with a RunObservation. The reference
+// default is a no-op; a platform supplies a Prometheus implementation (exposed at
+// /metrics) without changing the plane. Implementations MUST be safe for
+// concurrent use.
 type Observer interface {
-	ObserveRun(taskRef, phase string, timing aei.Timing)
+	ObserveRun(RunObservation)
+}
+
+// RunObservation is one run's terminal outcome as the control plane saw it.
+type RunObservation struct {
+	TaskRef string // the app's task, e.g. "github-converse"; may be empty
+	Phase   string // terminal phase: "Succeeded" or "Failed"
+	// Provider is the provider that placed the run, from its Handle (e.g. "k8s-job"),
+	// or else the one the caller named with WithProvider. Empty when neither did.
+	Provider string
+	// Duration is the run's wall-clock as the controller measured it: from the start
+	// of dispatch to the terminal signal (the runtime's callback, the provider's
+	// watch, or the deadline). It is set for every run, including one the runtime
+	// never reported on.
+	Duration time.Duration
+	// Timing is the breakdown the terminal signal carried: the runtime's /complete
+	// report or the provider's Await. It is the zero value when the run ended without
+	// one, e.g. at the deadline.
+	Timing aei.Timing
 }
 
 // nopObserver is the default Observer: it records nothing, so an unconfigured
 // plane (the reference profile) emits no metrics.
 type nopObserver struct{}
 
-func (nopObserver) ObserveRun(string, string, aei.Timing) {}
+func (nopObserver) ObserveRun(RunObservation) {}
 
 // Config configures a control plane.
 type Config struct {
@@ -131,7 +148,7 @@ type Config struct {
 	// seam; roadmap Phase 7).
 	Store Store
 	// Observer records each run's terminal outcome for metrics: its taskRef, terminal
-	// phase, and timing breakdown (the metrics seam, the /metrics analog of
+	// phase, provider, measured duration, and timing breakdown (the metrics seam, the /metrics analog of
 	// CredentialSource for /vend). Optional: nil records nothing (reference-grade). A
 	// platform supplies a Prometheus implementation and serves it at /metrics, without
 	// changing the plane.
@@ -295,7 +312,8 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 
 	done := p.arm(spec.ID)
 	defer p.disarm(spec.ID)
-	return p.race(ctx, launcher, spec, done)
+	r, _, err := p.race(ctx, launcher, spec, done)
+	return r, err
 }
 
 // RunState is the observable state of a submitted run, held in the Store so the
@@ -314,13 +332,20 @@ type RunState struct {
 // callback raced against the provider's Await and the deadline) is recorded into
 // the in-memory run store and read back with Status. This is the scalable app
 // path — one call per run, no per-run object (docs/dispatch-plane.md).
-func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpec) (string, error) {
+func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpec, opts ...SubmitOption) (string, error) {
 	if launcher == nil {
 		return "", errors.New("control: no launcher")
+	}
+	var o submitOptions
+	for _, opt := range opts {
+		opt(&o)
 	}
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
+	// The measured duration starts no later than the deadline's clock, so a run
+	// the deadline ends is never recorded as shorter than its deadline.
+	start := time.Now()
 	spec = p.applyDeadline(ownSpec(spec))
 	p.store.SetRunning(spec.ID)
 	done := p.arm(spec.ID)
@@ -331,22 +356,47 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 		// bounded only by the run deadline (the universal backstop).
 		ctx, cancel := withRunDeadline(context.Background(), spec)
 		defer cancel()
-		res, _ := p.race(ctx, launcher, spec, done)
+		res, h, _ := p.race(ctx, launcher, spec, done)
+		if h.Provider == "" {
+			h.Provider = o.provider
+		}
 		// Commit first, then observe what the store holds: a callback that wrote
 		// before this run's own outcome is the outcome, and metrics must agree
 		// with GET /runs/{id}.
-		p.observe(spec, p.finishRun(spec.ID, res))
+		p.observe(spec, h, p.finishRun(spec.ID, res), time.Since(start))
 	}()
 	return spec.ID, nil
 }
 
+// SubmitOption configures one Submit call.
+type SubmitOption func(*submitOptions)
+
+type submitOptions struct {
+	provider string
+}
+
+// WithProvider names the provider the caller resolved for the run (e.g. the
+// provider class's driver, "k8s-job"). It attributes the run's metrics when the
+// provider's Handle does not name it — notably when a synchronous Launch has not
+// returned yet because the runtime's /complete callback won the race.
+func WithProvider(name string) SubmitOption {
+	return func(o *submitOptions) { o.provider = name }
+}
+
 // observe reports a run's terminal outcome to the metrics Observer (the metrics
 // seam). It fires once per Submit — the data-plane app path — with the run's
-// taskRef and the terminal state the store recorded (whichever signal won the
-// first write), so metrics never disagree with Status. The default Observer is a
-// no-op, so an unconfigured plane records nothing.
-func (p *Plane) observe(spec aei.RunSpec, st RunState) {
-	p.obs.ObserveRun(spec.TaskRef, st.Phase, st.Timing)
+// taskRef, the terminal state the store recorded (whichever signal won the first
+// write, so metrics never disagree with Status), the provider from its handle, and
+// the duration the controller measured. The default Observer is a no-op, so an
+// unconfigured plane records nothing.
+func (p *Plane) observe(spec aei.RunSpec, h aei.Handle, st RunState, d time.Duration) {
+	p.obs.ObserveRun(RunObservation{
+		TaskRef:  spec.TaskRef,
+		Phase:    st.Phase,
+		Provider: h.Provider,
+		Duration: d,
+		Timing:   st.Timing,
+	})
 }
 
 // Status returns the current state of a submitted run, and whether it is known.
@@ -385,20 +435,30 @@ func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 // /complete callback (delivered on done), the provider's result (Await, or Launch
 // returning for a provider without the async capability), or the deadline (ctx).
 // It is the shared completion core of Run (blocking) and Submit (non-blocking).
-// The returned error is non-nil only when an async provider's Dispatch did not
-// accept the run: Dispatch failed, or ctx ended before Dispatch returned.
+// It also returns the provider's Handle, as far as it is known when the race
+// ends, so the run can be attributed to its provider. The returned error is
+// non-nil only when an async provider's Dispatch did not accept the run: Dispatch
+// failed, or ctx ended before Dispatch returned.
 //
 // The deadline is enforced here, not delegated to the provider: when ctx ends,
 // race returns at once with the context's cause (ErrDeadlineExceeded for the run
 // deadline), whether or not the provider honors cancellation. A provider call
 // that ignores cancellation is left to return on its own; its result goes to a
 // buffered channel nobody reads, so it cannot block or overwrite the outcome.
-func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, done chan aei.Result) (aei.Result, error) {
+func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, done chan aei.Result) (aei.Result, aei.Handle, error) {
 	type outcome struct {
 		res         aei.Result
 		dispatchErr error
 	}
 	provider := make(chan outcome, 1)
+	// handle holds the provider's Handle once Dispatch or Launch has returned it;
+	// a callback can win before a blocking Launch returns, when it is not known.
+	var (
+		hmu    sync.Mutex
+		handle aei.Handle
+	)
+	setHandle := func(h aei.Handle) { hmu.Lock(); handle = h; hmu.Unlock() }
+	getHandle := func() aei.Handle { hmu.Lock(); defer hmu.Unlock(); return handle }
 	// accepted closes once an async provider's Dispatch returns without error, so
 	// a deadline or cancellation that lands first is still reported as a failed
 	// dispatch rather than as an accepted run that ended.
@@ -425,6 +485,7 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		// observe completion by watch; a plain provider blocks in Launch.
 		if isAsync {
 			h, err := async.Dispatch(ctx, spec, cred)
+			setHandle(h)
 			if err != nil {
 				provider <- outcome{res: aei.Result{Err: err}, dispatchErr: err}
 				return
@@ -434,28 +495,30 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 			provider <- outcome{res: r}
 			return
 		}
-		_, err := launcher.Launch(ctx, spec, cred)
+		h, err := launcher.Launch(ctx, spec, cred)
+		setHandle(h)
 		provider <- outcome{res: aei.Result{Err: err}}
 	}()
 
 	select {
 	case r := <-done:
-		return r, nil
+		return r, getHandle(), nil
 	case o := <-provider:
-		return providerOutcome(ctx, done, o.res, o.dispatchErr)
+		r, err := providerOutcome(ctx, done, o.res, o.dispatchErr)
+		return r, getHandle(), err
 	case <-ctx.Done():
 		// A runtime callback that landed together with the deadline still wins.
 		select {
 		case r := <-done:
-			return r, nil
+			return r, getHandle(), nil
 		default:
 		}
 		cause := context.Cause(ctx)
 		select {
 		case <-accepted:
-			return aei.Result{Err: cause}, nil
+			return aei.Result{Err: cause}, getHandle(), nil
 		default:
-			return aei.Result{Err: cause}, cause // Dispatch never accepted the run
+			return aei.Result{Err: cause}, getHandle(), cause // Dispatch never accepted the run
 		}
 	}
 }
@@ -728,23 +791,28 @@ func (p *Plane) handleAuthority(w http.ResponseWriter, _ *http.Request) {
 }
 
 // wireTiming is the /complete timing body (docs/runtime-abi.md §3), whose snake_case
-// JSON is the wire contract; it maps onto the domain aei.Timing.
+// JSON is the wire contract; it maps onto the domain aei.Timing. The durations are
+// pointers so an explicit 0 is kept apart from an omitted field (aei.Timing.Measured).
 type wireTiming struct {
-	ProvisioningSeconds float64 `json:"provisioning_seconds"`
-	RuntimeSeconds      float64 `json:"runtime_seconds"`
-	ModelSeconds        float64 `json:"model_seconds"`
-	ModelCalls          int     `json:"model_calls"`
-	ToolCalls           int     `json:"tool_calls"`
+	ProvisioningSeconds *float64 `json:"provisioning_seconds"`
+	RuntimeSeconds      *float64 `json:"runtime_seconds"`
+	ModelSeconds        *float64 `json:"model_seconds"`
+	ModelCalls          int      `json:"model_calls"`
+	ToolCalls           int      `json:"tool_calls"`
 }
 
 func (t wireTiming) toAEI() aei.Timing {
-	return aei.Timing{
-		ProvisioningSeconds: t.ProvisioningSeconds,
-		RuntimeSeconds:      t.RuntimeSeconds,
-		ModelSeconds:        t.ModelSeconds,
-		ModelCalls:          t.ModelCalls,
-		ToolCalls:           t.ToolCalls,
+	out := aei.Timing{ModelCalls: t.ModelCalls, ToolCalls: t.ToolCalls}
+	set := func(v *float64, dst *float64, stage aei.TimingStages) {
+		if v != nil {
+			*dst = *v
+			out.Measured |= stage
+		}
 	}
+	set(t.ProvisioningSeconds, &out.ProvisioningSeconds, aei.StageProvisioning)
+	set(t.RuntimeSeconds, &out.RuntimeSeconds, aei.StageRuntime)
+	set(t.ModelSeconds, &out.ModelSeconds, aei.StageModel)
+	return out
 }
 
 func (p *Plane) handleComplete(w http.ResponseWriter, r *http.Request) {

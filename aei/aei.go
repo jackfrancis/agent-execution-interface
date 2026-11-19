@@ -122,7 +122,26 @@ type Timing struct {
 	ModelSeconds        float64 // the model share (optional)
 	ModelCalls          int     // optional
 	ToolCalls           int     // optional
+
+	// Measured marks durations the source measured, so a measured zero is
+	// distinguishable from a field it omitted. A positive duration counts as
+	// measured whether or not its bit is set, so a source that predates Measured
+	// keeps reporting its durations; set the bit to report a measured zero.
+	Measured TimingStages
 }
+
+// TimingStages is a set of Timing duration fields.
+type TimingStages uint8
+
+// The Timing duration fields a source can report.
+const (
+	StageProvisioning TimingStages = 1 << iota
+	StageRuntime
+	StageModel
+)
+
+// Has reports whether every stage in s is in the set.
+func (m TimingStages) Has(s TimingStages) bool { return m&s == s }
 
 // Result is the terminal outcome of a run. The result *payload* is out of scope
 // (app-defined); AEI carries only success/failure and observability. ResultRef is

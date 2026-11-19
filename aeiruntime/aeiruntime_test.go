@@ -280,3 +280,61 @@ func TestLoadRequiresRunIDAndControlURL(t *testing.T) {
 		t.Error("missing AEI_CONTROL_URL must fail")
 	}
 }
+
+// Timing encodes a duration only when it is positive or marked measured: an empty
+// report carries no durations, and a measured zero survives encoding.
+func TestTimingEncodesPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   rt.Timing
+		want string
+	}{
+		{"empty", rt.Timing{}, `{}`},
+		{"positive", rt.Timing{ProvisioningSeconds: 0.5, RuntimeSeconds: 2, ModelCalls: 3},
+			`{"provisioning_seconds":0.5,"runtime_seconds":2,"model_calls":3}`},
+		{"measured zero", rt.Timing{RuntimeSeconds: 2, Measured: rt.StageModel},
+			`{"runtime_seconds":2,"model_seconds":0}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tc.want {
+				t.Errorf("encoded %s, want %s", b, tc.want)
+			}
+		})
+	}
+}
+
+// A report decoded into Timing and re-encoded is unchanged: the snake_case fields
+// are read back, and each duration present on the wire (a measured zero included)
+// is marked measured, while an absent one stays absent.
+func TestTimingJSONRoundTrip(t *testing.T) {
+	for _, in := range []string{
+		`{}`,
+		`{"runtime_seconds":8,"model_seconds":0,"model_calls":3}`,
+		`{"provisioning_seconds":0.5,"runtime_seconds":2,"model_seconds":1.5,"model_calls":4,"tool_calls":9}`,
+	} {
+		var tm rt.Timing
+		if err := json.Unmarshal([]byte(in), &tm); err != nil {
+			t.Fatalf("decode %s: %v", in, err)
+		}
+		out, err := json.Marshal(tm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(out) != in {
+			t.Errorf("round trip %s -> %s", in, out)
+		}
+	}
+
+	var tm rt.Timing
+	if err := json.Unmarshal([]byte(`{"runtime_seconds":8,"model_seconds":0,"model_calls":3}`), &tm); err != nil {
+		t.Fatal(err)
+	}
+	want := rt.Timing{RuntimeSeconds: 8, ModelCalls: 3, Measured: rt.StageRuntime | rt.StageModel}
+	if tm != want {
+		t.Errorf("decoded %+v, want %+v", tm, want)
+	}
+}
