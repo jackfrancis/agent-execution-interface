@@ -90,8 +90,18 @@ const (
 	StageModel
 )
 
-// MarshalJSON encodes the /complete timing object. The snake_case keys are the
-// wire contract; a duration is present only when measured (see Timing).
+// timingWire is the /complete timing object's JSON shape. The snake_case keys are
+// the wire contract; the durations are pointers so presence is explicit.
+type timingWire struct {
+	ProvisioningSeconds *float64 `json:"provisioning_seconds,omitempty"`
+	RuntimeSeconds      *float64 `json:"runtime_seconds,omitempty"`
+	ModelSeconds        *float64 `json:"model_seconds,omitempty"`
+	ModelCalls          int      `json:"model_calls,omitempty"`
+	ToolCalls           int      `json:"tool_calls,omitempty"`
+}
+
+// MarshalJSON encodes the /complete timing object; a duration is present only when
+// it is positive or measured (see Timing).
 func (t Timing) MarshalJSON() ([]byte, error) {
 	dur := func(v float64, s Stages) *float64 {
 		if v > 0 || t.Measured&s != 0 {
@@ -99,19 +109,33 @@ func (t Timing) MarshalJSON() ([]byte, error) {
 		}
 		return nil
 	}
-	return json.Marshal(struct {
-		ProvisioningSeconds *float64 `json:"provisioning_seconds,omitempty"`
-		RuntimeSeconds      *float64 `json:"runtime_seconds,omitempty"`
-		ModelSeconds        *float64 `json:"model_seconds,omitempty"`
-		ModelCalls          int      `json:"model_calls,omitempty"`
-		ToolCalls           int      `json:"tool_calls,omitempty"`
-	}{
+	return json.Marshal(timingWire{
 		ProvisioningSeconds: dur(t.ProvisioningSeconds, StageProvisioning),
 		RuntimeSeconds:      dur(t.RuntimeSeconds, StageRuntime),
 		ModelSeconds:        dur(t.ModelSeconds, StageModel),
 		ModelCalls:          t.ModelCalls,
 		ToolCalls:           t.ToolCalls,
 	})
+}
+
+// UnmarshalJSON decodes the /complete timing object, marking each duration present
+// on the wire as measured, so a decoded report re-encodes unchanged.
+func (t *Timing) UnmarshalJSON(b []byte) error {
+	var w timingWire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	*t = Timing{ModelCalls: w.ModelCalls, ToolCalls: w.ToolCalls}
+	set := func(v *float64, dst *float64, s Stages) {
+		if v != nil {
+			*dst = *v
+			t.Measured |= s
+		}
+	}
+	set(w.ProvisioningSeconds, &t.ProvisioningSeconds, StageProvisioning)
+	set(w.RuntimeSeconds, &t.RuntimeSeconds, StageRuntime)
+	set(w.ModelSeconds, &t.ModelSeconds, StageModel)
+	return nil
 }
 
 // Credential is a short-lived bearer credential the runtime holds in memory only

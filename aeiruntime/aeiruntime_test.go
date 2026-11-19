@@ -306,3 +306,35 @@ func TestTimingEncodesPresence(t *testing.T) {
 		})
 	}
 }
+
+// A report decoded into Timing and re-encoded is unchanged: the snake_case fields
+// are read back, and each duration present on the wire (a measured zero included)
+// is marked measured, while an absent one stays absent.
+func TestTimingJSONRoundTrip(t *testing.T) {
+	for _, in := range []string{
+		`{}`,
+		`{"runtime_seconds":8,"model_seconds":0,"model_calls":3}`,
+		`{"provisioning_seconds":0.5,"runtime_seconds":2,"model_seconds":1.5,"model_calls":4,"tool_calls":9}`,
+	} {
+		var tm rt.Timing
+		if err := json.Unmarshal([]byte(in), &tm); err != nil {
+			t.Fatalf("decode %s: %v", in, err)
+		}
+		out, err := json.Marshal(tm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(out) != in {
+			t.Errorf("round trip %s -> %s", in, out)
+		}
+	}
+
+	var tm rt.Timing
+	if err := json.Unmarshal([]byte(`{"runtime_seconds":8,"model_seconds":0,"model_calls":3}`), &tm); err != nil {
+		t.Fatal(err)
+	}
+	want := rt.Timing{RuntimeSeconds: 8, ModelCalls: 3, Measured: rt.StageRuntime | rt.StageModel}
+	if tm != want {
+		t.Errorf("decoded %+v, want %+v", tm, want)
+	}
+}
