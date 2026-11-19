@@ -219,3 +219,30 @@ func TestTolerationsFromClassParameter(t *testing.T) {
 		t.Error("a malformed tolerations parameter must be an error")
 	}
 }
+
+// The control plane hands a provider the run's remaining budget, which is
+// fractional. activeDeadlineSeconds rounds it up, so the Job never ends before
+// the run's deadline (truncation gave a 1s run 0, and a 60s run 59).
+func TestActiveDeadlineRoundsUp(t *testing.T) {
+	for _, tc := range []struct {
+		deadline time.Duration
+		want     int64
+	}{
+		{999 * time.Millisecond, 1},
+		{59*time.Second + 999*time.Millisecond, 60},
+		{60 * time.Second, 60},
+	} {
+		l := testLauncher()
+		h, err := l.Dispatch(context.Background(), aei.RunSpec{ID: "r", Deadline: tc.deadline}, aei.Credential{Value: "t", Kind: aei.Token})
+		if err != nil {
+			t.Fatal(err)
+		}
+		job, err := l.client.BatchV1().Jobs("aei").Get(context.Background(), h.Ref, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := job.Spec.ActiveDeadlineSeconds; got == nil || *got != tc.want {
+			t.Errorf("deadline %v: activeDeadlineSeconds = %v, want %d", tc.deadline, got, tc.want)
+		}
+	}
+}

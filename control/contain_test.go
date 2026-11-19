@@ -352,29 +352,107 @@ func TestHungCreateGivesUpSlot(t *testing.T) {
 	}
 }
 
-// A plain provider's Launch is the run itself, so at the create timeout it keeps
-// running but gives its slot to the next create.
-func TestBlockingLaunchReleasesSlotAtCreateTimeout(t *testing.T) {
-	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 50 * time.Millisecond})
+// A plain provider's Launch is the run itself and gives no signal for when its
+// workload exists, so it holds its create slot until it returns, past
+// CreateTimeout: no second Launch starts while the first is outstanding.
+func TestBlockingLaunchHoldsSlotUntilReturn(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 20 * time.Millisecond})
 	slow := slowLaunch{entered: make(chan struct{}), release: make(chan struct{})}
 	id, err := p.Submit(context.Background(), slow, aei.RunSpec{Deadline: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-slow.entered // the long Launch holds the only slot
-	good, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{Deadline: 5 * time.Second})
+
+	next := slowLaunch{entered: make(chan struct{}), release: make(chan struct{})}
+	close(next.release)
+	nextID, err := p.Submit(context.Background(), next, aei.RunSpec{Deadline: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-next.entered:
+		t.Fatal("a second Launch started while the first was still running (past the create timeout)")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(slow.release)
+	for _, r := range []string{id, nextID} {
+		if st := mustTerminal(t, p, r); st.Phase != phaseSucceeded {
+			t.Fatalf("run %s = %+v, want Succeeded", r, st)
+		}
+	}
+}
+
+// Admission is released with the create slot, not when the run's outcome is
+// known: a callback that wins while a blocking Launch still holds its slot does
+// not open the queue. With one slot and one queue place, one more Submit fits.
+func TestAdmissionHeldUntilCreateReturns(t *testing.T) {
+	for _, path := range []string{"submit", "run"} {
+		t.Run(path, func(t *testing.T) {
+			p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, MaxQueued: 1})
+			slow := slowLaunch{entered: make(chan struct{}), release: make(chan struct{})}
+			defer close(slow.release)
+			spec := aei.RunSpec{ID: "first", Deadline: 5 * time.Second}
+
+			runDone := make(chan struct{})
+			if path == "submit" {
+				if _, err := p.Submit(context.Background(), slow, spec); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				go func() { _, _ = p.Run(context.Background(), slow, spec); close(runDone) }()
+			}
+			<-slow.entered
+			p.fire("first", aei.Result{ResultRef: "called-back"}) // the runtime's callback wins
+			if path == "submit" {
+				if st := mustTerminal(t, p, "first"); st.Phase != phaseSucceeded {
+					t.Fatalf("first = %+v, want Succeeded by callback", st)
+				}
+			} else {
+				<-runDone
+			}
+
+			queued := &fakeWatch{result: aei.Result{ResultRef: "ok"}}
+			if _, err := p.Submit(context.Background(), queued, aei.RunSpec{Deadline: 5 * time.Second}); err != nil {
+				t.Fatalf("Submit into the one queue place: %v", err)
+			}
+			if _, err := p.Submit(context.Background(), queued, aei.RunSpec{Deadline: 5 * time.Second}); !errors.Is(err, ErrOverloaded) {
+				t.Fatalf("Submit beyond the queue while the Launch still creates = %v, want ErrOverloaded", err)
+			}
+		})
+	}
+}
+
+// blockPull is a provider whose PullsCredential blocks, standing in for any
+// credential step (PullsCredential, the authority, the store) that hangs.
+type blockPull struct {
+	fakeWatch
+	entered, block chan struct{}
+}
+
+func (b *blockPull) PullsCredential() bool { close(b.entered); <-b.block; return true }
+
+// Minting counts against CreateTimeout: a credential step that hangs fails its run
+// at the timeout and gives the slot to the next create.
+func TestHungMintGivesUpSlot(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 50 * time.Millisecond})
+	hung := &blockPull{entered: make(chan struct{}), block: make(chan struct{})}
+	defer close(hung.block)
+
+	id, err := p.Submit(context.Background(), hung, aei.RunSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-hung.entered // the hung mint holds the only slot
+	good, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st := mustTerminal(t, p, good); st.Phase != phaseSucceeded {
-		t.Fatalf("run behind a long Launch = %+v, want Succeeded", st)
+		t.Fatalf("healthy run behind a hung mint = %+v, want Succeeded", st)
 	}
-	if st, _ := p.Status(id); st.Phase != phaseRunning {
-		t.Fatalf("long Launch = %+v, want still Running", st)
-	}
-	close(slow.release)
-	if st := mustTerminal(t, p, id); st.Phase != phaseSucceeded {
-		t.Fatalf("long Launch = %+v, want Succeeded once it returns", st)
+	if st := mustTerminal(t, p, id); st.Phase != phaseFailed || !strings.Contains(st.Err, "run credential not ready") {
+		t.Fatalf("hung-mint run = %+v, want Failed at the create timeout", st)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -194,7 +195,11 @@ func (l *Launcher) job(spec aei.RunSpec, cred aei.Credential, dispatchedAt time.
 	ttl := defaultTTLAfterFinished
 	var activeDeadline *int64
 	if spec.Deadline > 0 {
-		s := int64(spec.Deadline.Seconds())
+		// Round up: the plane hands over the run's remaining budget, which is
+		// fractional, and truncating it would end the Job early (a 1s run would
+		// get 0, eligible for DeadlineExceeded at once). The runtime gets the
+		// precise deadline through AEI_DEADLINE.
+		s := int64(math.Ceil(spec.Deadline.Seconds()))
 		activeDeadline = &s
 	}
 	ns, _ := runtimespec.Namespace(l.opts.Namespace, spec)
