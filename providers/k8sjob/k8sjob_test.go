@@ -244,3 +244,30 @@ func TestActiveDeadlineFollowsPlaneCutoff(t *testing.T) {
 		})
 	}
 }
+
+// TestActiveDeadlineCoversFractionalStart: Kubernetes stores the Job's startTime
+// rounded down to the second, so a Job dispatched 900ms into a second with a
+// 500ms budget must get 2s — 1s from the stored start would expire it 400ms
+// before the plane's cutoff.
+func TestActiveDeadlineCoversFractionalStart(t *testing.T) {
+	l := testLauncher()
+	for _, c := range []struct {
+		name   string
+		offset time.Duration // into the second at dispatch
+		budget time.Duration
+		want   int64
+	}{
+		{"900ms in, 500ms budget", 900 * time.Millisecond, 500 * time.Millisecond, 2},
+		{"100ms in, 500ms budget", 100 * time.Millisecond, 500 * time.Millisecond, 1},
+		{"999ms in, 5m budget", 999 * time.Millisecond, 5 * time.Minute, 301},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dispatched := l.now().Add(c.offset)
+			cutoff := dispatched.Add(c.budget)
+			job := l.job(aei.RunSpec{ID: "f", Deadline: c.budget, DeadlineAt: cutoff}, aei.Credential{Value: "tok"}, dispatched)
+			if got := job.Spec.ActiveDeadlineSeconds; got == nil || *got != c.want {
+				t.Errorf("activeDeadlineSeconds = %v, want %d", got, c.want)
+			}
+		})
+	}
+}

@@ -53,6 +53,10 @@ func Injection(spec RunSpec, cred Credential, controlURL, brokerURL string, disp
 	}
 	if !dispatchedAt.IsZero() {
 		m[EnvDispatchedAt] = strconv.FormatInt(dispatchedAt.UnixMilli(), 10)
+	}
+	// The plane's explicit cutoff stands on its own; only the relative fallback
+	// (dispatchedAt + Deadline) needs the dispatch timestamp.
+	if !spec.DeadlineAt.IsZero() || !dispatchedAt.IsZero() {
 		if cutoff := spec.Cutoff(dispatchedAt); !cutoff.IsZero() {
 			m[EnvDeadline] = strconv.FormatInt(cutoff.UnixMilli(), 10)
 		}

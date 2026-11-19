@@ -28,6 +28,20 @@ func (c *captureObserver) ObserveRun(taskRef, phase string, t aei.Timing) {
 	c.mu.Unlock()
 }
 
+// waitFor blocks until at least n runs have been observed and returns them. The
+// store holds a run's terminal state before ObserveRun is called, so a test that
+// saw the terminal phase must still wait for the observation to be delivered.
+func (c *captureObserver) waitFor(t *testing.T, n int) []observed {
+	t.Helper()
+	end := time.Now().Add(2 * time.Second)
+	for {
+		if got := c.snapshot(); len(got) >= n || time.Now().After(end) {
+			return got
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func (c *captureObserver) snapshot() []observed {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -48,7 +62,7 @@ func TestSubmitObservesTerminalRun(t *testing.T) {
 	}
 	waitTerminal(t, p, runID)
 
-	got := obs.snapshot()
+	got := obs.waitFor(t, 1)
 	if len(got) != 1 {
 		t.Fatalf("expected exactly one observation, got %d", len(got))
 	}
@@ -72,7 +86,7 @@ func TestSubmitObservesFailedRun(t *testing.T) {
 	}
 	waitTerminal(t, p, runID)
 
-	got := obs.snapshot()
+	got := obs.waitFor(t, 1)
 	if len(got) != 1 || got[0].phase != phaseFailed || got[0].taskRef != "github-ingest" {
 		t.Fatalf("observed %+v, want one Failed github-ingest observation", got)
 	}

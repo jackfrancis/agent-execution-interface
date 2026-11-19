@@ -96,3 +96,17 @@ func TestInjectionUsesPlaneCutoff(t *testing.T) {
 		t.Errorf("AEI_DEADLINE = %q, want the plane's cutoff 1789000040000", got)
 	}
 }
+
+// TestInjectionExplicitCutoffWithoutDispatchedAt: a provider that passes no
+// dispatch timestamp still hands the runtime the plane's explicit cutoff; only the
+// relative fallback needs dispatchedAt.
+func TestInjectionExplicitCutoffWithoutDispatchedAt(t *testing.T) {
+	spec := aei.RunSpec{ID: "r", Deadline: time.Minute, DeadlineAt: time.UnixMilli(1789000060000)}
+	m := aei.Injection(spec, aei.Credential{Value: "tok"}, "http://cp", "", time.Time{})
+	if got := m[aei.EnvDeadline]; got != "1789000060000" {
+		t.Errorf("AEI_DEADLINE = %q, want 1789000060000", got)
+	}
+	if _, ok := m[aei.EnvDispatchedAt]; ok {
+		t.Error("no dispatchedAt ⇒ no AEI_DISPATCHED_AT")
+	}
+}

@@ -390,3 +390,161 @@ func TestDeadlineFromSeconds(t *testing.T) {
 		t.Errorf("oversized timeout -> %s, want the 1h maximum", got)
 	}
 }
+
+// slowAuthority is a TokenAuthority whose Mint takes delay — a slow credential
+// issuer.
+type slowAuthority struct {
+	hmacAuthority
+	delay time.Duration
+}
+
+func (s slowAuthority) Mint(c Claims) (string, error) {
+	time.Sleep(s.delay)
+	return s.hmacAuthority.Mint(c)
+}
+
+// recordLaunch records whether the provider was ever called.
+type recordLaunch struct{ called chan struct{} }
+
+func (r *recordLaunch) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	r.called <- struct{}{}
+	return aei.Handle{}, nil
+}
+
+type recordDispatch struct{ recordLaunch }
+
+func (r *recordDispatch) Dispatch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	r.called <- struct{}{}
+	return aei.Handle{}, nil
+}
+func (r *recordDispatch) Await(context.Context, aei.Handle) (aei.Result, error) {
+	return aei.Result{}, nil
+}
+
+// TestSlowMintIsBoundedByDeadline: minting runs under the deadline. With a 10ms
+// budget and a 150ms issuer, the run ends at its deadline, and the provider is
+// never called with an expired run — on Run and Submit, plain and async.
+func TestSlowMintIsBoundedByDeadline(t *testing.T) {
+	const budget, mintDelay = 10 * time.Millisecond, 150 * time.Millisecond
+	newPlane := func() *Plane {
+		return New(Config{Authority: slowAuthority{hmacAuthority{secret: []byte("k"), now: time.Now}, mintDelay}})
+	}
+	notCalled := func(t *testing.T, called chan struct{}) {
+		t.Helper()
+		select {
+		case <-called:
+			t.Error("provider called after the deadline passed")
+		case <-time.After(mintDelay + 50*time.Millisecond):
+		}
+	}
+
+	t.Run("run/launch", func(t *testing.T) {
+		l := &recordLaunch{called: make(chan struct{}, 1)}
+		start := time.Now()
+		r, _ := newPlane().Run(context.Background(), l, aei.RunSpec{ID: "rl", Deadline: budget})
+		if elapsed := time.Since(start); elapsed >= mintDelay {
+			t.Errorf("Run returned after %s, want at the %s deadline", elapsed, budget)
+		}
+		if !errors.Is(r.Err, ErrDeadlineExceeded) {
+			t.Errorf("err = %v, want ErrDeadlineExceeded", r.Err)
+		}
+		notCalled(t, l.called)
+	})
+	t.Run("run/async", func(t *testing.T) {
+		l := &recordDispatch{recordLaunch{called: make(chan struct{}, 1)}}
+		_, err := newPlane().Run(context.Background(), l, aei.RunSpec{ID: "ra", Deadline: budget})
+		if !errors.Is(err, ErrDeadlineExceeded) {
+			t.Errorf("Run error = %v, want ErrDeadlineExceeded: the run was never dispatched", err)
+		}
+		notCalled(t, l.called)
+	})
+	t.Run("submit/launch", func(t *testing.T) {
+		l := &recordLaunch{called: make(chan struct{}, 1)}
+		p := newPlane()
+		start := time.Now()
+		id, _ := p.Submit(context.Background(), l, aei.RunSpec{ID: "sl", Deadline: budget})
+		assertTimedOut(t, awaitRunState(t, p, id, 2*time.Second))
+		if elapsed := time.Since(start); elapsed >= mintDelay {
+			t.Errorf("run ended after %s, want at the %s deadline", elapsed, budget)
+		}
+		notCalled(t, l.called)
+	})
+}
+
+// specRecorder is an AsyncLauncher that records the spec it was dispatched with
+// and completes at once.
+type specRecorder struct{ specs chan aei.RunSpec }
+
+func (s *specRecorder) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	return aei.Handle{}, nil
+}
+func (s *specRecorder) Dispatch(_ context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	s.specs <- spec
+	return aei.Handle{}, nil
+}
+func (s *specRecorder) Await(context.Context, aei.Handle) (aei.Result, error) {
+	return aei.Result{ResultRef: "ok"}, nil
+}
+
+// TestCallerDeadlineReachesProvider: when Run's caller has a deadline sooner than
+// the run's own, the provider (and so the runtime) gets the caller's.
+func TestCallerDeadlineReachesProvider(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	callerDL, _ := ctx.Deadline()
+	rec := &specRecorder{specs: make(chan aei.RunSpec, 1)}
+	if _, err := New(Config{Secret: []byte("k")}).Run(ctx, rec, aei.RunSpec{ID: "caller-dl"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := (<-rec.specs).DeadlineAt; !got.Equal(callerDL) {
+		t.Errorf("DeadlineAt = %s, want the caller's deadline %s", got, callerDL)
+	}
+}
+
+// TestQueuedCallbackBeatsProviderCancellation: when a successful callback, the
+// deadline and the provider's cancellation result are all ready at once, the
+// callback is the outcome, whichever select case Go picks.
+func TestQueuedCallbackBeatsProviderCancellation(t *testing.T) {
+	p := New(Config{Secret: []byte("k")})
+	past := time.Now().Add(-time.Second)
+	spec := aei.RunSpec{ID: "q", Deadline: time.Second, DeadlineAt: past}
+	for i := range 300 {
+		ctx, cancel := withRunDeadline(context.Background(), spec)
+		done := make(chan aei.Result, 1)
+		done <- aei.Result{ResultRef: "cb"}
+		r, err := p.race(ctx, &cancelledLaunch{}, spec, done)
+		cancel()
+		if err != nil || r.Err != nil || r.ResultRef != "cb" {
+			t.Fatalf("iteration %d: got (%+v, %v), want the queued callback", i, r, err)
+		}
+	}
+}
+
+// TestProviderCancellationYieldsToQueuedCallback is the deterministic form of the
+// test above: the provider reported its context's error first, the deadline has
+// passed, and a successful callback is queued — the callback is the outcome. With
+// nothing queued, the plane's deadline error replaces the bare context error.
+func TestProviderCancellationYieldsToQueuedCallback(t *testing.T) {
+	spec := aei.RunSpec{ID: "q", Deadline: time.Second, DeadlineAt: time.Now().Add(-time.Second)}
+	ctx, cancel := withRunDeadline(context.Background(), spec)
+	defer cancel()
+
+	done := make(chan aei.Result, 1)
+	done <- aei.Result{ResultRef: "cb"}
+	r, err := providerOutcome(ctx, done, aei.Result{Err: context.DeadlineExceeded}, nil)
+	if err != nil || r.Err != nil || r.ResultRef != "cb" {
+		t.Errorf("with a queued callback: got (%+v, %v), want the callback", r, err)
+	}
+
+	r, err = providerOutcome(ctx, make(chan aei.Result, 1), aei.Result{Err: context.Canceled}, context.Canceled)
+	if !errors.Is(r.Err, ErrDeadlineExceeded) || !errors.Is(err, ErrDeadlineExceeded) {
+		t.Errorf("with nothing queued: got (%v, %v), want ErrDeadlineExceeded for both", r.Err, err)
+	}
+}
+
+// cancelledLaunch is a plain Launcher that reports its context's error at once.
+type cancelledLaunch struct{}
+
+func (cancelledLaunch) Launch(ctx context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	return aei.Handle{Ref: spec.ID}, ctx.Err()
+}

@@ -221,8 +221,9 @@ func New(cfg Config) *Plane {
 
 // applyDeadline sets spec's Deadline to its effective value and DeadlineAt to the
 // absolute cutoff the plane enforces, measured from now — before the credential is
-// minted and the provider is called, so provisioning time is spent from the
-// budget, and the runtime's AEI_DEADLINE is the instant the plane ends the run.
+// minted and the provider is called, so minting and provisioning time are spent
+// from the budget, and the runtime's AEI_DEADLINE is the instant the plane ends
+// the run.
 func (p *Plane) applyDeadline(spec aei.RunSpec) aei.RunSpec {
 	spec.Deadline = p.effectiveDeadline(spec)
 	spec.DeadlineAt = time.Now().Add(spec.Deadline)
@@ -275,14 +276,13 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 		spec.ID = randID()
 	}
 	spec = p.applyDeadline(spec)
-	cred := p.mint(launcher, spec)
-
 	ctx, cancel := withRunDeadline(ctx, spec)
 	defer cancel()
+	spec = withContextCutoff(ctx, spec) // a caller deadline sooner than the run's wins
 
 	done := p.arm(spec.ID)
 	defer p.disarm(spec.ID)
-	return p.race(ctx, launcher, spec, cred, done)
+	return p.race(ctx, launcher, spec, done)
 }
 
 // RunState is the observable state of a submitted run, held in the Store so the
@@ -309,7 +309,6 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 		spec.ID = randID()
 	}
 	spec = p.applyDeadline(spec)
-	cred := p.mint(launcher, spec)
 	p.store.SetRunning(spec.ID)
 	done := p.arm(spec.ID)
 
@@ -319,7 +318,7 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 		// bounded only by the run deadline (the universal backstop).
 		ctx, cancel := withRunDeadline(context.Background(), spec)
 		defer cancel()
-		res, _ := p.race(ctx, launcher, spec, cred, done)
+		res, _ := p.race(ctx, launcher, spec, done)
 		// Commit first, then observe what the store holds: a callback that wrote
 		// before this run's own outcome is the outcome, and metrics must agree
 		// with GET /runs/{id}.
@@ -381,7 +380,7 @@ func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 // deadline), whether or not the provider honors cancellation. A provider call
 // that ignores cancellation is left to return on its own; its result goes to a
 // buffered channel nobody reads, so it cannot block or overwrite the outcome.
-func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, cred aei.Credential, done chan aei.Result) (aei.Result, error) {
+func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, done chan aei.Result) (aei.Result, error) {
 	type outcome struct {
 		res         aei.Result
 		dispatchErr error
@@ -396,6 +395,19 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		close(accepted) // a plain provider has no separate dispatch step
 	}
 	go func() {
+		// Minting runs under the deadline too: a slow credential issuer cannot
+		// hold the run open, and a run whose deadline passed while its credential
+		// was minted is never handed to the provider.
+		cred := p.mint(launcher, spec)
+		if ctx.Err() != nil {
+			cause := context.Cause(ctx)
+			o := outcome{res: aei.Result{Err: cause}}
+			if isAsync {
+				o.dispatchErr = cause
+			}
+			provider <- o
+			return
+		}
 		// The async capability lets us dispatch without blocking a worker and
 		// observe completion by watch; a plain provider blocks in Launch.
 		if isAsync {
@@ -417,16 +429,7 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 	case r := <-done:
 		return r, nil
 	case o := <-provider:
-		// A provider that honors cancellation reports the context's bare error
-		// when the deadline fires; record the plane's cause instead, so a timed-out
-		// run reads the same whichever signal won.
-		if ctx.Err() != nil && (errors.Is(o.res.Err, context.DeadlineExceeded) || errors.Is(o.res.Err, context.Canceled)) {
-			o.res.Err = context.Cause(ctx)
-			if o.dispatchErr != nil {
-				o.dispatchErr = o.res.Err
-			}
-		}
-		return o.res, o.dispatchErr
+		return providerOutcome(ctx, done, o.res, o.dispatchErr)
 	case <-ctx.Done():
 		// A runtime callback that landed together with the deadline still wins.
 		select {
@@ -451,6 +454,37 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 func withRunDeadline(ctx context.Context, spec aei.RunSpec) (context.Context, context.CancelFunc) {
 	return context.WithDeadlineCause(ctx, spec.DeadlineAt,
 		fmt.Errorf("%w after %s: %w", ErrDeadlineExceeded, spec.Deadline, context.DeadlineExceeded))
+}
+
+// providerOutcome settles a run whose provider reported first. A provider that
+// honors cancellation reports the context's bare error when the deadline fires;
+// the plane records its own cause instead, so a timed-out run reads the same
+// whichever signal won — unless a runtime callback is queued alongside the
+// cancellation, which still wins.
+func providerOutcome(ctx context.Context, done chan aei.Result, res aei.Result, dispatchErr error) (aei.Result, error) {
+	if ctx.Err() == nil || !(errors.Is(res.Err, context.DeadlineExceeded) || errors.Is(res.Err, context.Canceled)) {
+		return res, dispatchErr
+	}
+	select {
+	case r := <-done:
+		return r, nil
+	default:
+	}
+	res.Err = context.Cause(ctx)
+	if dispatchErr != nil {
+		dispatchErr = res.Err
+	}
+	return res, dispatchErr
+}
+
+// withContextCutoff lowers spec.DeadlineAt to ctx's deadline when that is sooner
+// (a Run caller's own deadline), so the provider and the runtime stop when the
+// plane stops waiting.
+func withContextCutoff(ctx context.Context, spec aei.RunSpec) aei.RunSpec {
+	if dl, ok := ctx.Deadline(); ok && dl.Before(spec.DeadlineAt) {
+		spec.DeadlineAt = dl
+	}
+	return spec
 }
 
 // --- completion registry (the callback/watch race) ---
