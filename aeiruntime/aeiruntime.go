@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/signal"
@@ -200,7 +202,7 @@ func Load(ctx context.Context, getenv func(string) string, metadata map[string]s
 		},
 		controlURL: controlURL,
 		brokerURL:  brokerURL,
-		http:       http.DefaultClient,
+		http:       &http.Client{Timeout: requestTimeout},
 	}
 
 	// Exactly one of credential/ticket is present (docs/runtime-abi.md §1.1). A
@@ -252,14 +254,68 @@ type completeRequest struct {
 
 // Complete reports the terminal outcome at {control}/complete. runErr nil is
 // success; resultRef is an optional opaque pointer the platform stores but never
-// parses. Safe to call once — the platform dedupes it against the substrate watch
-// and the deadline backstop (rule R4).
+// parses. The platform records the first outcome for a run and ignores the rest
+// (rule R4), so Complete retries a failed delivery until ctx ends: on a substrate
+// with no watch (a durable actor) this call is the only success signal, and one
+// dropped request would otherwise turn a finished run into a timeout. Network
+// errors and 408/429/5xx responses are retried with jittered exponential backoff;
+// any other 4xx (an expired or foreign credential) is final. Bound the total time
+// with ctx.
 func (r *Runtime) Complete(ctx context.Context, runErr error, t Timing, resultRef string) error {
 	body := completeRequest{RunID: r.spec.RunID, ResultRef: resultRef, Timing: t}
 	if runErr != nil {
 		body.Error = runErr.Error()
 	}
-	return r.post(ctx, r.controlURL+"/complete", r.cred, body, nil)
+	backoff := completeBackoffMin
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, completeAttemptTimeout)
+		err := r.post(attemptCtx, r.controlURL+"/complete", r.cred, body, nil)
+		cancel()
+		if err == nil || !retryable(err) {
+			return err
+		}
+		// Full jitter in [backoff/2, backoff) keeps many runtimes finishing at once
+		// (a controller restart) from retrying in lockstep.
+		wait := backoff/2 + rand.N(backoff/2)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w (gave up: %w)", err, context.Cause(ctx))
+		case <-time.After(wait):
+		}
+		backoff = min(2*backoff, completeBackoffMax)
+	}
+}
+
+// Completion delivery bounds. Each attempt gets completeAttemptTimeout so a hung
+// controller connection cannot consume the caller's whole budget; between attempts
+// the delay doubles from completeBackoffMin to completeBackoffMax.
+const (
+	completeAttemptTimeout = 10 * time.Second
+	completeBackoffMin     = 200 * time.Millisecond
+	completeBackoffMax     = 5 * time.Second
+	// requestTimeout caps any single runtime ABI request (redeem, vend, complete).
+	requestTimeout = 30 * time.Second
+	// completionBudget is how long the SDK's own run bracket keeps retrying the
+	// completion report after the work returns.
+	completionBudget = 2 * time.Minute
+)
+
+// statusError is a non-2xx response from the control plane or broker.
+type statusError struct {
+	url  string
+	code int
+}
+
+func (e *statusError) Error() string { return fmt.Sprintf("POST %s: status %d", e.url, e.code) }
+
+// retryable reports whether a failed completion attempt may succeed if repeated:
+// a transport failure (refused, reset, attempt timeout) or a 408/429/5xx response.
+func retryable(err error) bool {
+	var se *statusError
+	if errors.As(err, &se) {
+		return se.code == http.StatusRequestTimeout || se.code == http.StatusTooManyRequests || se.code >= 500
+	}
+	return true
 }
 
 // redeem exchanges a single-use ticket for the run credential at {broker}/redeem.
@@ -298,7 +354,7 @@ func (r *Runtime) post(ctx context.Context, url, bearer string, in, out any) err
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return fmt.Errorf("POST %s: status %d", url, resp.StatusCode)
+		return &statusError{url: url, code: resp.StatusCode}
 	}
 	if out == nil {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
@@ -372,10 +428,11 @@ func runTask(ctx context.Context, rt *Runtime, fn func(context.Context, *Runtime
 }
 
 // reportCompletion posts the terminal outcome on a fresh context so it still lands
-// after a deadline cancel (rule R4). A completion error is logged, not fatal: the
-// platform dedupes terminal state against its substrate watch and deadline backstop.
+// after a deadline cancel (rule R4), retrying for up to completionBudget. A final
+// failure is logged, not fatal: on a workload substrate the provider's watch still
+// reports the outcome, and on a durable one the deadline backstop ends the run.
 func reportCompletion(rt *Runtime, runErr error, t Timing) {
-	reportCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	reportCtx, cancel := context.WithTimeout(context.Background(), completionBudget)
 	defer cancel()
 	if cerr := rt.Complete(reportCtx, runErr, t, ""); cerr != nil {
 		fmt.Fprintln(os.Stderr, "aeiruntime: completion report failed:", cerr)
