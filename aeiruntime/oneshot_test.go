@@ -24,6 +24,9 @@ func TestOneShotReportPlan(t *testing.T) {
 		{"no deadline", time.Time{}, oneShotCompletionBudget, true},
 		{"distant deadline", now.Add(10 * time.Minute), oneShotCompletionBudget, true},
 		{"near deadline", now.Add(15 * time.Second), 15*time.Second - oneShotExitMargin, true},
+		{"window exactly one final attempt", now.Add(oneShotExitMargin + oneShotFinalAttempt), oneShotFinalAttempt, true},
+		// 20ms of window would starve a healthy controller; one full attempt instead.
+		{"window shorter than one attempt", now.Add(oneShotExitMargin + 20*time.Millisecond), oneShotFinalAttempt, false},
 		{"inside the exit margin", now.Add(3 * time.Second), oneShotFinalAttempt, false},
 		{"past the deadline", now.Add(-time.Minute), oneShotFinalAttempt, false},
 	}
@@ -122,13 +125,39 @@ func TestLoadRejectsUnusableEndpoints(t *testing.T) {
 		{EnvControlURL, "controller.default.svc"},
 		{EnvControlURL, "ftp://controller.default.svc"},
 		{EnvControlURL, "http://"},
+		{EnvControlURL, "http://:8080"},
+		{EnvControlURL, "http://controller.default.svc:99999"},
+		{EnvControlURL, "http://controller.default.svc:0"},
 		{EnvBrokerURL, "broker.default.svc:8080"},
+		{EnvCredential, "tok\n"},
+		{EnvCredential, "tok\r\nX-Injected: 1"},
 	} {
 		env := map[string]string{EnvRunID: "r", EnvCredential: "tok", EnvControlURL: "http://cp.default.svc"}
 		env[tc.key] = tc.value
 		if _, err := Load(context.Background(), func(k string) string { return env[k] }, nil); err == nil {
 			t.Errorf("%s=%q: want Load to fail", tc.key, tc.value)
 		}
+	}
+	// Valid forms still load.
+	for _, u := range []string{"http://cp.default.svc", "https://cp.example:8443/aei/v1alpha1", "http://[::1]:8080"} {
+		env := map[string]string{EnvRunID: "r", EnvCredential: "tok", EnvControlURL: u}
+		if _, err := Load(context.Background(), func(k string) string { return env[k] }, nil); err != nil {
+			t.Errorf("%s=%q: Load: %v", EnvControlURL, u, err)
+		}
+	}
+}
+
+// TestLoadRejectsUnsendableRedeemedCredential: a credential the broker returns is
+// checked the same way as an injected one.
+func TestLoadRejectsUnsendableRedeemedCredential(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credential":"tok\n","expires_in":60}`))
+	}))
+	defer srv.Close()
+	env := map[string]string{EnvRunID: "r", EnvTicket: "ticket", EnvControlURL: srv.URL}
+	if _, err := Load(context.Background(), func(k string) string { return env[k] }, nil); err == nil {
+		t.Error("want Load to fail for a redeemed credential with a newline")
 	}
 }
 
@@ -188,5 +217,23 @@ func TestCompleteReturnsEncodeErrorImmediately(t *testing.T) {
 	}
 	if attempts.Load() != 0 {
 		t.Errorf("attempts = %d, want 0", attempts.Load())
+	}
+}
+
+// TestOneShotHealthyCallbackAtExitMarginSucceeds: with just over the exit margin
+// left, a healthy controller that takes 100ms to answer still records the
+// completion; the run is not starved of a full attempt.
+func TestOneShotHealthyCallbackAtExitMarginSucceeds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	rt, err := Load(context.Background(), oneShotEnv(srv.URL, time.Now().Add(oneShotExitMargin+20*time.Millisecond)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Complete(context.Background(), nil, Timing{}, "res://kept"); err != nil {
+		t.Fatalf("Complete: %v", err)
 	}
 }

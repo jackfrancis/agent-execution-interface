@@ -16,7 +16,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -105,7 +107,18 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req dispatchRequest
-	if json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req) != nil || req.App == "" {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		// The listener's read timeout runs from the start of the request, so a slow
+		// authentication can leave too little of it for the body. That is a
+		// retryable 408, not a malformed request.
+		if isReadTimeout(err) {
+			http.Error(w, "request body timed out", http.StatusRequestTimeout)
+			return
+		}
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.App == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -238,6 +251,12 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (Caller, 
 		return Caller{}, false
 	}
 	return caller, true
+}
+
+// isReadTimeout reports whether err is the connection's read deadline expiring.
+func isReadTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
 }
 
 // timedOut answers 503 when the request's deadline has passed. The listener sets

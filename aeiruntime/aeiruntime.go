@@ -232,6 +232,11 @@ func Load(ctx context.Context, getenv func(string) string, metadata map[string]s
 		}
 		rt.cred = c.Value
 	}
+	// The credential rides an Authorization header on every later call; one the
+	// client cannot send would make Complete retry a permanent failure.
+	if err := checkHeaderValue(rt.cred); err != nil {
+		return nil, fmt.Errorf("aeiruntime: run credential: %w", err)
+	}
 	return rt, nil
 }
 
@@ -333,8 +338,9 @@ const (
 	// so it retries for at most oneShotCompletionBudget, and stops
 	// oneShotExitMargin before the run deadline: time for the process to exit, the
 	// pod status to update, and the provider's watch (a 2s poll) to observe it
-	// before the controller's own deadline. Inside that margin it makes one
-	// attempt of at most oneShotFinalAttempt and no retries.
+	// before the controller's own deadline. When less than oneShotFinalAttempt of
+	// retry window is left (or none), it makes one attempt of oneShotFinalAttempt
+	// and no retries, so a healthy controller always has time to answer.
 	oneShotCompletionBudget = 30 * time.Second
 	oneShotExitMargin       = 10 * time.Second
 	oneShotFinalAttempt     = 500 * time.Millisecond
@@ -348,20 +354,39 @@ func oneShotReportPlan(deadline, now time.Time) (budget time.Duration, retry boo
 	if deadline.IsZero() {
 		return oneShotCompletionBudget, true
 	}
-	if left := deadline.Sub(now) - oneShotExitMargin; left > 0 {
+	if left := deadline.Sub(now) - oneShotExitMargin; left >= oneShotFinalAttempt {
 		return min(oneShotCompletionBudget, left), true
 	}
 	return oneShotFinalAttempt, false
 }
 
-// checkEndpoint reports whether raw is an absolute http(s) URL with a host.
+// checkEndpoint reports whether raw is an absolute http(s) URL with a host and,
+// if it names one, a valid port. The HTTP client refuses anything else before
+// sending, and Complete must not retry a failure that can never clear.
 func checkEndpoint(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return err
 	}
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return fmt.Errorf("want an http:// or https:// URL with a host, got %q", raw)
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid port %q in %q", p, raw)
+		}
+	}
+	return nil
+}
+
+// checkHeaderValue reports whether v can be sent as an HTTP header value: no
+// control characters other than tab (net/http rejects them before sending). A
+// credential read from a file with a trailing newline is the usual offender.
+func checkHeaderValue(v string) error {
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; (c < 0x20 && c != '\t') || c == 0x7f {
+			return fmt.Errorf("contains control character %#02x at byte %d", c, i)
+		}
 	}
 	return nil
 }

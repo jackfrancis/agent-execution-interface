@@ -1,10 +1,13 @@
 package dispatch
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -387,4 +390,39 @@ func TestDispatchRefusesAfterRequestDeadline(t *testing.T) {
 			assertNothingLaunched(t)
 		})
 	}
+}
+
+// TestDispatchBodyReadTimeoutIs408: authentication that uses up the listener's
+// read timeout before the body is read turns a valid dispatch into a 408, which
+// the caller can retry, not a 400 for a malformed request.
+func TestDispatchBodyReadTimeoutIs408(t *testing.T) {
+	mux := deadlineMux(t, slowAuth{echoAuth{namespace: "team"}, 300 * time.Millisecond}, interceptor.Funcs{})
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Config.ReadTimeout = 200 * time.Millisecond
+	srv.Start()
+	defer srv.Close()
+
+	body, _ := json.Marshal(dispatchRequest{App: "pyfer", TaskRef: "item://late-body", TimeoutSeconds: 30})
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Headers now; the valid body only after the read deadline has passed, while
+	// authentication is still running.
+	fmt.Fprintf(conn, "POST /aei/v1alpha1/dispatch HTTP/1.1\r\nHost: aei\r\nAuthorization: Bearer pyfer\r\n"+
+		"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n", len(body))
+	time.Sleep(250 * time.Millisecond)
+	_, _ = conn.Write(body)
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("dispatch = %d, want 408", resp.StatusCode)
+	}
+	assertNothingLaunched(t)
 }
