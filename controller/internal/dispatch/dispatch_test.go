@@ -106,7 +106,7 @@ func newTestServerWith(t *testing.T, launcher aei.Launcher, cfg control.Config) 
 	plane := control.New(cfg)
 	h := NewHandler(plane, echoAuth{namespace: "team"}, c)
 	if launcher != nil {
-		h.launchers[class.Name] = launcher
+		h.launchers[class.Name] = cachedLauncher{launcher: launcher, driver: class.Spec.Provider}
 	}
 	mux := http.NewServeMux()
 	plane.RegisterRoutes(mux)
@@ -261,5 +261,29 @@ func TestDispatchBurstGetsOverloaded(t *testing.T) {
 			t.Fatalf("dispatch after drain = %d, want 202", resp.StatusCode)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The cached launcher keeps the driver it was built from, so if an admin edits the
+// class to another driver, runs the cached launcher still dispatches are credited
+// to the driver that actually runs them, not to the class's new one.
+func TestLauncherCacheKeepsItsDriver(t *testing.T) {
+	h := NewHandler(control.New(control.Config{Secret: []byte("k")}), echoAuth{namespace: "team"}, nil)
+	class := &aeiv1.AgentProviderClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "standard"},
+		Spec:       aeiv1.AgentProviderClassSpec{Provider: "test-dispatch"},
+	}
+	first, driver, err := h.launcherForClass(class)
+	if err != nil || driver != "test-dispatch" {
+		t.Fatalf("launcherForClass = %q, %v; want test-dispatch", driver, err)
+	}
+
+	class.Spec.Provider = "k8s-job" // the admin edits the class
+	again, driver, err := h.launcherForClass(class)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != first || driver != "test-dispatch" {
+		t.Errorf("cached launcher driver = %q (same launcher %v), want the cached test-dispatch", driver, again == first)
 	}
 }

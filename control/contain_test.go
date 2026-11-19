@@ -188,7 +188,7 @@ func TestAwaitErrorFailsRun(t *testing.T) {
 	if st.Timing.RuntimeSeconds != 3 {
 		t.Errorf("timing = %+v, want the provider's timing kept", st.Timing)
 	}
-	if got := obs.snapshot(); len(got) != 1 || got[0].phase != phaseFailed {
+	if got := obs.snapshot(); len(got) != 1 || got[0].Phase != phaseFailed {
 		t.Fatalf("observed %+v, want one Failed observation", got)
 	}
 
