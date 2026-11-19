@@ -53,11 +53,19 @@ type Handler struct {
 	client client.Client
 
 	mu        sync.Mutex
-	launchers map[string]aei.Launcher // provider class name -> resolved launcher
-	owners    map[string]owner        // runID -> owning app (for status authorization)
+	launchers map[string]cachedLauncher // provider class name -> resolved launcher
+	owners    map[string]owner          // runID -> owning app (for status authorization)
 }
 
 type owner struct{ Namespace, App string }
+
+// cachedLauncher is a resolved launcher and the provider driver it was built
+// from. The driver is kept with the launcher so a run is attributed to the driver
+// that actually dispatches it, even if the class has since been edited.
+type cachedLauncher struct {
+	launcher aei.Launcher
+	driver   string
+}
 
 // NewHandler builds a dispatch handler over the shared plane, an authenticator,
 // and a Kubernetes client (used to read AgentApp / AgentProviderClass).
@@ -66,7 +74,7 @@ func NewHandler(plane *control.Plane, auth Authenticator, c client.Client) *Hand
 		plane:     plane,
 		auth:      auth,
 		client:    c,
-		launchers: map[string]aei.Launcher{},
+		launchers: map[string]cachedLauncher{},
 		owners:    map[string]owner{},
 	}
 }
@@ -134,7 +142,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	launcher, err := h.launcherForClass(class)
+	launcher, driver, err := h.launcherForClass(class)
 	if err != nil {
 		http.Error(w, "provider unavailable", http.StatusBadGateway)
 		return
@@ -155,7 +163,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		},
 		Deadline: time.Duration(req.TimeoutSeconds) * time.Second,
 	}
-	runID, err := h.plane.Submit(r.Context(), launcher, spec)
+	runID, err := h.plane.Submit(r.Context(), launcher, spec, control.WithProvider(driver))
 	if err != nil {
 		http.Error(w, "dispatch failed", http.StatusInternalServerError)
 		return
@@ -216,20 +224,21 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (Caller, 
 }
 
 // launcherForClass builds (and caches) the launcher bound to a resolved provider
-// class. Mirrors the reconciler's launcherFor — the two dispatch ingresses share
-// the same providers, just reached from a watch vs a request.
-func (h *Handler) launcherForClass(class *aeiv1.AgentProviderClass) (aei.Launcher, error) {
+// class, and returns the provider driver it was built from. Mirrors the
+// reconciler's launcherFor — the two dispatch ingresses share the same providers,
+// just reached from a watch vs a request.
+func (h *Handler) launcherForClass(class *aeiv1.AgentProviderClass) (aei.Launcher, string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if l, ok := h.launchers[class.Name]; ok {
-		return l, nil
+	if c, ok := h.launchers[class.Name]; ok {
+		return c.launcher, c.driver, nil
 	}
 	l, err := aei.Build(class.Spec.Provider, aei.Config{Params: class.Spec.Parameters})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	h.launchers[class.Name] = l
-	return l, nil
+	h.launchers[class.Name] = cachedLauncher{launcher: l, driver: class.Spec.Provider}
+	return l, class.Spec.Provider, nil
 }
 
 func (h *Handler) resolveClass(ctx context.Context, name string) (*aeiv1.AgentProviderClass, error) {
