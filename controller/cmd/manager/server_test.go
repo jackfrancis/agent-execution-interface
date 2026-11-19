@@ -19,6 +19,7 @@ var testTimeouts = serverTimeouts{
 	ReadHeader: 100 * time.Millisecond,
 	Read:       300 * time.Millisecond,
 	Write:      time.Second,
+	Handler:    500 * time.Millisecond,
 	Idle:       time.Second,
 	Shutdown:   5 * time.Second,
 }
@@ -42,11 +43,39 @@ func startServer(t *testing.T, ctx context.Context, h http.Handler) (string, <-c
 func TestDefaultServerTimeoutsAreSet(t *testing.T) {
 	d := defaultServerTimeouts
 	for name, v := range map[string]time.Duration{
-		"ReadHeader": d.ReadHeader, "Read": d.Read, "Write": d.Write, "Idle": d.Idle, "Shutdown": d.Shutdown,
+		"ReadHeader": d.ReadHeader, "Read": d.Read, "Write": d.Write, "Handler": d.Handler, "Idle": d.Idle, "Shutdown": d.Shutdown,
 	} {
 		if v <= 0 {
 			t.Errorf("%s timeout = %v, want > 0", name, v)
 		}
+	}
+	if d.Handler >= d.Write {
+		t.Errorf("Handler %v must be shorter than Write %v so a handler that stops at its deadline can still answer", d.Handler, d.Write)
+	}
+}
+
+// TestRequestContextHasHandlerDeadline: every request's context carries the
+// Handler deadline, which handlers check before an irreversible step.
+func TestRequestContextHasHandlerDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	remaining := make(chan time.Duration, 1)
+	addr, _ := startServer(t, ctx, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dl, ok := r.Context().Deadline()
+		if !ok {
+			remaining <- 0
+			return
+		}
+		remaining <- time.Until(dl)
+	}))
+	resp, err := http.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	got := <-remaining
+	if got <= 0 || got > testTimeouts.Handler {
+		t.Errorf("request deadline in %v; want within the %v Handler timeout", got, testTimeouts.Handler)
 	}
 }
 

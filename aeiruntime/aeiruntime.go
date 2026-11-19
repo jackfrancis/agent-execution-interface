@@ -259,17 +259,22 @@ type completeRequest struct {
 // with no watch (a durable actor) this call is the only success signal, and one
 // dropped request would otherwise turn a finished run into a timeout. Network
 // errors and 408/429/5xx responses are retried with jittered exponential backoff;
-// any other 4xx (an expired or foreign credential) is final. Bound the total time
+// any other 4xx (an expired or foreign credential) is final, and so is a request
+// that cannot be built (an unencodable Timing such as NaN). Bound the total time
 // with ctx.
 func (r *Runtime) Complete(ctx context.Context, runErr error, t Timing, resultRef string) error {
-	body := completeRequest{RunID: r.spec.RunID, ResultRef: resultRef, Timing: t}
+	req := completeRequest{RunID: r.spec.RunID, ResultRef: resultRef, Timing: t}
 	if runErr != nil {
-		body.Error = runErr.Error()
+		req.Error = runErr.Error()
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("aeiruntime: encode completion: %w", err)
 	}
 	backoff := completeBackoffMin
 	for {
 		attemptCtx, cancel := context.WithTimeout(ctx, completeAttemptTimeout)
-		err := r.post(attemptCtx, r.controlURL+"/complete", r.cred, body, nil)
+		err := r.send(attemptCtx, r.controlURL+"/complete", r.cred, body, nil)
 		cancel()
 		if err == nil || !retryable(err) {
 			return err
@@ -295,10 +300,30 @@ const (
 	completeBackoffMax     = 5 * time.Second
 	// requestTimeout caps any single runtime ABI request (redeem, vend, complete).
 	requestTimeout = 30 * time.Second
-	// completionBudget is how long the SDK's own run bracket keeps retrying the
-	// completion report after the work returns.
+	// completionBudget is how long a durable actor keeps retrying a run's
+	// completion report. Nothing else can report the run's success there, and the
+	// actor keeps serving other tasks while it retries.
 	completionBudget = 2 * time.Minute
+	// A one-shot workload must exit for its provider's watch to see the outcome,
+	// so it retries for at most oneShotCompletionBudget, and stops
+	// oneShotExitMargin before the run deadline: time for the process to exit, the
+	// pod status to update, and the provider's watch (a 2s poll) to observe it
+	// before the controller's own deadline. A run already inside that margin still
+	// gets oneShotMinBudget, enough for one prompt attempt.
+	oneShotCompletionBudget = 30 * time.Second
+	oneShotExitMargin       = 10 * time.Second
+	oneShotMinBudget        = time.Second
 )
+
+// oneShotReportBudget is how long a one-shot workload that finished at now may
+// spend reporting its completion before it exits.
+func oneShotReportBudget(deadline, now time.Time) time.Duration {
+	budget := oneShotCompletionBudget
+	if !deadline.IsZero() {
+		budget = min(budget, deadline.Sub(now)-oneShotExitMargin)
+	}
+	return max(budget, oneShotMinBudget)
+}
 
 // statusError is a non-2xx response from the control plane or broker.
 type statusError struct {
@@ -308,14 +333,23 @@ type statusError struct {
 
 func (e *statusError) Error() string { return fmt.Sprintf("POST %s: status %d", e.url, e.code) }
 
+// transportError is a request that was sent, or attempted, but got no response:
+// refused, reset, or timed out.
+type transportError struct{ err error }
+
+func (e *transportError) Error() string { return e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
+
 // retryable reports whether a failed completion attempt may succeed if repeated:
-// a transport failure (refused, reset, attempt timeout) or a 408/429/5xx response.
+// a transport failure or a 408/429/5xx response. Anything else, such as a request
+// that could not be built, fails the same way every time.
 func retryable(err error) bool {
 	var se *statusError
 	if errors.As(err, &se) {
 		return se.code == http.StatusRequestTimeout || se.code == http.StatusTooManyRequests || se.code >= 500
 	}
-	return true
+	var te *transportError
+	return errors.As(err, &te)
 }
 
 // redeem exchanges a single-use ticket for the run credential at {broker}/redeem.
@@ -339,7 +373,13 @@ func (r *Runtime) post(ctx context.Context, url, bearer string, in, out any) err
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	return r.send(ctx, url, bearer, b, out)
+}
+
+// send posts an encoded JSON body. A failure to get any response is a
+// *transportError and a non-2xx response a *statusError.
+func (r *Runtime) send(ctx context.Context, url, bearer string, body []byte, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -349,7 +389,7 @@ func (r *Runtime) post(ctx context.Context, url, bearer string, in, out any) err
 	}
 	resp, err := r.http.Do(req)
 	if err != nil {
-		return err
+		return &transportError{err: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -390,17 +430,28 @@ func Main(getenv func(string) string, metadata map[string]string, fn func(contex
 	}
 
 	// Workload substrate: one shot.
+	if code := runOneShot(getenv, metadata, fn); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// runOneShot is Main on a workload substrate: Load, run fn under the deadline,
+// report completion, and return the process exit code. Reporting is bounded by
+// oneShotReportBudget so a callback outage cannot keep the process alive past the
+// point where the provider's watch can still observe a successful exit.
+func runOneShot(getenv func(string) string, metadata map[string]string, fn func(context.Context, *Runtime) error) int {
 	rt, err := Load(context.Background(), getenv, metadata)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "aeiruntime:", err)
-		os.Exit(2)
+		return 2
 	}
 	timing, runErr := runTask(context.Background(), rt, fn)
-	reportCompletion(rt, runErr, timing)
+	reportCompletion(rt, runErr, timing, oneShotReportBudget(rt.spec.Deadline, time.Now()))
 	if runErr != nil {
 		fmt.Fprintln(os.Stderr, "aeiruntime: run failed:", runErr)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // runTask runs fn once under the run's deadline (AEI_DEADLINE) and returns the
@@ -428,11 +479,11 @@ func runTask(ctx context.Context, rt *Runtime, fn func(context.Context, *Runtime
 }
 
 // reportCompletion posts the terminal outcome on a fresh context so it still lands
-// after a deadline cancel (rule R4), retrying for up to completionBudget. A final
-// failure is logged, not fatal: on a workload substrate the provider's watch still
-// reports the outcome, and on a durable one the deadline backstop ends the run.
-func reportCompletion(rt *Runtime, runErr error, t Timing) {
-	reportCtx, cancel := context.WithTimeout(context.Background(), completionBudget)
+// after a deadline cancel (rule R4), retrying for up to budget. A final failure is
+// logged, not fatal: on a workload substrate the provider's watch still reports
+// the outcome, and on a durable one the deadline backstop ends the run.
+func reportCompletion(rt *Runtime, runErr error, t Timing, budget time.Duration) {
+	reportCtx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	if cerr := rt.Complete(reportCtx, runErr, t, ""); cerr != nil {
 		fmt.Fprintln(os.Stderr, "aeiruntime: completion report failed:", cerr)

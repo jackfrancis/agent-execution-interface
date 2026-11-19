@@ -36,7 +36,9 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"net"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -827,7 +829,17 @@ func (p *Plane) handleComplete(w http.ResponseWriter, r *http.Request) {
 		ResultRef string     `json:"result_ref"`
 		Timing    wireTiming `json:"timing"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		// A body cut off by the listener's read timeout is retryable: answer 408,
+		// which the runtime SDK retries, rather than falling through to a run-id
+		// mismatch (403), which it treats as final and so would drop the outcome.
+		if isTimeout(err) {
+			http.Error(w, "request body timed out", http.StatusRequestTimeout)
+			return
+		}
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 	// A runtime may only complete its own run: the body's run id must match the
 	// run the credential is bound to.
 	if body.RunID != claims.RunID {
@@ -846,6 +858,13 @@ func (p *Plane) handleComplete(w http.ResponseWriter, r *http.Request) {
 	p.finishRun(claims.RunID, res)
 	p.fire(claims.RunID, res)
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// isTimeout reports whether err is a read deadline expiring, as when a client
+// stalls past the server's read timeout.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
 }
 
 func (p *Plane) handleRedeem(w http.ResponseWriter, r *http.Request) {

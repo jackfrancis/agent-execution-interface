@@ -162,6 +162,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		},
 		Deadline: control.DeadlineFromSeconds(req.TimeoutSeconds),
 	}
+	// The 202 and its run id must reach the caller, or the caller's retry launches
+	// a second run. If the lookups above used up the request's deadline (the
+	// listener sets one shorter than its write timeout), refuse before launching.
+	if r.Context().Err() != nil {
+		http.Error(w, "dispatch timed out before submitting; no run was started", http.StatusServiceUnavailable)
+		return
+	}
 	runID, err := h.plane.Submit(r.Context(), launcher, spec, control.WithProvider(driver))
 	if err != nil {
 		http.Error(w, "dispatch failed", http.StatusInternalServerError)

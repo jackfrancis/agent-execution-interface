@@ -293,3 +293,54 @@ func TestLauncherCacheKeepsItsDriver(t *testing.T) {
 		t.Errorf("cached launcher driver = %q (same launcher %v), want the cached test-dispatch", driver, again == first)
 	}
 }
+
+// slowAuth authenticates like echoAuth but only after delay, ignoring its context,
+// as a slow TokenReview or class lookup would.
+type slowAuth struct {
+	echoAuth
+	delay time.Duration
+}
+
+func (s slowAuth) Authenticate(ctx context.Context, bearer string) (Caller, error) {
+	time.Sleep(s.delay)
+	return s.echoAuth.Authenticate(ctx, bearer)
+}
+
+// TestDispatchRefusesAfterRequestDeadline: when the lookups before Submit outlast
+// the request's deadline, dispatch answers 503 and launches nothing, so a caller
+// that retries cannot end up with two runs.
+func TestDispatchRefusesAfterRequestDeadline(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := aeiv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	app := &aeiv1.AgentApp{
+		ObjectMeta: metav1.ObjectMeta{Name: "pyfer", Namespace: "team"},
+		Spec:       aeiv1.AgentAppSpec{ProviderClassName: "standard", Dispatchers: []string{"pyfer"}},
+	}
+	class := &aeiv1.AgentProviderClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "standard"},
+		Spec:       aeiv1.AgentProviderClassSpec{Provider: "test-dispatch"},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(app, class).Build()
+	h := NewHandler(control.New(control.Config{Secret: []byte("k")}), slowAuth{echoAuth{namespace: "team"}, 100 * time.Millisecond}, c)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	b, _ := json.Marshal(dispatchRequest{App: "pyfer", TaskRef: "item://late", TimeoutSeconds: 30})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/aei/v1alpha1/dispatch", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer pyfer")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("dispatch = %d, want 503", rec.Code)
+	}
+	select {
+	case <-testLauncher.dispatched:
+		t.Fatal("a run was launched after the request deadline")
+	case <-time.After(100 * time.Millisecond):
+	}
+}

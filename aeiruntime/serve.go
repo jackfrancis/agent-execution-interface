@@ -132,7 +132,7 @@ func handleTask(w http.ResponseWriter, r *http.Request, getenv func(string) stri
 	go func() {
 		defer sem.release()
 		timing, runErr := runTask(context.Background(), run, fn)
-		reportCompletion(run, runErr, timing)
+		reportCompletion(run, runErr, timing, completionBudget)
 	}()
 	writeTask(w, req.ID, run.spec.RunID, stateSubmitted, "")
 }
