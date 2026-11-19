@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,7 +38,10 @@ import (
 
 func main() {
 	var abiAddr string
+	var runDefaultTimeout, runMaxTimeout time.Duration
 	flag.StringVar(&abiAddr, "abi-addr", ":8080", "address to serve the runtime ABI (/complete, /redeem, /vend)")
+	flag.DurationVar(&runDefaultTimeout, "run-default-timeout", 0, "deadline for a run dispatched without a timeout (0 = 15m)")
+	flag.DurationVar(&runMaxTimeout, "run-max-timeout", 0, "longest deadline a run may have; a longer timeout is reduced to it (0 = 1h)")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -56,7 +60,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	cfg := control.Config{Secret: []byte(os.Getenv("AEI_SIGNING_SECRET"))}
+	cfg := control.Config{
+		Secret: []byte(os.Getenv("AEI_SIGNING_SECRET")),
+		// Every run gets a deadline the controller enforces itself: a dispatch or
+		// AgentRun without a timeout gets the default, and a longer one is capped.
+		DefaultDeadline: runDefaultTimeout,
+		MaxDeadline:     runMaxTimeout,
+	}
 	// An app with an asymmetric identity posture (a sole-minter control tier and a
 	// verify-only app tier) provisions the control plane with its Ed25519 private
 	// key. When set, the plane mints run credentials with it and the app verifies

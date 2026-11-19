@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +59,12 @@ func (e echoAuth) Authenticate(_ context.Context, bearer string) (Caller, error)
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	return newTestServerWith(t, control.Config{Secret: []byte("k")})
+}
+
+// newTestServerWith is newTestServer with a caller-supplied plane config.
+func newTestServerWith(t *testing.T, cfg control.Config) *httptest.Server {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := aeiv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -75,7 +82,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 		Spec:       aeiv1.AgentProviderClassSpec{Provider: "test-dispatch"},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(app, class).Build()
-	plane := control.New(control.Config{Secret: []byte("k")})
+	plane := control.New(cfg)
 	h := NewHandler(plane, echoAuth{namespace: "team"}, c)
 	mux := http.NewServeMux()
 	plane.RegisterRoutes(mux)
@@ -155,6 +162,50 @@ func TestDispatchCompleteStatus(t *testing.T) {
 			t.Fatalf("run never reached Succeeded (last phase %q)", st.Phase)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestDispatchWithoutTimeoutEndsAtDefault: a dispatch that omits timeoutSeconds
+// still ends — the plane applies its default deadline, and with no callback and a
+// provider that never reports on its own, the run reads Failed with the deadline
+// error once the default passes.
+func TestDispatchWithoutTimeoutEndsAtDefault(t *testing.T) {
+	const def = 100 * time.Millisecond
+	srv := newTestServerWith(t, control.Config{Secret: []byte("k"), DefaultDeadline: def})
+
+	start := time.Now()
+	resp := do(t, http.MethodPost, srv.URL+"/aei/v1alpha1/dispatch", "pyfer", map[string]any{
+		"app":      "pyfer",
+		"taskRef":  "item://no-timeout",
+		"identity": map[string]any{"subject": "github:1", "scopes": []string{"signals:read"}},
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("dispatch = %d, want 202", resp.StatusCode)
+	}
+	var out struct {
+		RunID string `json:"runId"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	<-testLauncher.dispatched // drain: this run never calls back
+
+	end := time.Now().Add(2 * time.Second)
+	for {
+		s := do(t, http.MethodGet, srv.URL+"/aei/v1alpha1/runs/"+out.RunID, "pyfer", nil)
+		var st struct{ Phase, Message string }
+		_ = json.NewDecoder(s.Body).Decode(&st)
+		if st.Phase != "Running" && st.Phase != "" {
+			if elapsed := time.Since(start); elapsed < def {
+				t.Errorf("run ended after %s, before the %s default", elapsed, def)
+			}
+			if st.Phase != "Failed" || !strings.Contains(st.Message, control.ErrDeadlineExceeded.Error()) {
+				t.Errorf("status = %q %q, want Failed with %q", st.Phase, st.Message, control.ErrDeadlineExceeded.Error())
+			}
+			return
+		}
+		if time.Now().After(end) {
+			t.Fatalf("run without a timeout never ended (last phase %q)", st.Phase)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

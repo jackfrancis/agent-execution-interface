@@ -82,7 +82,12 @@ Content-Type: application/json
 ```
 
 The body is the `AgentRunSpec` fields (camelCase — the same CRD schema the app SDK
-already models) plus `app`. `providerClassName` is ignored: the `AgentApp` fixes
+already models) plus `app`. Every run has a deadline the controller enforces
+itself: an omitted or zero `timeoutSeconds` gets the controller's default (15m,
+`-run-default-timeout`), and a value above its maximum (1h, `-run-max-timeout`)
+is reduced to the maximum. When the deadline passes before the runtime's callback
+or the provider reports an outcome, the run ends `Failed` with a
+`run deadline exceeded` message, whether or not the provider honors cancellation. `providerClassName` is ignored: the `AgentApp` fixes
 the class. Dispatch is **non-blocking** — the run outlives the request; its
 outcome lands off-API (below).
 

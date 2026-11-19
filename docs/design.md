@@ -267,7 +267,11 @@ Requirements this imposes on the standard:
   recorded exactly once.
 - **The deadline is the universal backstop.** A provider that can be neither
   watched nor guaranteed to call back still terminates, because `RunSpec.Deadline`
-  bounds `Await`.
+  bounds the race. The control plane enforces it itself rather than trusting the
+  provider to honor cancellation: when the deadline passes it records the run as
+  failed (`control.ErrDeadlineExceeded`) even if `Await` or `Launch` never
+  returns. Every run has one — the plane applies a default when the caller sets
+  none and caps a longer one (`control.Config.DefaultDeadline`, `MaxDeadline`).
 - **"Done" is per-run, not per-workload.** For a durable runtime that keeps
   running, completion is a property of the *run*, not the termination of a
   workload — the callback carries the `runID`.
