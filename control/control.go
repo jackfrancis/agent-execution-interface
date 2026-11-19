@@ -144,6 +144,13 @@ type Config struct {
 	// beyond it is refused at once with ErrOverloaded, so a burst gets a predictable
 	// answer instead of an unbounded queue. Optional: <= 0 uses DefaultMaxQueued.
 	MaxQueued int
+	// CreateTimeout bounds how long one provider create may hold a create slot, so
+	// a provider that hangs (e.g. retrying an unavailable substrate) cannot stall
+	// dispatch for every other provider. An async provider's Dispatch is cancelled
+	// at the timeout and the run fails. A plain provider's blocking Launch is the
+	// whole run, so it keeps running but gives up its slot. Optional: <= 0 uses
+	// DefaultCreateTimeout.
+	CreateTimeout time.Duration
 }
 
 // Dispatch bounds, matching ZZ's orchestrator (two dispatch workers, a 128-deep
@@ -151,10 +158,12 @@ type Config struct {
 const (
 	DefaultMaxConcurrentCreates = 2
 	DefaultMaxQueued            = 128
+	DefaultCreateTimeout        = 2 * time.Minute
 )
 
 // ErrOverloaded is returned by Submit when MaxQueued runs are already waiting for a
-// create slot. Nothing about the run is recorded; the caller may retry later. The
+// create slot (on either path). Nothing about the run is recorded; the caller may
+// retry later. The
 // dispatch API maps it to 429 Too Many Requests with Retry-After.
 var ErrOverloaded = errors.New("control: dispatch queue full")
 
@@ -179,10 +188,12 @@ type Plane struct {
 	obs       Observer // run-outcome metrics sink; the observability seam
 
 	// creates holds one token per provider create in progress (cap
-	// MaxConcurrentCreates); admit holds one per Submit run that has not finished
-	// its create (cap MaxConcurrentCreates+MaxQueued), so it bounds the queue.
-	creates chan struct{}
-	admit   chan struct{}
+	// MaxConcurrentCreates); admit holds one per run, on either path, that has not
+	// finished its create (cap MaxConcurrentCreates+MaxQueued), so it bounds the
+	// queue. createTimeout bounds how long one create holds its slot.
+	creates       chan struct{}
+	admit         chan struct{}
+	createTimeout time.Duration
 
 	mu      sync.Mutex
 	waiters map[string]chan aei.Result // runID -> completion channel (same-replica wake)
@@ -216,17 +227,18 @@ func New(cfg Config) *Plane {
 		queued = DefaultMaxQueued
 	}
 	return &Plane{
-		auth:      auth,
-		creds:     cfg.Credentials,
-		tokenTTL:  orDur(cfg.TokenTTL, 15*time.Minute),
-		ticketTTL: orDur(cfg.TicketTTL, 5*time.Minute),
-		now:       now,
-		log:       log,
-		store:     store,
-		obs:       obs,
-		creates:   make(chan struct{}, creates),
-		admit:     make(chan struct{}, creates+queued),
-		waiters:   map[string]chan aei.Result{},
+		auth:          auth,
+		creds:         cfg.Credentials,
+		tokenTTL:      orDur(cfg.TokenTTL, 15*time.Minute),
+		ticketTTL:     orDur(cfg.TicketTTL, 5*time.Minute),
+		now:           now,
+		log:           log,
+		store:         store,
+		obs:           obs,
+		creates:       make(chan struct{}, creates),
+		admit:         make(chan struct{}, creates+queued),
+		createTimeout: orDur(cfg.CreateTimeout, DefaultCreateTimeout),
+		waiters:       map[string]chan aei.Result{},
 	}
 }
 
@@ -238,8 +250,8 @@ func New(cfg Config) *Plane {
 // one completion registry, one ABI server — front many providers, which is what
 // the CRD controller needs (a provider per AgentProviderClass).
 //
-// Run shares the plane's create bound with Submit but not its queue cap: it waits
-// for a create slot, bounded by ctx and the deadline. A provider panic or watch
+// Run shares the plane's create bound and queue with Submit, but where Submit is
+// refused at the queue limit Run waits for room, bounded by ctx and the deadline. A provider panic or watch
 // error comes back as a failed Result; the error is non-nil only when the run
 // could not be dispatched.
 func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec) (res aei.Result, err error) {
@@ -251,15 +263,13 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 	}
 	// The caller (the AgentRun reconciler) runs this on its own goroutine, so a
 	// panic that escapes here would end the controller. Provider calls are guarded
-	// individually in race; this catches anything else (e.g. a provider's
-	// PullsCredential during mint) and reports it as a failed run.
+	// individually in race; this is the backstop for anything else.
 	defer func() {
 		if rec := recover(); rec != nil {
 			res = aei.Result{Err: p.panicked(spec.ID, "run", rec)}
 			err = res.Err
 		}
 	}()
-	cred := p.mint(launcher, spec)
 
 	if spec.Deadline > 0 {
 		var cancel context.CancelFunc
@@ -267,10 +277,22 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 		defer cancel()
 	}
 
+	// Run takes an admission slot like Submit, so a run here waiting for or holding
+	// a create slot counts against the queue Submit enforces. It waits for the slot
+	// rather than being refused: the CRD path has no caller to answer 429 to.
+	select {
+	case p.admit <- struct{}{}:
+	case <-ctx.Done():
+		err := fmt.Errorf("control: no dispatch slot before the deadline: %w", ctx.Err())
+		return aei.Result{Err: err}, err
+	}
+	release := sync.OnceFunc(func() { <-p.admit })
+	defer release()
+
 	done := p.arm(spec.ID)
 	defer p.disarm(spec.ID)
 
-	return p.race(ctx, launcher, spec, cred, done, func() {})
+	return p.race(ctx, launcher, spec, done, release)
 }
 
 // RunState is the observable state of a submitted run, held in the Store so the
@@ -293,41 +315,28 @@ type RunState struct {
 // Submit never blocks on the provider: when MaxQueued runs are already waiting for
 // a create slot it returns ErrOverloaded and records nothing. A provider panic or
 // watch error is recorded as a Failed run.
-func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpec) (runID string, err error) {
+func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpec) (string, error) {
 	if launcher == nil {
 		return "", errors.New("control: no launcher")
 	}
 	// Admission: a run holds an admission slot from here until its provider create
 	// returns, so at most MaxConcurrentCreates runs are creating and at most
-	// MaxQueued are waiting to. Beyond that the submission is refused at once with
-	// ErrOverloaded rather than queued without bound (ZZ's non-blocking enqueue).
+	// MaxQueued are waiting to, across Submit and Run. Beyond that the submission
+	// is refused at once with ErrOverloaded rather than queued without bound (ZZ's
+	// non-blocking enqueue).
 	select {
 	case p.admit <- struct{}{}:
 	default:
 		return "", ErrOverloaded
 	}
 	release := sync.OnceFunc(func() { <-p.admit })
-	started := false
-	defer func() {
-		if started {
-			return
-		}
-		// Provider code ran before the run started (PullsCredential, during mint)
-		// and panicked: give the slot back and refuse the submission.
-		release()
-		if rec := recover(); rec != nil {
-			runID, err = "", p.panicked(spec.ID, "run", rec)
-		}
-	}()
 
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
-	cred := p.mint(launcher, spec)
 	p.store.SetRunning(spec.ID)
 	done := p.arm(spec.ID)
 
-	started = true
 	go func() {
 		defer p.disarm(spec.ID)
 		defer release()
@@ -346,7 +355,7 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 			ctx, cancel = context.WithTimeout(ctx, spec.Deadline)
 			defer cancel()
 		}
-		res, _ := p.race(ctx, launcher, spec, cred, done, release)
+		res, _ := p.race(ctx, launcher, spec, done, release)
 		p.observe(spec, res)
 		p.finishRun(spec.ID, res)
 	}()
@@ -398,27 +407,52 @@ func (p *Plane) finishRun(runID string, res aei.Result) {
 // (non-blocking).
 //
 // The provider create (Dispatch, or a plain provider's blocking Launch) waits for
-// one of the plane's MaxConcurrentCreates slots, bounded by ctx; created is called
-// once that create has returned, whatever its outcome. Every provider call is
-// guarded: a panic becomes a failed Result instead of ending the process, and an
-// error from Await fails the run instead of being dropped. The returned error is
-// non-nil only when the run could not be dispatched (no slot before the deadline,
-// or Dispatch failed); it is also carried in the Result.
-func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, cred aei.Credential, done chan aei.Result, created func()) (aei.Result, error) {
+// one of the plane's MaxConcurrentCreates slots, bounded by ctx, and holds it for
+// at most CreateTimeout; created is called once the create has given its slot
+// back. Only then is the run credential minted and the provider handed the time
+// left before the deadline, so neither a ticket nor the workload's own deadline
+// is spent in the queue. Every provider call is guarded: a panic becomes a failed
+// Result instead of ending the process, and an error from Await fails the run
+// instead of being dropped. The returned error is non-nil only when the run could
+// not be dispatched (no slot before the deadline, mint or Dispatch failed); it is
+// also carried in the Result.
+func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, done chan aei.Result, created func()) (aei.Result, error) {
+	undispatched := func(err error) (aei.Result, error) { return aei.Result{Err: err}, err }
 	select {
 	case p.creates <- struct{}{}:
 	case <-ctx.Done():
 		created()
-		err := fmt.Errorf("control: no dispatch slot before the deadline: %w", ctx.Err())
-		return aei.Result{Err: err}, err
+		return undispatched(fmt.Errorf("control: no dispatch slot before the deadline: %w", ctx.Err()))
 	}
-	endCreate := func() { <-p.creates; created() }
+	endCreate := sync.OnceFunc(func() { <-p.creates; created() })
+
+	// Hand the provider what is left of the run's budget, not the full Deadline:
+	// time spent queued already counts against the plane's deadline, and a
+	// workload that outlives it could overlap a retry.
+	if dl, ok := ctx.Deadline(); ok {
+		spec.Deadline = time.Until(dl)
+		if spec.Deadline <= 0 {
+			endCreate()
+			return undispatched(fmt.Errorf("control: no dispatch slot before the deadline: %w", context.DeadlineExceeded))
+		}
+	}
+	cred, err := p.guardMint(launcher, spec)
+	if err != nil {
+		endCreate()
+		return undispatched(err)
+	}
 
 	if async, ok := launcher.(aei.AsyncLauncher); ok {
-		h, err := p.guardCreate(spec.ID, "Dispatch", func() (aei.Handle, error) { return async.Dispatch(ctx, spec, cred) })
+		createCtx, cancel := context.WithTimeout(ctx, p.createTimeout)
+		h, err := p.guardCreate(spec.ID, "Dispatch", func() (aei.Handle, error) { return async.Dispatch(createCtx, spec, cred) })
+		timedOut := errors.Is(createCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+		cancel()
 		endCreate()
 		if err != nil {
-			return aei.Result{Err: err}, err
+			if timedOut {
+				err = fmt.Errorf("control: provider create did not finish within %s: %w", p.createTimeout, err)
+			}
+			return undispatched(err)
 		}
 		watch := make(chan aei.Result, 1)
 		go func() { watch <- p.await(ctx, async, spec.ID, h) }()
@@ -429,9 +463,13 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 			return r, nil
 		}
 	}
+	// A plain provider's Launch is the whole run, so it cannot be cut off at the
+	// create timeout without killing the run. It gives up its slot instead.
+	lease := time.AfterFunc(p.createTimeout, endCreate)
 	launch := make(chan aei.Result, 1)
 	go func() {
 		_, err := p.guardCreate(spec.ID, "Launch", func() (aei.Handle, error) { return launcher.Launch(ctx, spec, cred) })
+		lease.Stop()
 		endCreate()
 		launch <- aei.Result{Err: err}
 	}()
@@ -441,6 +479,17 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 	case r := <-launch:
 		return r, nil
 	}
+}
+
+// guardMint mints the run credential, converting a panic (a provider's
+// PullsCredential, or the authority) into an error so the run fails cleanly.
+func (p *Plane) guardMint(launcher aei.Launcher, spec aei.RunSpec) (cred aei.Credential, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = p.panicked(spec.ID, "mint", rec)
+		}
+	}()
+	return p.mint(launcher, spec), nil
 }
 
 // guardCreate calls a provider's Dispatch or Launch, converting a panic into an

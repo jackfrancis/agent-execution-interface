@@ -41,7 +41,8 @@ func (c *captureLauncher) Await(ctx context.Context, _ aei.Handle) (aei.Result, 
 var testLauncher = &captureLauncher{dispatched: make(chan aei.Credential, 8)}
 
 // blockLauncher is an AsyncLauncher whose Dispatch blocks until gate closes, so a
-// test can hold the control plane's create slot and fill its queue.
+// test can hold the control plane's create slot and fill its queue. Each test
+// builds its own, so repeated runs (-count) start with the gate shut.
 type blockLauncher struct {
 	gate    chan struct{}
 	entered chan struct{}
@@ -59,11 +60,8 @@ func (b *blockLauncher) Await(context.Context, aei.Handle) (aei.Result, error) {
 	return aei.Result{ResultRef: "ok"}, nil
 }
 
-var blockingLauncher = &blockLauncher{gate: make(chan struct{}), entered: make(chan struct{}, 8)}
-
 func init() {
 	aei.Register("test-dispatch", func(aei.Config) (aei.Launcher, error) { return testLauncher, nil })
-	aei.Register("test-block", func(aei.Config) (aei.Launcher, error) { return blockingLauncher, nil })
 }
 
 // echoAuth authenticates any non-empty token as a ServiceAccount named by the
@@ -80,12 +78,13 @@ func (e echoAuth) Authenticate(_ context.Context, bearer string) (Caller, error)
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	return newTestServerWith(t, "test-dispatch", control.Config{Secret: []byte("k")})
+	return newTestServerWith(t, nil, control.Config{Secret: []byte("k")})
 }
 
-// newTestServerWith serves the dispatch API for app "pyfer" on a class backed by
-// provider, with the control plane built from cfg.
-func newTestServerWith(t *testing.T, provider string, cfg control.Config) *httptest.Server {
+// newTestServerWith serves the dispatch API for app "pyfer", with the control
+// plane built from cfg. A non-nil launcher backs the app's class in place of the
+// registered test-dispatch provider.
+func newTestServerWith(t *testing.T, launcher aei.Launcher, cfg control.Config) *httptest.Server {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := aeiv1.AddToScheme(scheme); err != nil {
@@ -101,11 +100,14 @@ func newTestServerWith(t *testing.T, provider string, cfg control.Config) *httpt
 	}
 	class := &aeiv1.AgentProviderClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "standard"},
-		Spec:       aeiv1.AgentProviderClassSpec{Provider: provider},
+		Spec:       aeiv1.AgentProviderClassSpec{Provider: "test-dispatch"},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(app, class).Build()
 	plane := control.New(cfg)
 	h := NewHandler(plane, echoAuth{namespace: "team"}, c)
+	if launcher != nil {
+		h.launchers[class.Name] = launcher
+	}
 	mux := http.NewServeMux()
 	plane.RegisterRoutes(mux)
 	h.RegisterRoutes(mux)
@@ -223,7 +225,8 @@ func TestDispatchAuthorization(t *testing.T) {
 // are full, /dispatch answers 429 with Retry-After at once instead of queueing
 // without bound, and accepts work again when the queue drains.
 func TestDispatchBurstGetsOverloaded(t *testing.T) {
-	srv := newTestServerWith(t, "test-block", control.Config{Secret: []byte("k"), MaxConcurrentCreates: 1, MaxQueued: 2})
+	blocking := &blockLauncher{gate: make(chan struct{}), entered: make(chan struct{}, 8)}
+	srv := newTestServerWith(t, blocking, control.Config{Secret: []byte("k"), MaxConcurrentCreates: 1, MaxQueued: 2})
 	req := dispatchRequest{App: "pyfer", TaskRef: "item://1", TimeoutSeconds: 30}
 	req.Identity.Subject = "github:1"
 
@@ -245,8 +248,8 @@ func TestDispatchBurstGetsOverloaded(t *testing.T) {
 		}
 	}
 
-	<-blockingLauncher.entered
-	close(blockingLauncher.gate) // let the creates finish and the queue drain
+	<-blocking.entered
+	close(blocking.gate) // let the creates finish and the queue drain
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		resp := do(t, http.MethodPost, srv.URL+"/aei/v1alpha1/dispatch", "pyfer", req)

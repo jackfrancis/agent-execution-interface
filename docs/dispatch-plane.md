@@ -91,8 +91,13 @@ Dispatch is also **bounded**. The control plane runs at most
 provider and both ingresses, and lets at most `--max-queued-runs` dispatched runs
 wait for one (default 128) — the limits ZZ's orchestrator applied. A run stops
 counting against either limit once its create returns; awaiting completion holds
-no slot. Beyond the queue limit the request is refused at once, with nothing
-recorded:
+no slot. One create holds its slot for at most `--create-timeout` (default 2m): a
+provider's `Dispatch` still running then is cancelled and the run fails, so one
+unavailable substrate cannot stall the others. The run credential is minted, and
+the provider handed the run's remaining time, only once the create starts, so
+time in the queue spends neither a pull ticket nor the workload's own deadline.
+An AgentRun waits in the same queue rather than being refused. Beyond the queue
+limit the request is refused at once, with nothing recorded:
 
 ```http
 429 Too Many Requests

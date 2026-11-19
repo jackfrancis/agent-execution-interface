@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -41,6 +42,8 @@ func main() {
 	var maxCreates, maxQueued int
 	flag.IntVar(&maxCreates, "max-concurrent-creates", control.DefaultMaxConcurrentCreates, "maximum provider creates (Dispatch/Launch) in progress at once, across all providers")
 	flag.IntVar(&maxQueued, "max-queued-runs", control.DefaultMaxQueued, "maximum dispatched runs waiting for a create slot; beyond it /dispatch answers 429")
+	var createTimeout time.Duration
+	flag.DurationVar(&createTimeout, "create-timeout", control.DefaultCreateTimeout, "maximum time one provider create may hold a create slot; an async provider's Dispatch is cancelled at it")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -63,6 +66,7 @@ func main() {
 		Secret:               []byte(os.Getenv("AEI_SIGNING_SECRET")),
 		MaxConcurrentCreates: maxCreates,
 		MaxQueued:            maxQueued,
+		CreateTimeout:        createTimeout,
 	}
 	// An app with an asymmetric identity posture (a sole-minter control tier and a
 	// verify-only app tier) provisions the control plane with its Ed25519 private

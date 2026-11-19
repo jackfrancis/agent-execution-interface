@@ -46,7 +46,7 @@ func (panicSync) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handl
 }
 
 // panicPull panics while the plane asks how it takes its credential (during mint),
-// outside any provider create or watch.
+// before any provider create or watch.
 type panicPull struct{ fakeWatch }
 
 func (*panicPull) PullsCredential() bool { panic("pulls exploded") }
@@ -72,12 +72,16 @@ type gated struct {
 	entered  chan string // receives each run id as its Dispatch starts (optional)
 	inflight atomic.Int32
 	peak     atomic.Int32
+
+	mu        sync.Mutex
+	deadlines map[string]time.Duration // spec.Deadline each Dispatch was handed
+	creds     map[string]aei.Credential
 }
 
 func (g *gated) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
 	return aei.Handle{}, nil
 }
-func (g *gated) Dispatch(_ context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+func (g *gated) Dispatch(_ context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
 	n := g.inflight.Add(1)
 	defer g.inflight.Add(-1)
 	for {
@@ -86,6 +90,12 @@ func (g *gated) Dispatch(_ context.Context, spec aei.RunSpec, _ aei.Credential) 
 			break
 		}
 	}
+	g.mu.Lock()
+	if g.deadlines == nil {
+		g.deadlines, g.creds = map[string]time.Duration{}, map[string]aei.Credential{}
+	}
+	g.deadlines[spec.ID], g.creds[spec.ID] = spec.Deadline, cred
+	g.mu.Unlock()
 	if g.entered != nil {
 		g.entered <- spec.ID
 	}
@@ -107,8 +117,8 @@ func mustTerminal(t *testing.T, p *Plane, runID string) RunState {
 	return st
 }
 
-// A provider panic in Dispatch, Await, or a blocking Launch is recorded as a failed
-// run, and the plane then completes the next healthy run. MaxConcurrentCreates is
+// A provider panic in Dispatch, Await, a blocking Launch, or PullsCredential
+// (during mint) is recorded as a failed run, and the plane then completes the next healthy run. MaxConcurrentCreates is
 // 1, so the healthy run also proves the panicking create gave its slot back.
 func TestProviderPanicFailsRunAndPlaneContinues(t *testing.T) {
 	cases := []struct {
@@ -119,7 +129,7 @@ func TestProviderPanicFailsRunAndPlaneContinues(t *testing.T) {
 		{"dispatch", panicAsync{in: "Dispatch"}, "Dispatch"},
 		{"await", panicAsync{in: "Await"}, "Await"},
 		{"launch", panicSync{}, "Launch"},
-		{"mint", &panicPull{}, "run"},
+		{"mint", &panicPull{}, "mint"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name+"/submit", func(t *testing.T) {
@@ -127,22 +137,13 @@ func TestProviderPanicFailsRunAndPlaneContinues(t *testing.T) {
 			p := New(Config{Secret: []byte("k"), Logger: quietLog, Observer: obs, MaxConcurrentCreates: 1, MaxQueued: 1})
 
 			id, err := p.Submit(context.Background(), tc.launcher, aei.RunSpec{ID: "bad", Deadline: 2 * time.Second})
-			if tc.in == "run" {
-				// A panic during mint happens before the run is accepted, on the
-				// caller's goroutine (net/http recovers it for the dispatch API).
-				// What matters is that its admission slot is returned.
-				if err == nil {
-					t.Fatalf("Submit = %q, nil; want the mint panic to surface", id)
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("Submit: %v", err)
-				}
-				st := mustTerminal(t, p, id)
-				want := "provider panicked in " + tc.in
-				if st.Phase != phaseFailed || !strings.Contains(st.Err, want) {
-					t.Fatalf("panicking run = %+v, want Failed containing %q", st, want)
-				}
+			if err != nil {
+				t.Fatalf("Submit: %v", err)
+			}
+			st := mustTerminal(t, p, id)
+			want := "provider panicked in " + tc.in
+			if st.Phase != phaseFailed || !strings.Contains(st.Err, want) {
+				t.Fatalf("panicking run = %+v, want Failed containing %q", st, want)
 			}
 
 			// The next healthy run completes on the same plane.
@@ -290,6 +291,174 @@ func TestRunWaitsForCreateSlotUntilDeadline(t *testing.T) {
 	r, err := p.Run(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "late"}}, aei.RunSpec{Deadline: 50 * time.Millisecond})
 	if err == nil || r.Err == nil || !errors.Is(r.Err, context.DeadlineExceeded) {
 		t.Fatalf("Run = %+v, %v; want a deadline failure waiting for a slot", r, err)
+	}
+}
+
+// gatedPull is a gated provider that pulls its credential (a redemption ticket).
+type gatedPull struct{ *gated }
+
+func (gatedPull) PullsCredential() bool { return true }
+
+// hangDispatch is an AsyncLauncher whose Dispatch never finishes on its own: it
+// returns only when its context ends, like substrate retrying a 503 actor.
+type hangDispatch struct{}
+
+func (hangDispatch) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	return aei.Handle{}, nil
+}
+func (hangDispatch) Dispatch(ctx context.Context, _ aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	<-ctx.Done()
+	return aei.Handle{}, fmt.Errorf("actor did not become ready: %w", ctx.Err())
+}
+func (hangDispatch) Await(context.Context, aei.Handle) (aei.Result, error) {
+	return aei.Result{}, nil
+}
+
+// slowLaunch is a plain Launcher whose Launch (the whole run) blocks until release.
+type slowLaunch struct{ entered, release chan struct{} }
+
+func (s slowLaunch) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	close(s.entered)
+	<-s.release
+	return aei.Handle{}, nil
+}
+
+// A create that hangs holds its slot for at most CreateTimeout, even for a run
+// with no deadline: the hung Dispatch is cancelled and its run fails, and healthy
+// runs behind it complete.
+func TestHungCreateGivesUpSlot(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 2, MaxQueued: 4, CreateTimeout: 50 * time.Millisecond})
+
+	var hung []string
+	for range 2 { // occupy both slots, with no run deadline
+		id, err := p.Submit(context.Background(), hangDispatch{}, aei.RunSpec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hung = append(hung, id)
+	}
+	good, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := mustTerminal(t, p, good); st.Phase != phaseSucceeded {
+		t.Fatalf("healthy run behind hung creates = %+v, want Succeeded", st)
+	}
+	for _, id := range hung {
+		st := mustTerminal(t, p, id)
+		if st.Phase != phaseFailed || !strings.Contains(st.Err, "provider create did not finish within 50ms") {
+			t.Fatalf("hung run = %+v, want Failed at the create timeout", st)
+		}
+	}
+}
+
+// A plain provider's Launch is the run itself, so at the create timeout it keeps
+// running but gives its slot to the next create.
+func TestBlockingLaunchReleasesSlotAtCreateTimeout(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 50 * time.Millisecond})
+	slow := slowLaunch{entered: make(chan struct{}), release: make(chan struct{})}
+	id, err := p.Submit(context.Background(), slow, aei.RunSpec{Deadline: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-slow.entered // the long Launch holds the only slot
+	good, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{Deadline: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := mustTerminal(t, p, good); st.Phase != phaseSucceeded {
+		t.Fatalf("run behind a long Launch = %+v, want Succeeded", st)
+	}
+	if st, _ := p.Status(id); st.Phase != phaseRunning {
+		t.Fatalf("long Launch = %+v, want still Running", st)
+	}
+	close(slow.release)
+	if st := mustTerminal(t, p, id); st.Phase != phaseSucceeded {
+		t.Fatalf("long Launch = %+v, want Succeeded once it returns", st)
+	}
+}
+
+// The queue limit holds across both paths: an AgentRun (Run) occupying the only
+// create slot counts, so with MaxQueued 1 the second Submit is refused.
+func TestRunCountsAgainstSubmitQueue(t *testing.T) {
+	g := &gated{gate: make(chan struct{}), entered: make(chan string, 4)}
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, MaxQueued: 1})
+
+	runDone := make(chan aei.Result, 1)
+	go func() {
+		r, _ := p.Run(context.Background(), g, aei.RunSpec{ID: "agentrun", Deadline: 5 * time.Second})
+		runDone <- r
+	}()
+	<-g.entered // the AgentRun holds the create slot
+
+	first, err := p.Submit(context.Background(), g, aei.RunSpec{Deadline: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("first Submit (fills the queue): %v", err)
+	}
+	if _, err := p.Submit(context.Background(), g, aei.RunSpec{Deadline: 5 * time.Second}); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("second Submit = %v, want ErrOverloaded", err)
+	}
+	close(g.gate)
+	if r := <-runDone; r.Err != nil {
+		t.Fatalf("AgentRun: %v", r.Err)
+	}
+	if st := mustTerminal(t, p, first); st.Phase != phaseSucceeded {
+		t.Fatalf("queued Submit = %+v, want Succeeded", st)
+	}
+}
+
+// The credential is minted when the create starts, not when the run is queued: a
+// pull ticket handed to a run that waited longer than the ticket TTL is still
+// redeemable.
+func TestTicketMintedAfterQueueWait(t *testing.T) {
+	g := &gated{gate: make(chan struct{}), entered: make(chan string, 4)}
+	pull := gatedPull{g}
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, TicketTTL: time.Second})
+
+	if _, err := p.Submit(context.Background(), g, aei.RunSpec{ID: "blocker", Deadline: 10 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	<-g.entered
+	if _, err := p.Submit(context.Background(), pull, aei.RunSpec{ID: "queued", Deadline: 10 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond) // queued past the ticket TTL
+	close(g.gate)
+	waitTerminal(t, p, "queued")
+
+	g.mu.Lock()
+	cred := g.creds["queued"]
+	g.mu.Unlock()
+	if cred.Kind != aei.Ticket {
+		t.Fatalf("credential kind = %v, want a ticket", cred.Kind)
+	}
+	if _, _, ok := p.redeem(cred.Value); !ok {
+		t.Fatal("ticket minted for a queued run had already expired when its create started")
+	}
+}
+
+// The provider is handed the run's remaining budget, not its full Deadline, so a
+// workload cannot outlive the deadline the plane enforces.
+func TestProviderGetsRemainingDeadline(t *testing.T) {
+	g := &gated{gate: make(chan struct{}), entered: make(chan string, 4)}
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1})
+
+	if _, err := p.Submit(context.Background(), g, aei.RunSpec{ID: "blocker", Deadline: 10 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	<-g.entered
+	if _, err := p.Submit(context.Background(), g, aei.RunSpec{ID: "queued", Deadline: 2 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	close(g.gate)
+	waitTerminal(t, p, "queued")
+
+	g.mu.Lock()
+	got := g.deadlines["queued"]
+	g.mu.Unlock()
+	if got <= 0 || got > 1600*time.Millisecond {
+		t.Fatalf("provider got Deadline %v after 500ms queued on a 2s run, want <= 1.5s", got)
 	}
 }
 
