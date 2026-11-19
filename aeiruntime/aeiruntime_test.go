@@ -280,3 +280,29 @@ func TestLoadRequiresRunIDAndControlURL(t *testing.T) {
 		t.Error("missing AEI_CONTROL_URL must fail")
 	}
 }
+
+// Timing encodes a duration only when it is positive or marked measured: an empty
+// report carries no durations, and a measured zero survives encoding.
+func TestTimingEncodesPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   rt.Timing
+		want string
+	}{
+		{"empty", rt.Timing{}, `{}`},
+		{"positive", rt.Timing{ProvisioningSeconds: 0.5, RuntimeSeconds: 2, ModelCalls: 3},
+			`{"provisioning_seconds":0.5,"runtime_seconds":2,"model_calls":3}`},
+		{"measured zero", rt.Timing{RuntimeSeconds: 2, Measured: rt.StageModel},
+			`{"runtime_seconds":2,"model_seconds":0}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tc.want {
+				t.Errorf("encoded %s, want %s", b, tc.want)
+			}
+		})
+	}
+}

@@ -116,10 +116,10 @@ type Timing struct {
 	ModelCalls          int     // optional
 	ToolCalls           int     // optional
 
-	// Measured marks which of the duration fields above the source reported, so a
-	// measured zero is distinguishable from a field it omitted. A metrics sink
-	// records a duration only when its bit is set. A source that leaves Measured
-	// empty reports no durations, only call counts.
+	// Measured marks durations the source measured, so a measured zero is
+	// distinguishable from a field it omitted. A positive duration counts as
+	// measured whether or not its bit is set, so a source that predates Measured
+	// keeps reporting its durations; set the bit to report a measured zero.
 	Measured TimingStages
 }
 

@@ -80,8 +80,9 @@ func New() *Collector {
 // headline "how long did the run take" series; it is recorded for every observed
 // run, including one ended by the watch or the deadline. Every duration in the
 // runtime's report is optional (docs/runtime-abi.md §3), so each reported stage is
-// recorded only when the report carried it (aei.Timing.Measured): an omitted stage
-// adds no sample, while a measured zero does. The call counters are created for
+// recorded only when it carries a value: a positive duration (from any source,
+// including a provider's Await that predates aei.Timing.Measured) or a zero the
+// source marked measured. An omitted stage adds no sample. The call counters are created for
 // every run and grow only by a positive count; a negative count (a malformed
 // report) is ignored rather than passed to Counter.Add, which would panic.
 func (c *Collector) ObserveRun(o control.RunObservation) {
@@ -107,7 +108,7 @@ func (c *Collector) ObserveRun(o control.RunObservation) {
 		{"runtime", aei.StageRuntime, t.RuntimeSeconds},
 		{"model", aei.StageModel, t.ModelSeconds},
 	} {
-		if t.Measured.Has(s.stage) {
+		if s.seconds > 0 || t.Measured.Has(s.stage) {
 			observe(s.name, s.seconds)
 		}
 	}

@@ -64,14 +64,54 @@ type RunSpec struct {
 	Session      string            // AEI_SESSION; "" ⇒ a one-shot run (no working-set caching)
 }
 
-// Timing is the launcher-symmetric run-timing breakdown reported on /complete. The
-// JSON tags are the wire contract (docs/runtime-abi.md §3).
+// Timing is the launcher-symmetric run-timing breakdown reported on /complete
+// (docs/runtime-abi.md §3). A duration is sent when it is positive or its stage is
+// in Measured, and omitted otherwise, so an empty Timing reports no durations and a
+// measured zero (e.g. a run that made no model calls) survives encoding.
 type Timing struct {
-	ProvisioningSeconds float64 `json:"provisioning_seconds"`
-	RuntimeSeconds      float64 `json:"runtime_seconds"`
-	ModelSeconds        float64 `json:"model_seconds,omitempty"`
-	ModelCalls          int     `json:"model_calls,omitempty"`
-	ToolCalls           int     `json:"tool_calls,omitempty"`
+	ProvisioningSeconds float64
+	RuntimeSeconds      float64
+	ModelSeconds        float64
+	ModelCalls          int
+	ToolCalls           int
+
+	// Measured marks durations the runtime measured even when they are zero. A
+	// positive duration is sent whether or not its stage is set.
+	Measured Stages
+}
+
+// Stages is a set of Timing duration fields.
+type Stages uint8
+
+// The Timing duration fields.
+const (
+	StageProvisioning Stages = 1 << iota
+	StageRuntime
+	StageModel
+)
+
+// MarshalJSON encodes the /complete timing object. The snake_case keys are the
+// wire contract; a duration is present only when measured (see Timing).
+func (t Timing) MarshalJSON() ([]byte, error) {
+	dur := func(v float64, s Stages) *float64 {
+		if v > 0 || t.Measured&s != 0 {
+			return &v
+		}
+		return nil
+	}
+	return json.Marshal(struct {
+		ProvisioningSeconds *float64 `json:"provisioning_seconds,omitempty"`
+		RuntimeSeconds      *float64 `json:"runtime_seconds,omitempty"`
+		ModelSeconds        *float64 `json:"model_seconds,omitempty"`
+		ModelCalls          int      `json:"model_calls,omitempty"`
+		ToolCalls           int      `json:"tool_calls,omitempty"`
+	}{
+		ProvisioningSeconds: dur(t.ProvisioningSeconds, StageProvisioning),
+		RuntimeSeconds:      dur(t.RuntimeSeconds, StageRuntime),
+		ModelSeconds:        dur(t.ModelSeconds, StageModel),
+		ModelCalls:          t.ModelCalls,
+		ToolCalls:           t.ToolCalls,
+	})
 }
 
 // Credential is a short-lived bearer credential the runtime holds in memory only
@@ -289,9 +329,10 @@ func Main(getenv func(string) string, metadata map[string]string, fn func(contex
 // driven identically on either substrate.
 func runTask(ctx context.Context, rt *Runtime, fn func(context.Context, *Runtime) error) (Timing, error) {
 	start := time.Now()
-	var provisioning float64
+	t := Timing{Measured: StageRuntime}
 	if !rt.spec.DispatchedAt.IsZero() {
-		provisioning = start.Sub(rt.spec.DispatchedAt).Seconds()
+		t.ProvisioningSeconds = start.Sub(rt.spec.DispatchedAt).Seconds()
+		t.Measured |= StageProvisioning
 	}
 	runCtx := ctx
 	var cancel context.CancelFunc
@@ -302,7 +343,8 @@ func runTask(ctx context.Context, rt *Runtime, fn func(context.Context, *Runtime
 	}
 	defer cancel()
 	runErr := fn(runCtx, rt)
-	return Timing{ProvisioningSeconds: provisioning, RuntimeSeconds: time.Since(start).Seconds()}, runErr
+	t.RuntimeSeconds = time.Since(start).Seconds()
+	return t, runErr
 }
 
 // reportCompletion posts the terminal outcome on a fresh context so it still lands

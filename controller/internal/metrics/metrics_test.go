@@ -150,6 +150,22 @@ func TestCollectorKeepsMeasuredZero(t *testing.T) {
 	t.Fatal("no provisioning series")
 }
 
+// A provider whose Await reports a positive duration without setting Measured
+// (the API before Measured existed) still has that duration recorded.
+func TestCollectorRecordsUnmarkedPositiveDuration(t *testing.T) {
+	c := New()
+	c.ObserveRun(control.RunObservation{TaskRef: "t", Phase: "Succeeded", Provider: "p", Duration: 9 * time.Second,
+		Timing: aei.Timing{RuntimeSeconds: 8}})
+	l := map[string]string{"task_ref": "t", "phase": "Succeeded", "provider": "p"}
+	f := gather(t, c)
+	if got, ok := f.value("aei_run_duration_seconds", withStage(l, "runtime")); !ok || got != 8 {
+		t.Errorf("runtime = %v (present %v), want 8", got, ok)
+	}
+	if _, ok := f.value("aei_run_duration_seconds", withStage(l, "provisioning")); ok {
+		t.Error("an unmarked zero provisioning should add no sample")
+	}
+}
+
 func withStage(l map[string]string, stage string) map[string]string {
 	out := map[string]string{"stage": stage}
 	for k, v := range l {

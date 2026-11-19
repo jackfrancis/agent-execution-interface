@@ -262,7 +262,10 @@ launcher cannot see) and a synchronous actor resume are measured the same way.
 
 A duration the runtime did not measure is **omitted**, not sent as `0`: the
 control plane treats an explicit `0` as a measurement (it counts in the
-`/metrics` histograms) and an omitted field as no sample.
+`/metrics` histograms) and an omitted field as no sample. The Go SDK
+(`aeiruntime.Timing`) sends a duration when it is positive or its stage is in
+`Timing.Measured`, so an empty `Timing` reports no durations and a measured zero
+is still sent.
 
 ---
 
