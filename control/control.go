@@ -90,20 +90,37 @@ type PublicKeyAuthority interface {
 // Observer records a run's terminal outcome for metrics. It is the pluggable
 // observability seam — the metrics analog of CredentialSource (/vend) and
 // TokenAuthority (mint/verify). The control plane calls ObserveRun exactly once
-// per run on the data-plane (Submit) path, with the run's taskRef, terminal phase
-// ("Succeeded" or "Failed"), and the provider-reported timing breakdown. The
-// reference default is a no-op; a platform supplies a Prometheus implementation
-// (exposed at /metrics) without changing the plane. Implementations MUST be safe
-// for concurrent use.
+// per run on the data-plane (Submit) path, with a RunObservation. The reference
+// default is a no-op; a platform supplies a Prometheus implementation (exposed at
+// /metrics) without changing the plane. Implementations MUST be safe for
+// concurrent use.
 type Observer interface {
-	ObserveRun(taskRef, phase string, timing aei.Timing)
+	ObserveRun(RunObservation)
+}
+
+// RunObservation is one run's terminal outcome as the control plane saw it.
+type RunObservation struct {
+	TaskRef string // the app's task, e.g. "github-converse"; may be empty
+	Phase   string // terminal phase: "Succeeded" or "Failed"
+	// Provider is the provider that placed the run, from its Handle (e.g. "k8s-job").
+	// Empty when the provider did not report one.
+	Provider string
+	// Duration is the run's wall-clock as the controller measured it: from the start
+	// of dispatch to the terminal signal (the runtime's callback, the provider's
+	// watch, or the deadline). It is set for every run, including one the runtime
+	// never reported on.
+	Duration time.Duration
+	// Timing is the breakdown the terminal signal carried: the runtime's /complete
+	// report or the provider's Await. It is the zero value when the run ended without
+	// one, e.g. at the deadline.
+	Timing aei.Timing
 }
 
 // nopObserver is the default Observer: it records nothing, so an unconfigured
 // plane (the reference profile) emits no metrics.
 type nopObserver struct{}
 
-func (nopObserver) ObserveRun(string, string, aei.Timing) {}
+func (nopObserver) ObserveRun(RunObservation) {}
 
 // Config configures a control plane.
 type Config struct {
@@ -127,7 +144,7 @@ type Config struct {
 	// seam; roadmap Phase 7).
 	Store Store
 	// Observer records each run's terminal outcome for metrics: its taskRef, terminal
-	// phase, and timing breakdown (the metrics seam, the /metrics analog of
+	// phase, provider, measured duration, and timing breakdown (the metrics seam, the /metrics analog of
 	// CredentialSource for /vend). Optional: nil records nothing (reference-grade). A
 	// platform supplies a Prometheus implementation and serves it at /metrics, without
 	// changing the plane.
@@ -287,8 +304,9 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 			ctx, cancel = context.WithTimeout(ctx, spec.Deadline)
 			defer cancel()
 		}
-		res := p.race(ctx, launcher, spec, cred, done)
-		p.observe(spec, res)
+		start := time.Now()
+		res, h := p.race(ctx, launcher, spec, cred, done)
+		p.observe(spec, h, res, time.Since(start))
 		p.finishRun(spec.ID, res)
 	}()
 	return spec.ID, nil
@@ -296,15 +314,22 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 
 // observe reports a run's terminal outcome to the metrics Observer (the metrics
 // seam). It fires once per Submit — the data-plane app path — with the run's
-// taskRef, terminal phase, and the provider-reported timing breakdown. The default
+// taskRef, terminal phase, the provider from its handle, the duration the
+// controller measured, and the timing the terminal signal carried. The default
 // Observer is a no-op, so an unconfigured plane records nothing. The phase mirrors
 // finishRun's: a run with an error is Failed, otherwise Succeeded.
-func (p *Plane) observe(spec aei.RunSpec, res aei.Result) {
+func (p *Plane) observe(spec aei.RunSpec, h aei.Handle, res aei.Result, d time.Duration) {
 	phase := phaseSucceeded
 	if res.Err != nil {
 		phase = phaseFailed
 	}
-	p.obs.ObserveRun(spec.TaskRef, phase, res.Timing)
+	p.obs.ObserveRun(RunObservation{
+		TaskRef:  spec.TaskRef,
+		Phase:    phase,
+		Provider: h.Provider,
+		Duration: d,
+		Timing:   res.Timing,
+	})
 }
 
 // Status returns the current state of a submitted run, and whether it is known.
@@ -335,13 +360,14 @@ func (p *Plane) finishRun(runID string, res aei.Result) {
 
 // race dispatches spec and returns the first terminal signal: the runtime's
 // /complete callback (delivered on done), the provider's Await, or the deadline
-// (ctx). It is the shared completion core of Run (blocking) and Submit
-// (non-blocking).
-func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, cred aei.Credential, done chan aei.Result) aei.Result {
+// (ctx). It also returns the provider's Handle, as far as it is known when the
+// race ends, so the run can be attributed to its provider. It is the completion
+// core of Submit (non-blocking).
+func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, cred aei.Credential, done chan aei.Result) (aei.Result, aei.Handle) {
 	if async, ok := launcher.(aei.AsyncLauncher); ok {
 		h, err := async.Dispatch(ctx, spec, cred)
 		if err != nil {
-			return aei.Result{Err: err}
+			return aei.Result{Err: err}, h
 		}
 		watch := make(chan aei.Result, 1)
 		go func() {
@@ -350,21 +376,32 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		}()
 		select {
 		case r := <-done:
-			return r
+			return r, h
 		case r := <-watch:
-			return r
+			return r, h
 		}
 	}
-	launch := make(chan aei.Result, 1)
+	type launched struct {
+		h   aei.Handle
+		err error
+	}
+	launch := make(chan launched, 1)
 	go func() {
-		_, err := launcher.Launch(ctx, spec, cred)
-		launch <- aei.Result{Err: err}
+		h, err := launcher.Launch(ctx, spec, cred)
+		launch <- launched{h, err}
 	}()
 	select {
 	case r := <-done:
-		return r
-	case r := <-launch:
-		return r
+		// A blocking Launch may still be running when the callback wins, so its
+		// handle is not known yet. Take it if it is already there.
+		select {
+		case l := <-launch:
+			return r, l.h
+		default:
+			return r, aei.Handle{}
+		}
+	case l := <-launch:
+		return aei.Result{Err: l.err}, l.h
 	}
 }
 
