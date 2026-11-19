@@ -40,8 +40,30 @@ func (c *captureLauncher) Await(ctx context.Context, _ aei.Handle) (aei.Result, 
 
 var testLauncher = &captureLauncher{dispatched: make(chan aei.Credential, 8)}
 
+// blockLauncher is an AsyncLauncher whose Dispatch blocks until gate closes, so a
+// test can hold the control plane's create slot and fill its queue.
+type blockLauncher struct {
+	gate    chan struct{}
+	entered chan struct{}
+}
+
+func (b *blockLauncher) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	return aei.Handle{}, nil
+}
+func (b *blockLauncher) Dispatch(_ context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	b.entered <- struct{}{}
+	<-b.gate
+	return aei.Handle{Provider: "test-block", Ref: spec.ID}, nil
+}
+func (b *blockLauncher) Await(context.Context, aei.Handle) (aei.Result, error) {
+	return aei.Result{ResultRef: "ok"}, nil
+}
+
+var blockingLauncher = &blockLauncher{gate: make(chan struct{}), entered: make(chan struct{}, 8)}
+
 func init() {
 	aei.Register("test-dispatch", func(aei.Config) (aei.Launcher, error) { return testLauncher, nil })
+	aei.Register("test-block", func(aei.Config) (aei.Launcher, error) { return blockingLauncher, nil })
 }
 
 // echoAuth authenticates any non-empty token as a ServiceAccount named by the
@@ -58,6 +80,13 @@ func (e echoAuth) Authenticate(_ context.Context, bearer string) (Caller, error)
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	return newTestServerWith(t, "test-dispatch", control.Config{Secret: []byte("k")})
+}
+
+// newTestServerWith serves the dispatch API for app "pyfer" on a class backed by
+// provider, with the control plane built from cfg.
+func newTestServerWith(t *testing.T, provider string, cfg control.Config) *httptest.Server {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := aeiv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -72,10 +101,10 @@ func newTestServer(t *testing.T) *httptest.Server {
 	}
 	class := &aeiv1.AgentProviderClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "standard"},
-		Spec:       aeiv1.AgentProviderClassSpec{Provider: "test-dispatch"},
+		Spec:       aeiv1.AgentProviderClassSpec{Provider: provider},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(app, class).Build()
-	plane := control.New(control.Config{Secret: []byte("k")})
+	plane := control.New(cfg)
 	h := NewHandler(plane, echoAuth{namespace: "team"}, c)
 	mux := http.NewServeMux()
 	plane.RegisterRoutes(mux)
@@ -187,5 +216,47 @@ func TestDispatchAuthorization(t *testing.T) {
 				t.Errorf("status = %d, want %d", resp.StatusCode, tc.want)
 			}
 		})
+	}
+}
+
+// TestDispatchBurstGetsOverloaded: once the control plane's create slots and queue
+// are full, /dispatch answers 429 with Retry-After at once instead of queueing
+// without bound, and accepts work again when the queue drains.
+func TestDispatchBurstGetsOverloaded(t *testing.T) {
+	srv := newTestServerWith(t, "test-block", control.Config{Secret: []byte("k"), MaxConcurrentCreates: 1, MaxQueued: 2})
+	req := dispatchRequest{App: "pyfer", TaskRef: "item://1", TimeoutSeconds: 30}
+	req.Identity.Subject = "github:1"
+
+	var codes []int
+	for range 5 {
+		resp := do(t, http.MethodPost, srv.URL+"/aei/v1alpha1/dispatch", "pyfer", req)
+		codes = append(codes, resp.StatusCode)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if ra := resp.Header.Get("Retry-After"); ra == "" {
+				t.Error("429 without a Retry-After header")
+			}
+		}
+		_ = resp.Body.Close()
+	}
+	want := []int{202, 202, 202, 429, 429} // 1 creating + 2 queued, then refused
+	for i := range want {
+		if codes[i] != want[i] {
+			t.Fatalf("burst status codes = %v, want %v", codes, want)
+		}
+	}
+
+	<-blockingLauncher.entered
+	close(blockingLauncher.gate) // let the creates finish and the queue drain
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp := do(t, http.MethodPost, srv.URL+"/aei/v1alpha1/dispatch", "pyfer", req)
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusAccepted {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dispatch after drain = %d, want 202", resp.StatusCode)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

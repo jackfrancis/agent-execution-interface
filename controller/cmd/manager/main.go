@@ -38,6 +38,9 @@ import (
 func main() {
 	var abiAddr string
 	flag.StringVar(&abiAddr, "abi-addr", ":8080", "address to serve the runtime ABI (/complete, /redeem, /vend)")
+	var maxCreates, maxQueued int
+	flag.IntVar(&maxCreates, "max-concurrent-creates", control.DefaultMaxConcurrentCreates, "maximum provider creates (Dispatch/Launch) in progress at once, across all providers")
+	flag.IntVar(&maxQueued, "max-queued-runs", control.DefaultMaxQueued, "maximum dispatched runs waiting for a create slot; beyond it /dispatch answers 429")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -56,7 +59,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	cfg := control.Config{Secret: []byte(os.Getenv("AEI_SIGNING_SECRET"))}
+	cfg := control.Config{
+		Secret:               []byte(os.Getenv("AEI_SIGNING_SECRET")),
+		MaxConcurrentCreates: maxCreates,
+		MaxQueued:            maxQueued,
+	}
 	// An app with an asymmetric identity posture (a sole-minter control tier and a
 	// verify-only app tier) provisions the control plane with its Ed25519 private
 	// key. When set, the plane mints run credentials with it and the app verifies

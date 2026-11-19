@@ -86,6 +86,23 @@ already models) plus `app`. `providerClassName` is ignored: the `AgentApp` fixes
 the class. Dispatch is **non-blocking** — the run outlives the request; its
 outcome lands off-API (below).
 
+Dispatch is also **bounded**. The control plane runs at most
+`--max-concurrent-creates` provider creates at once (default 2), across every
+provider and both ingresses, and lets at most `--max-queued-runs` dispatched runs
+wait for one (default 128) — the limits ZZ's orchestrator applied. A run stops
+counting against either limit once its create returns; awaiting completion holds
+no slot. Beyond the queue limit the request is refused at once, with nothing
+recorded:
+
+```http
+429 Too Many Requests
+Retry-After: 1
+```
+
+The Go SDK returns this as `aeiapp.ErrOverloaded`; back off and retry. The limits
+are global, so one app can still fill the queue for others; per-app limits are
+tracked separately.
+
 ### `GET /aei/v1alpha1/runs/{id}` — read lifecycle
 
 ```http
@@ -128,6 +145,11 @@ the runtime's `/complete` callback against the provider's `Await` and the deadli
 (the same race as `Plane.Run`), and records the first terminal signal into the
 in-memory run store. `GET /runs/{id}` reads that store. Idempotent finish (R4)
 holds: callback and watch may both fire; the first wins.
+
+A provider failure is contained to its run. A panic in `Dispatch`, `Await`, or a
+blocking `Launch` is recovered, logged with its stack, and recorded as a `Failed`
+run (`provider panicked in …`); the controller keeps serving. An error returned by
+`Await` means the watch itself broke, so the run is `Failed`, never `Succeeded`.
 
 ## Tradeoffs (stated, not hidden)
 
