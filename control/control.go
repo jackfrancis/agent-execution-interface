@@ -35,6 +35,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -223,9 +224,9 @@ type Plane struct {
 	// 2*MaxConcurrentCreates, leaving room for the next creates beside calls stuck
 	// in a slow backend). launchDeadline is the run deadline given to a plain
 	// provider's Launch when the run has none.
-	capabilityCalls chan struct{} // a provider's PullsCredential
-	ticketCalls     chan struct{} // Store.PutTicket (pull credential)
-	tokenCalls      chan struct{} // TokenAuthority.Mint (pushed credential)
+	capabilityCalls map[any]*permitPool // a provider's PullsCredential, per launcher (guarded by mu)
+	ticketCalls     chan struct{}       // Store.PutTicket (pull credential)
+	tokenCalls      chan struct{}       // TokenAuthority.Mint (pushed credential)
 	launchDeadline  time.Duration
 
 	mu      sync.Mutex
@@ -271,7 +272,7 @@ func New(cfg Config) *Plane {
 		creates:         make(chan struct{}, creates),
 		admit:           make(chan struct{}, creates+queued),
 		createTimeout:   orDur(cfg.CreateTimeout, DefaultCreateTimeout),
-		capabilityCalls: make(chan struct{}, 2*creates),
+		capabilityCalls: map[any]*permitPool{},
 		ticketCalls:     make(chan struct{}, 2*creates),
 		tokenCalls:      make(chan struct{}, 2*creates),
 		launchDeadline:  defaultLaunchDeadline,
@@ -596,42 +597,93 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 // unused) but keeps its permit until it returns. Each credential backend has its
 // own permits (2*MaxConcurrentCreates), so outstanding calls stay bounded and an
 // outage in one cannot stall the others: a stalled ticket store does not block
-// runs whose token the authority signs, and vice versa. The provider's
-// PullsCredential, which decides between them, has permits of its own.
+// runs whose token the authority signs, and vice versa. A provider's
+// PullsCredential, which decides between them, has permits of its own per
+// launcher, so one provider stuck there does not stall another.
+//
+// The claims, including their expiry, are computed inside each step once it holds
+// its permit, so waiting for capacity does not shorten the credential's life.
 func (p *Plane) mintWithin(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec) (aei.Credential, error) {
-	claims := p.claims(spec)
 	pulls := false
 	if pl, ok := launcher.(aei.PullCredentialLauncher); ok {
-		if err := p.bounded(ctx, p.capabilityCalls, spec.ID, "PullsCredential", func() { pulls = pl.PullsCredential() }); err != nil {
+		permits, done := p.capabilityPermits(launcher)
+		if err := p.bounded(ctx, permits, done, spec.ID, "PullsCredential", func() { pulls = pl.PullsCredential() }); err != nil {
 			return aei.Credential{}, err
 		}
 	}
 	if pulls {
 		var id string
-		if err := p.bounded(ctx, p.ticketCalls, spec.ID, "redemption ticket", func() { id = p.issueTicket(claims) }); err != nil {
+		if err := p.bounded(ctx, p.ticketCalls, nil, spec.ID, "redemption ticket", func() { id = p.issueTicket(p.claims(spec)) }); err != nil {
 			return aei.Credential{}, err
 		}
 		return aei.Credential{Value: id, Kind: aei.Ticket}, nil
 	}
 	var tok string
-	if err := p.bounded(ctx, p.tokenCalls, spec.ID, "run token", func() { tok = p.mintToken(claims) }); err != nil {
+	if err := p.bounded(ctx, p.tokenCalls, nil, spec.ID, "run token", func() { tok = p.mintToken(p.claims(spec)) }); err != nil {
 		return aei.Credential{}, err
 	}
 	return aei.Credential{Value: tok, Kind: aei.Token}, nil
 }
 
+// capabilityPermits returns the PullsCredential permits for launcher (cap
+// 2*MaxConcurrentCreates) and a func to call once the caller is finished with
+// them. An entry lives only while some run is waiting for, or holding, one of its
+// permits, so the map stays as small as the set of launchers with calls in
+// flight, however many launchers the plane sees over time.
+func (p *Plane) capabilityPermits(launcher aei.Launcher) (chan struct{}, func()) {
+	key := launcherKey(launcher)
+	p.mu.Lock()
+	e, ok := p.capabilityCalls[key]
+	if !ok {
+		e = &permitPool{permits: make(chan struct{}, cap(p.ticketCalls))}
+		p.capabilityCalls[key] = e
+	}
+	e.users++
+	p.mu.Unlock()
+	return e.permits, func() {
+		p.mu.Lock()
+		if e.users--; e.users == 0 {
+			delete(p.capabilityCalls, key)
+		}
+		p.mu.Unlock()
+	}
+}
+
+// permitPool is one launcher's PullsCredential permits and how many runs are
+// waiting for or holding them.
+type permitPool struct {
+	permits chan struct{}
+	users   int
+}
+
+// launcherKey identifies a launcher for capabilityPermits. A comparable launcher
+// (a pointer, as every in-tree provider is) is its own key; one whose dynamic
+// type cannot be a map key is keyed by that type.
+func launcherKey(l aei.Launcher) any {
+	if t := reflect.TypeOf(l); !t.Comparable() {
+		return t
+	}
+	return l
+}
+
 // bounded runs f, which takes no context, holding one of permits until f returns,
 // and waits for it only until ctx ends. A panic in f is returned as an error.
 // Results f writes are safe to read once bounded returns nil (the channel send
-// orders them); after a timeout the caller must not read them.
-func (p *Plane) bounded(ctx context.Context, permits chan struct{}, runID, what string, f func()) error {
+// orders them); after a timeout the caller must not read them. done, if not nil,
+// is called once the permit is given back, or at once if none was acquired.
+func (p *Plane) bounded(ctx context.Context, permits chan struct{}, done func(), runID, what string, f func()) error {
+	if done == nil {
+		done = func() {}
+	}
 	select {
 	case permits <- struct{}{}:
 	case <-ctx.Done():
+		done()
 		return fmt.Errorf("control: %s not ready (earlier calls still outstanding): %w", what, ctx.Err())
 	}
 	ch := make(chan error, 1)
 	go func() {
+		defer done()
 		defer func() { <-permits }()
 		defer func() {
 			if rec := recover(); rec != nil {

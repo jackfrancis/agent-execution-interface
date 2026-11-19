@@ -632,7 +632,7 @@ func TestOutstandingMintsBounded(t *testing.T) {
 		t.Fatalf("peak outstanding credential calls = %d, want 2 (2*MaxConcurrentCreates)", peak)
 	}
 	close(hung.release)
-	waitFor(t, func() bool { return len(p.capabilityCalls) == 0 })
+	waitFor(t, func() bool { return capabilityPools(p) == 0 })
 	good, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{})
 	if err != nil {
 		t.Fatal(err)
@@ -726,6 +726,100 @@ func TestTicketStoreOutageDoesNotBlockTokenRuns(t *testing.T) {
 		t.Fatalf("job credential = %+v, want a signed token", cred)
 	}
 	close(store.release) // only now does the store recover
+}
+
+func capabilityPools(p *Plane) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.capabilityCalls)
+}
+
+// A credential's expiry is set once its step holds a permit, not when the run
+// starts waiting for one: a run that waited longer than the token lifetime for
+// capacity still gets a credential that verifies (a token, or a ticket that
+// redeems for one).
+func TestCredentialExpirySetAfterPermitWait(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pull bool
+	}{{"token", false}, {"ticket", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 5 * time.Second, TokenTTL: time.Second, TicketTTL: 10 * time.Second})
+			permits := p.tokenCalls
+			g := &gated{}
+			var l aei.Launcher = g
+			if tc.pull {
+				permits, l = p.ticketCalls, gatedPull{g}
+			}
+			for range cap(permits) { // every permit held by stalled calls
+				permits <- struct{}{}
+			}
+			id, err := p.Submit(context.Background(), l, aei.RunSpec{ID: "job", Deadline: 10 * time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Wait longer than the token lifetime; expiry has whole-second
+			// resolution, so more than 2s guarantees crossing it.
+			time.Sleep(2200 * time.Millisecond)
+			for range cap(permits) {
+				<-permits
+			}
+			if st := mustTerminal(t, p, id); st.Phase != phaseSucceeded {
+				t.Fatalf("run = %+v, want Succeeded", st)
+			}
+			g.mu.Lock()
+			cred := g.creds["job"]
+			g.mu.Unlock()
+			tok := cred.Value
+			if tc.pull {
+				var ok bool
+				if tok, _, ok = p.redeem(cred.Value); !ok {
+					t.Fatal("ticket did not redeem")
+				}
+			}
+			if _, ok := p.verifyToken(tok); !ok {
+				t.Fatal("credential minted after waiting for a permit had already expired")
+			}
+		})
+	}
+}
+
+// PullsCredential permits are per launcher: one provider stuck there does not stop
+// another provider's runs, while the stuck provider's own calls stay bounded.
+func TestCapabilityChecksIsolatedPerLauncher(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 30 * time.Millisecond})
+	stuck := &countingPull{release: make(chan struct{})}
+	for i := range 3 {
+		id, err := p.Submit(context.Background(), stuck, aei.RunSpec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		st := mustTerminal(t, p, id)
+		if st.Phase != phaseFailed {
+			t.Fatalf("stuck provider run %d = %+v, want Failed", i, st)
+		}
+		if i == 2 && !strings.Contains(st.Err, "earlier calls still outstanding") {
+			t.Fatalf("third stuck run = %+v, want refused a permit (its own calls are bounded)", st)
+		}
+	}
+
+	// Another provider that also implements PullsCredential, while the first
+	// provider's calls are still blocked.
+	healthy := &fakePull{fakeWatch{result: aei.Result{ResultRef: "fine"}}}
+	good, err := p.Submit(context.Background(), healthy, aei.RunSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := mustTerminal(t, p, good); st.Phase != phaseSucceeded {
+		t.Fatalf("healthy provider while another is stuck in PullsCredential = %+v, want Succeeded", st)
+	}
+	if peak := stuck.peak.Load(); peak != 2 {
+		t.Errorf("stuck provider's outstanding PullsCredential calls = %d, want 2", peak)
+	}
+
+	close(stuck.release)
+	waitFor(t, func() bool { return capabilityPools(p) == 0 }) // no entry outlives its calls
 }
 
 func waitFor(t *testing.T, cond func() bool) {
