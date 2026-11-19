@@ -68,6 +68,12 @@ make public-key KUBECONFIG=/path/to/kubeconfig
   current context is used unless `KUBE_CONTEXT=<name>` picks another.
 - Use a new image tag per build: the controller pod re-pulls only when the image
   reference changes.
+- The controller refuses to start without a signing key, and the install ships
+  none. `make deploy` and `make dev-up` run `make authority` first, which creates
+  an Ed25519 keypair in the `aei-signing` secret or reuses the one already there, so
+  a redeploy keeps the key apps verify with. `make undeploy` deletes the
+  `aei-system` namespace and the key with it; the next install makes a new key,
+  and verify-only apps must re-read it (`make public-key`).
 - The same flag works on the other cluster-agnostic targets (`status`, `logs`,
   `smoke`, `provider`, `install-agent-sandbox`, `agent-sandbox-enable`,
   `register-app`, `undeploy`). The kind-only ones (`dev-up`, `load`, `kind-up`,

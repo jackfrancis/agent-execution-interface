@@ -34,7 +34,9 @@ kind-load: ## load the image into the kind cluster (engine-agnostic archive load
 	$(KIND) load image-archive $(IMAGE_ARCHIVE) --name $(KIND_CLUSTER)
 	@rm -f $(IMAGE_ARCHIVE)
 
-deploy: ## install CRDs + RBAC + manager (Deployment/Service/Secret)
+# The install ships no signing key, and the controller refuses to start without
+# one: run the repo root's `make authority` first (`make deploy` there does both).
+deploy: ## install CRDs + RBAC + manager (Deployment/Service); needs the aei-signing secret (root: make authority)
 	$(KUBECTL) apply -k config/default
 
 undeploy: ## remove the operator

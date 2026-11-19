@@ -31,6 +31,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -222,7 +223,12 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
-	cred := p.mint(launcher, spec)
+	cred, err := p.mint(launcher, spec)
+	if err != nil {
+		// Fail closed: never dispatch a run with an empty credential.
+		p.log.Warn("run failed", "run", spec.ID, "err", err)
+		return aei.Result{Err: err}, err
+	}
 
 	if spec.Deadline > 0 {
 		var cancel context.CancelFunc
@@ -294,8 +300,16 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
-	cred := p.mint(launcher, spec)
+	cred, err := p.mint(launcher, spec)
 	p.store.SetRunning(spec.ID)
+	if err != nil {
+		// Fail closed: the run is recorded Failed (visible at GET /runs/{id}) and
+		// never dispatched with an empty credential.
+		res := aei.Result{Err: err}
+		p.observe(spec, res)
+		p.finishRun(spec.ID, res)
+		return spec.ID, nil
+	}
 	done := p.arm(spec.ID)
 
 	go func() {
@@ -472,7 +486,8 @@ type Claims struct {
 
 // mint produces the credential handed to the provider: a pushed token, or (for a
 // PullCredentialLauncher) a single-use ticket the runtime redeems for the token.
-func (p *Plane) mint(launcher aei.Launcher, spec aei.RunSpec) aei.Credential {
+// A mint error is returned, never collapsed into an empty credential.
+func (p *Plane) mint(launcher aei.Launcher, spec aei.RunSpec) (aei.Credential, error) {
 	claims := Claims{
 		RunID:    spec.ID,
 		Subject:  spec.Identity.Subject,
@@ -481,9 +496,13 @@ func (p *Plane) mint(launcher aei.Launcher, spec aei.RunSpec) aei.Credential {
 		Exp:      p.now().Add(p.tokenTTL).Unix(),
 	}
 	if pl, ok := launcher.(aei.PullCredentialLauncher); ok && pl.PullsCredential() {
-		return aei.Credential{Value: p.issueTicket(claims), Kind: aei.Ticket}
+		return aei.Credential{Value: p.issueTicket(claims), Kind: aei.Ticket}, nil
 	}
-	return aei.Credential{Value: p.mintToken(claims), Kind: aei.Token}
+	tok, err := p.mintToken(claims)
+	if err != nil {
+		return aei.Credential{}, err
+	}
+	return aei.Credential{Value: tok, Kind: aei.Token}, nil
 }
 
 func (p *Plane) issueTicket(c Claims) string {
@@ -493,22 +512,36 @@ func (p *Plane) issueTicket(c Claims) string {
 }
 
 // redeem consumes a single-use ticket and mints the run token it was issued for,
-// preserving the run id so completion still correlates.
-func (p *Plane) redeem(id string) (string, int, bool) {
+// preserving the run id so completion still correlates. A mint error fails the
+// run (the ticket is already spent, so the runtime cannot retry) and is returned.
+func (p *Plane) redeem(id string) (string, int, bool, error) {
 	c, ok := p.store.RedeemTicket(id, p.now())
 	if !ok {
-		return "", 0, false
+		return "", 0, false, nil
+	}
+	tok, err := p.mintToken(c)
+	if err != nil {
+		res := aei.Result{Err: err}
+		p.finishRun(c.RunID, res)
+		p.fire(c.RunID, res)
+		return "", 0, true, err
 	}
 	ttl := int(time.Unix(c.Exp, 0).Sub(p.now()).Seconds())
-	return p.mintToken(c), ttl, true
+	return tok, ttl, true, nil
 }
 
-// mintToken produces a run credential via the configured TokenAuthority. It keeps
-// a single-value signature (a mint error collapses to an empty token) so the
-// internal mint/redeem paths stay unchanged.
-func (p *Plane) mintToken(c Claims) string {
-	tok, _ := p.auth.Mint(c)
-	return tok
+// mintToken produces a run credential via the configured TokenAuthority. It fails
+// closed: an authority error, or an authority that returns an empty token, is an
+// error — never an empty credential handed to a run.
+func (p *Plane) mintToken(c Claims) (string, error) {
+	tok, err := p.auth.Mint(c)
+	if err == nil && tok == "" {
+		err = errors.New("authority returned an empty token")
+	}
+	if err != nil {
+		return "", fmt.Errorf("control: mint run credential: %w", err)
+	}
+	return tok, nil
 }
 
 // verifyToken authenticates a run credential via the configured TokenAuthority.
@@ -525,6 +558,10 @@ type hmacAuthority struct {
 }
 
 func (a hmacAuthority) Mint(c Claims) (string, error) {
+	if len(a.secret) == 0 {
+		// Fail closed: an unkeyed HMAC is a forgeable credential.
+		return "", errors.New("no HMAC signing secret configured")
+	}
 	payload, err := json.Marshal(c)
 	if err != nil {
 		return "", err
@@ -534,6 +571,9 @@ func (a hmacAuthority) Mint(c Claims) (string, error) {
 }
 
 func (a hmacAuthority) Verify(tok string) (Claims, bool) {
+	if len(a.secret) == 0 {
+		return Claims{}, false // fail closed, as Mint does
+	}
 	b, sig, ok := strings.Cut(tok, ".")
 	if !ok || !hmac.Equal([]byte(sig), []byte(a.sign(b))) {
 		return Claims{}, false
@@ -720,9 +760,13 @@ func (p *Plane) handleRedeem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	tok, ttl, ok := p.redeem(body.Ticket)
+	tok, ttl, ok, err := p.redeem(body.Ticket)
 	if !ok {
 		http.Error(w, "invalid ticket", http.StatusUnauthorized) // coarse: unknown/spent/expired alike
+		return
+	}
+	if err != nil {
+		http.Error(w, "credential unavailable", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, map[string]any{"credential": tok, "expires_in": ttl})

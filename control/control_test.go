@@ -68,14 +68,14 @@ func post(t *testing.T, url, bearer string, body any) *http.Response {
 
 func TestTokenRoundTripTamperExpire(t *testing.T) {
 	p := New(Config{Secret: []byte("k")})
-	tok := p.mintToken(Claims{RunID: "r", Exp: p.now().Add(time.Hour).Unix()})
+	tok := mustToken(t, p, Claims{RunID: "r", Exp: p.now().Add(time.Hour).Unix()})
 	if c, ok := p.verifyToken(tok); !ok || c.RunID != "r" {
 		t.Fatalf("valid token should verify, got ok=%v", ok)
 	}
 	if _, ok := p.verifyToken(tok + "x"); ok {
 		t.Error("tampered signature must fail")
 	}
-	expired := p.mintToken(Claims{RunID: "r", Exp: p.now().Add(-time.Hour).Unix()})
+	expired := mustToken(t, p, Claims{RunID: "r", Exp: p.now().Add(-time.Hour).Unix()})
 	if _, ok := p.verifyToken(expired); ok {
 		t.Error("expired token must fail")
 	}
@@ -176,7 +176,7 @@ func (s *stubAuthority) Verify(tok string) (Claims, bool) {
 func TestConfigAuthorityOverridesDefault(t *testing.T) {
 	sa := &stubAuthority{}
 	p := New(Config{Authority: sa})
-	tok := p.mintToken(Claims{RunID: "r7"})
+	tok := mustToken(t, p, Claims{RunID: "r7"})
 	if tok != "stub.r7" {
 		t.Fatalf("plane should mint via the injected authority, got %q", tok)
 	}
@@ -245,7 +245,7 @@ func TestRunCompletesViaWatch(t *testing.T) {
 // redeeming it (single-use) yields a token bound to the same run.
 func TestPullProviderIssuesTicketAndRedeems(t *testing.T) {
 	p := New(Config{Secret: []byte("k")})
-	cred := p.mint(&fakePull{}, aei.RunSpec{ID: "run-3", Identity: aei.IdentityRequest{Subject: "u1"}})
+	cred := mustMint(t, p, &fakePull{}, aei.RunSpec{ID: "run-3", Identity: aei.IdentityRequest{Subject: "u1"}})
 	if cred.Kind != aei.Ticket {
 		t.Fatalf("pull provider must get a ticket, got kind %v", cred.Kind)
 	}
@@ -278,7 +278,7 @@ func TestPullProviderIssuesTicketAndRedeems(t *testing.T) {
 // run id must match the credential's bound run.
 func TestCompleteRejectsForeignRun(t *testing.T) {
 	p := New(Config{Secret: []byte("k")})
-	cred := p.mint(&fakeWatch{}, aei.RunSpec{ID: "run-A"})
+	cred := mustMint(t, p, &fakeWatch{}, aei.RunSpec{ID: "run-A"})
 
 	srv := httptest.NewServer(p.Handler())
 	defer srv.Close()
@@ -310,7 +310,7 @@ func (fakeCreds) Vend(_ context.Context, _, subject, provider string) (VendedCre
 // app's downstream credential; an unknown provider is 404.
 func TestVendUsesSource(t *testing.T) {
 	p := New(Config{Secret: []byte("k"), Credentials: fakeCreds{}})
-	cred := p.mint(&fakeWatch{}, aei.RunSpec{ID: "run-v", Identity: aei.IdentityRequest{Subject: "u1"}})
+	cred := mustMint(t, p, &fakeWatch{}, aei.RunSpec{ID: "run-v", Identity: aei.IdentityRequest{Subject: "u1"}})
 
 	srv := httptest.NewServer(p.Handler())
 	defer srv.Close()
