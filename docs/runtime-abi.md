@@ -260,6 +260,10 @@ one comparable number.
 `runtime_start − AEI_DISPATCHED_AT`, so an asynchronous pod cold-start (which the
 launcher cannot see) and a synchronous actor resume are measured the same way.
 
+A duration the runtime did not measure is **omitted**, not sent as `0`: the
+control plane treats an explicit `0` as a measurement (it counts in the
+`/metrics` histograms) and an omitted field as no sample.
+
 ---
 
 ## 4. Runtime-authoring rules → ABI mapping

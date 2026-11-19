@@ -655,23 +655,28 @@ func (p *Plane) handleAuthority(w http.ResponseWriter, _ *http.Request) {
 }
 
 // wireTiming is the /complete timing body (docs/runtime-abi.md §3), whose snake_case
-// JSON is the wire contract; it maps onto the domain aei.Timing.
+// JSON is the wire contract; it maps onto the domain aei.Timing. The durations are
+// pointers so an explicit 0 is kept apart from an omitted field (aei.Timing.Measured).
 type wireTiming struct {
-	ProvisioningSeconds float64 `json:"provisioning_seconds"`
-	RuntimeSeconds      float64 `json:"runtime_seconds"`
-	ModelSeconds        float64 `json:"model_seconds"`
-	ModelCalls          int     `json:"model_calls"`
-	ToolCalls           int     `json:"tool_calls"`
+	ProvisioningSeconds *float64 `json:"provisioning_seconds"`
+	RuntimeSeconds      *float64 `json:"runtime_seconds"`
+	ModelSeconds        *float64 `json:"model_seconds"`
+	ModelCalls          int      `json:"model_calls"`
+	ToolCalls           int      `json:"tool_calls"`
 }
 
 func (t wireTiming) toAEI() aei.Timing {
-	return aei.Timing{
-		ProvisioningSeconds: t.ProvisioningSeconds,
-		RuntimeSeconds:      t.RuntimeSeconds,
-		ModelSeconds:        t.ModelSeconds,
-		ModelCalls:          t.ModelCalls,
-		ToolCalls:           t.ToolCalls,
+	out := aei.Timing{ModelCalls: t.ModelCalls, ToolCalls: t.ToolCalls}
+	set := func(v *float64, dst *float64, stage aei.TimingStages) {
+		if v != nil {
+			*dst = *v
+			out.Measured |= stage
+		}
 	}
+	set(t.ProvisioningSeconds, &out.ProvisioningSeconds, aei.StageProvisioning)
+	set(t.RuntimeSeconds, &out.RuntimeSeconds, aei.StageRuntime)
+	set(t.ModelSeconds, &out.ModelSeconds, aei.StageModel)
+	return out
 }
 
 func (p *Plane) handleComplete(w http.ResponseWriter, r *http.Request) {

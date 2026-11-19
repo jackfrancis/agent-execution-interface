@@ -133,12 +133,42 @@ func TestSubmitObservesCallbackCountsAndProvider(t *testing.T) {
 		t.Fatalf("expected exactly one observation, got %d", len(got))
 	}
 	o := got[0]
-	want := aei.Timing{ProvisioningSeconds: 1.5, RuntimeSeconds: 6, ModelSeconds: 4, ModelCalls: 3, ToolCalls: 7}
+	want := aei.Timing{ProvisioningSeconds: 1.5, RuntimeSeconds: 6, ModelSeconds: 4, ModelCalls: 3, ToolCalls: 7,
+		Measured: aei.StageProvisioning | aei.StageRuntime | aei.StageModel}
 	if o.Phase != phaseSucceeded || o.Provider != "fake" || o.Timing != want {
 		t.Errorf("observed %+v, want Succeeded, provider fake, timing %+v", o, want)
 	}
 	if o.Duration < 20*time.Millisecond || o.Duration > 5*time.Second {
 		t.Errorf("measured duration = %v, want at least 20ms and under the deadline", o.Duration)
+	}
+}
+
+// The /complete decoder keeps which durations the runtime sent: an explicit 0 is
+// measured, an omitted field is not.
+func TestCompleteKeepsDurationPresence(t *testing.T) {
+	obs := &captureObserver{}
+	p := New(Config{Secret: []byte("k"), Observer: obs})
+	srv := httptest.NewServer(p.Handler())
+	defer srv.Close()
+
+	fa := &fakeAsync{dispatched: make(chan aei.Credential, 1)}
+	runID, err := p.Submit(context.Background(), fa, aei.RunSpec{TaskRef: "t", Deadline: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := <-fa.dispatched
+	resp := post(t, srv.URL+"/aei/v1alpha1/complete", cred.Value, map[string]any{
+		"run_id": runID,
+		"timing": map[string]any{"provisioning_seconds": 0, "runtime_seconds": 3, "model_calls": 2},
+	})
+	resp.Body.Close()
+
+	got := obs.waitObserved(t, 1)[0].Timing
+	if want := aei.StageProvisioning | aei.StageRuntime; got.Measured != want {
+		t.Errorf("Measured = %b, want provisioning|runtime (%b)", got.Measured, want)
+	}
+	if got.ModelCalls != 2 || got.RuntimeSeconds != 3 {
+		t.Errorf("timing = %+v, want runtime 3, model calls 2", got)
 	}
 }
 

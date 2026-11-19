@@ -23,11 +23,12 @@ func TestCollectorRecordsAndExposes(t *testing.T) {
 	c := New()
 	c.ObserveRun(control.RunObservation{
 		TaskRef: "github-converse", Phase: "Succeeded", Provider: "k8s-job", Duration: 11 * time.Second,
-		Timing: aei.Timing{ProvisioningSeconds: 2, RuntimeSeconds: 8, ModelSeconds: 5, ModelCalls: 3, ToolCalls: 4},
+		Timing: aei.Timing{ProvisioningSeconds: 2, RuntimeSeconds: 8, ModelSeconds: 5, ModelCalls: 3, ToolCalls: 4,
+			Measured: aei.StageProvisioning | aei.StageRuntime | aei.StageModel},
 	})
 	c.ObserveRun(control.RunObservation{
 		TaskRef: "github-converse", Phase: "Failed", Provider: "k8s-job", Duration: 3 * time.Second,
-		Timing: aei.Timing{ProvisioningSeconds: 1, RuntimeSeconds: 1},
+		Timing: aei.Timing{ProvisioningSeconds: 1, RuntimeSeconds: 1, Measured: aei.StageProvisioning | aei.StageRuntime},
 	})
 
 	body := scrape(t, c.Handler())
@@ -102,7 +103,7 @@ func TestCollectorIgnoresNegativeCounts(t *testing.T) {
 	c := New()
 	c.ObserveRun(control.RunObservation{
 		TaskRef: "github-review", Phase: "Succeeded", Provider: "k8s-job", Duration: 4 * time.Second,
-		Timing: aei.Timing{ModelSeconds: 2, ModelCalls: -1, ToolCalls: -5},
+		Timing: aei.Timing{ModelSeconds: 2, ModelCalls: -1, ToolCalls: -5, Measured: aei.StageModel},
 	})
 	f := gather(t, c)
 	l := map[string]string{"task_ref": "github-review", "phase": "Succeeded", "provider": "k8s-job"}
@@ -117,6 +118,36 @@ func TestCollectorIgnoresNegativeCounts(t *testing.T) {
 	if got, _ := f.value("aei_run_duration_seconds", withStage(l, "model")); got != 2 {
 		t.Errorf("model = %v, want 2", got)
 	}
+}
+
+// A measured zero is a sample; an omitted stage is not. Two reports with
+// provisioning 0s and 2s average 1s, and a third that omits provisioning does not
+// change that.
+func TestCollectorKeepsMeasuredZero(t *testing.T) {
+	c := New()
+	for _, tm := range []aei.Timing{
+		{ProvisioningSeconds: 0, Measured: aei.StageProvisioning},
+		{ProvisioningSeconds: 2, Measured: aei.StageProvisioning},
+		{RuntimeSeconds: 5, Measured: aei.StageRuntime},
+	} {
+		c.ObserveRun(control.RunObservation{TaskRef: "t", Phase: "Succeeded", Provider: "p", Duration: time.Second, Timing: tm})
+	}
+	l := map[string]string{"task_ref": "t", "phase": "Succeeded", "provider": "p", "stage": "provisioning"}
+	mf := gather(t, c)["aei_run_duration_seconds"]
+	for _, m := range mf.GetMetric() {
+		got := map[string]string{}
+		for _, lp := range m.GetLabel() {
+			got[lp.GetName()] = lp.GetValue()
+		}
+		if got["stage"] != l["stage"] {
+			continue
+		}
+		if h := m.GetHistogram(); h.GetSampleCount() != 2 || h.GetSampleSum() != 2 {
+			t.Errorf("provisioning count=%d sum=%v, want count 2 sum 2", h.GetSampleCount(), h.GetSampleSum())
+		}
+		return
+	}
+	t.Fatal("no provisioning series")
 }
 
 func withStage(l map[string]string, stage string) map[string]string {

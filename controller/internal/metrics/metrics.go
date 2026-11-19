@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/jackfrancis/agent-execution-interface/aei"
 	"github.com/jackfrancis/agent-execution-interface/control"
 )
 
@@ -77,12 +78,12 @@ func New() *Collector {
 // ObserveRun records one run's terminal outcome (control.Observer). It is safe for
 // concurrent use. Stage "total" is the controller-measured wall-clock, the
 // headline "how long did the run take" series; it is recorded for every observed
-// run, including one ended by the watch or the deadline. Every field of the
-// runtime's timing report is optional (docs/runtime-abi.md §3), so each reported
-// stage is recorded only when its value is positive: a run that did not report a
-// stage does not drag it toward zero. The call counters are created for every run
-// and grow only by a positive count; a negative count (a malformed report) is
-// ignored rather than passed to Counter.Add, which would panic.
+// run, including one ended by the watch or the deadline. Every duration in the
+// runtime's report is optional (docs/runtime-abi.md §3), so each reported stage is
+// recorded only when the report carried it (aei.Timing.Measured): an omitted stage
+// adds no sample, while a measured zero does. The call counters are created for
+// every run and grow only by a positive count; a negative count (a malformed
+// report) is ignored rather than passed to Counter.Add, which would panic.
 func (c *Collector) ObserveRun(o control.RunObservation) {
 	taskRef, provider := o.TaskRef, o.Provider
 	if taskRef == "" {
@@ -92,15 +93,24 @@ func (c *Collector) ObserveRun(o control.RunObservation) {
 		provider = "unknown"
 	}
 	c.runs.WithLabelValues(taskRef, o.Phase, provider).Inc()
-	stage := func(name string, seconds float64) {
-		if seconds > 0 {
-			c.duration.WithLabelValues(taskRef, o.Phase, provider, name).Observe(seconds)
+	observe := func(name string, seconds float64) {
+		c.duration.WithLabelValues(taskRef, o.Phase, provider, name).Observe(seconds)
+	}
+	observe("total", o.Duration.Seconds())
+	t := o.Timing
+	for _, s := range []struct {
+		name    string
+		stage   aei.TimingStages
+		seconds float64
+	}{
+		{"provisioning", aei.StageProvisioning, t.ProvisioningSeconds},
+		{"runtime", aei.StageRuntime, t.RuntimeSeconds},
+		{"model", aei.StageModel, t.ModelSeconds},
+	} {
+		if t.Measured.Has(s.stage) {
+			observe(s.name, s.seconds)
 		}
 	}
-	stage("total", o.Duration.Seconds())
-	stage("provisioning", o.Timing.ProvisioningSeconds)
-	stage("runtime", o.Timing.RuntimeSeconds)
-	stage("model", o.Timing.ModelSeconds)
 
 	count := func(v *prometheus.CounterVec, n int) {
 		ctr := v.WithLabelValues(taskRef, o.Phase, provider)
