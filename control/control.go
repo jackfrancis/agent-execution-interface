@@ -102,8 +102,8 @@ type Observer interface {
 type RunObservation struct {
 	TaskRef string // the app's task, e.g. "github-converse"; may be empty
 	Phase   string // terminal phase: "Succeeded" or "Failed"
-	// Provider is the provider that placed the run, from its Handle (e.g. "k8s-job").
-	// Empty when the provider did not report one.
+	// Provider is the provider that placed the run, from its Handle (e.g. "k8s-job"),
+	// or else the one the caller named with WithProvider. Empty when neither did.
 	Provider string
 	// Duration is the run's wall-clock as the controller measured it: from the start
 	// of dispatch to the terminal signal (the runtime's callback, the provider's
@@ -283,9 +283,13 @@ type RunState struct {
 // callback raced against the provider's Await and the deadline) is recorded into
 // the in-memory run store and read back with Status. This is the scalable app
 // path — one call per run, no per-run object (docs/dispatch-plane.md).
-func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpec) (string, error) {
+func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpec, opts ...SubmitOption) (string, error) {
 	if launcher == nil {
 		return "", errors.New("control: no launcher")
+	}
+	var o submitOptions
+	for _, opt := range opts {
+		opt(&o)
 	}
 	if spec.ID == "" {
 		spec.ID = randID()
@@ -306,10 +310,28 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 		}
 		start := time.Now()
 		res, h := p.race(ctx, launcher, spec, cred, done)
+		if h.Provider == "" {
+			h.Provider = o.provider
+		}
 		p.observe(spec, h, res, time.Since(start))
 		p.finishRun(spec.ID, res)
 	}()
 	return spec.ID, nil
+}
+
+// SubmitOption configures one Submit call.
+type SubmitOption func(*submitOptions)
+
+type submitOptions struct {
+	provider string
+}
+
+// WithProvider names the provider the caller resolved for the run (e.g. the
+// provider class's driver, "k8s-job"). It attributes the run's metrics when the
+// provider's Handle does not name it — notably when a synchronous Launch has not
+// returned yet because the runtime's /complete callback won the race.
+func WithProvider(name string) SubmitOption {
+	return func(o *submitOptions) { o.provider = name }
 }
 
 // observe reports a run's terminal outcome to the metrics Observer (the metrics

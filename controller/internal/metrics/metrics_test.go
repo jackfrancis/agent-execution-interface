@@ -68,6 +68,65 @@ func TestCollectorUnreportedRunRecordsTotalOnly(t *testing.T) {
 	}
 }
 
+// Every timing field is optional: a report with call counts but no model time
+// counts the calls without a zero-second model observation, and a report with no
+// stage times records only the controller's total.
+func TestCollectorRecordsOnlyReportedStages(t *testing.T) {
+	c := New()
+	c.ObserveRun(control.RunObservation{
+		TaskRef: "github-review", Phase: "Succeeded", Provider: "k8s-job", Duration: 4 * time.Second,
+		Timing: aei.Timing{ModelCalls: 3, ToolCalls: 2},
+	})
+	f := gather(t, c)
+	l := map[string]string{"task_ref": "github-review", "phase": "Succeeded", "provider": "k8s-job"}
+	if got, _ := f.value("aei_run_model_calls_total", l); got != 3 {
+		t.Errorf("model calls = %v, want 3", got)
+	}
+	if got, _ := f.value("aei_run_tool_calls_total", l); got != 2 {
+		t.Errorf("tool calls = %v, want 2", got)
+	}
+	for _, s := range []string{"provisioning", "runtime", "model"} {
+		if _, ok := f.value("aei_run_duration_seconds", withStage(l, s)); ok {
+			t.Errorf("stage %q recorded without a reported value", s)
+		}
+	}
+	if got, _ := f.value("aei_run_duration_seconds", withStage(l, "total")); got != 4 {
+		t.Errorf("total = %v, want 4", got)
+	}
+}
+
+// A malformed report with negative counts must not panic the controller (the
+// observer runs on Submit's goroutine and Counter.Add panics on a negative value);
+// the run and the rest of its report are still recorded.
+func TestCollectorIgnoresNegativeCounts(t *testing.T) {
+	c := New()
+	c.ObserveRun(control.RunObservation{
+		TaskRef: "github-review", Phase: "Succeeded", Provider: "k8s-job", Duration: 4 * time.Second,
+		Timing: aei.Timing{ModelSeconds: 2, ModelCalls: -1, ToolCalls: -5},
+	})
+	f := gather(t, c)
+	l := map[string]string{"task_ref": "github-review", "phase": "Succeeded", "provider": "k8s-job"}
+	if got, _ := f.value("aei_runs_total", l); got != 1 {
+		t.Errorf("runs = %v, want 1", got)
+	}
+	for _, name := range []string{"aei_run_model_calls_total", "aei_run_tool_calls_total"} {
+		if got, ok := f.value(name, l); !ok || got != 0 {
+			t.Errorf("%s = %v (present %v), want 0", name, got, ok)
+		}
+	}
+	if got, _ := f.value("aei_run_duration_seconds", withStage(l, "model")); got != 2 {
+		t.Errorf("model = %v, want 2", got)
+	}
+}
+
+func withStage(l map[string]string, stage string) map[string]string {
+	out := map[string]string{"stage": stage}
+	for k, v := range l {
+		out[k] = v
+	}
+	return out
+}
+
 // An empty taskRef or provider is labeled "unknown" rather than dropped, so the
 // run still shows up.
 func TestCollectorDefaultsLabels(t *testing.T) {
@@ -115,13 +174,13 @@ func TestPlaneToMetrics(t *testing.T) {
 		return map[string]string{"task_ref": task, "phase": phase, "provider": "fake"}
 	}
 	stage := func(task, phase, s string) map[string]string {
-		l := labels(task, phase)
-		l["stage"] = s
-		return l
+		return withStage(labels(task, phase), s)
 	}
+	// ObserveRun writes its series one after another, so wait for the last one each
+	// run writes that the assertions read, not just its run counter.
 	mf := waitFor(t, c, func(mf families) bool {
-		_, a := mf.value("aei_runs_total", labels("github-review", "Succeeded"))
-		_, b := mf.value("aei_runs_total", labels("github-review-timeout", "Failed"))
+		_, a := mf.value("aei_run_tool_calls_total", labels("github-review", "Succeeded"))
+		_, b := mf.value("aei_run_duration_seconds", stage("github-review-timeout", "Failed", "total"))
 		return a && b
 	})
 

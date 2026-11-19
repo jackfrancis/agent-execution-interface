@@ -441,14 +441,17 @@ cold-start (asynchronous, after dispatch returns) and an actor resume
 cannot be compared. (The reference implementation measures this by stamping a
 dispatch timestamp the runtime reports back.)
 
-The controller exports these at `/metrics`, every series labeled by `task_ref`,
-`phase`, and `provider`: `aei_runs_total`; `aei_run_duration_seconds` by
-`stage`, where `total` is the run's wall-clock as the controller measured it
-(recorded for every run, including one ended by the watch or the deadline) and
-`provisioning`, `runtime`, and `model` are the runtime's report (recorded only
-when the run carried one); and `aei_run_model_calls_total` /
-`aei_run_tool_calls_total`. Time waiting for the provider is the `provisioning`
-stage; time in the model is the `model` stage.
+The controller exports these at `/metrics` for runs submitted through the data
+plane (the dispatch API, `Plane.Submit`); declarative `AgentRun` resources, which
+the reconciler runs through `Plane.Run`, report their timing in
+`AgentRun.status.timing` and do not appear in these series. Every series is
+labeled by `task_ref`, `phase`, and `provider`: `aei_runs_total`;
+`aei_run_duration_seconds` by `stage`, where `total` is the run's wall-clock as
+the controller measured it (recorded for every submitted run, including one
+ended by the watch or the deadline) and `provisioning`, `runtime`, and `model`
+are the runtime's report (each recorded only when the run reported it); and
+`aei_run_model_calls_total` / `aei_run_tool_calls_total`. Time waiting for the
+provider is the `provisioning` stage; time in the model is the `model` stage.
 
 ---
 

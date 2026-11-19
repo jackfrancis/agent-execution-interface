@@ -155,7 +155,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		},
 		Deadline: time.Duration(req.TimeoutSeconds) * time.Second,
 	}
-	runID, err := h.plane.Submit(r.Context(), launcher, spec)
+	runID, err := h.plane.Submit(r.Context(), launcher, spec, control.WithProvider(class.Spec.Provider))
 	if err != nil {
 		http.Error(w, "dispatch failed", http.StatusInternalServerError)
 		return

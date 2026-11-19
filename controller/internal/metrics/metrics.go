@@ -12,7 +12,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/jackfrancis/agent-execution-interface/aei"
 	"github.com/jackfrancis/agent-execution-interface/control"
 )
 
@@ -52,7 +51,7 @@ func New() *Collector {
 			Name: "aei_run_duration_seconds",
 			Help: "AEI run timing in seconds, by task, phase, provider, and stage. " +
 				"stage=total is the controller-measured wall-clock from dispatch to the terminal signal, recorded for every run; " +
-				"provisioning (waiting for the provider to start the runtime), runtime, and model are the runtime's report, recorded only when the run carried one.",
+				"provisioning (waiting for the provider to start the runtime), runtime, and model are the runtime's report, each recorded only when reported.",
 			Buckets: durationBuckets,
 		}, append(append([]string(nil), runLabels...), "stage")),
 		modelCalls: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -77,11 +76,13 @@ func New() *Collector {
 
 // ObserveRun records one run's terminal outcome (control.Observer). It is safe for
 // concurrent use. Stage "total" is the controller-measured wall-clock, the
-// headline "how long did the run take" series; it is recorded for every run,
-// including one ended by the watch or the deadline. The runtime-reported stages
-// are recorded only when the run carried a timing report, so a run that ended
-// without one does not drag them toward zero. The model stage is optional within
-// a report and is recorded only when the runtime measured it.
+// headline "how long did the run take" series; it is recorded for every observed
+// run, including one ended by the watch or the deadline. Every field of the
+// runtime's timing report is optional (docs/runtime-abi.md §3), so each reported
+// stage is recorded only when its value is positive: a run that did not report a
+// stage does not drag it toward zero. The call counters are created for every run
+// and grow only by a positive count; a negative count (a malformed report) is
+// ignored rather than passed to Counter.Add, which would panic.
 func (c *Collector) ObserveRun(o control.RunObservation) {
 	taskRef, provider := o.TaskRef, o.Provider
 	if taskRef == "" {
@@ -92,21 +93,23 @@ func (c *Collector) ObserveRun(o control.RunObservation) {
 	}
 	c.runs.WithLabelValues(taskRef, o.Phase, provider).Inc()
 	stage := func(name string, seconds float64) {
-		c.duration.WithLabelValues(taskRef, o.Phase, provider, name).Observe(seconds)
+		if seconds > 0 {
+			c.duration.WithLabelValues(taskRef, o.Phase, provider, name).Observe(seconds)
+		}
 	}
 	stage("total", o.Duration.Seconds())
+	stage("provisioning", o.Timing.ProvisioningSeconds)
+	stage("runtime", o.Timing.RuntimeSeconds)
+	stage("model", o.Timing.ModelSeconds)
 
-	t := o.Timing
-	if t == (aei.Timing{}) {
-		return // the run ended without a timing report
+	count := func(v *prometheus.CounterVec, n int) {
+		ctr := v.WithLabelValues(taskRef, o.Phase, provider)
+		if n > 0 {
+			ctr.Add(float64(n))
+		}
 	}
-	stage("provisioning", t.ProvisioningSeconds)
-	stage("runtime", t.RuntimeSeconds)
-	if t.ModelSeconds > 0 || t.ModelCalls > 0 {
-		stage("model", t.ModelSeconds)
-	}
-	c.modelCalls.WithLabelValues(taskRef, o.Phase, provider).Add(float64(t.ModelCalls))
-	c.toolCalls.WithLabelValues(taskRef, o.Phase, provider).Add(float64(t.ToolCalls))
+	count(c.modelCalls, o.Timing.ModelCalls)
+	count(c.toolCalls, o.Timing.ToolCalls)
 }
 
 // Handler serves the collected metrics in the Prometheus text exposition format.

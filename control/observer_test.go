@@ -188,6 +188,61 @@ func TestSubmitObservesSyncProvider(t *testing.T) {
 	}
 }
 
+// A synchronous provider whose workload waits on its own /complete call has not
+// returned from Launch when the callback wins, so its Handle is not known; the run
+// is attributed to the provider the caller named with WithProvider. A provider
+// that does report itself in its Handle keeps that name over the fallback.
+func TestSubmitProviderFallbackWhenCallbackWins(t *testing.T) {
+	obs := &captureObserver{}
+	p := New(Config{Secret: []byte("k"), Observer: obs})
+	srv := httptest.NewServer(p.Handler())
+	defer srv.Close()
+
+	bl := &blockingSync{dispatched: make(chan aei.Credential, 1), release: make(chan struct{})}
+	defer close(bl.release)
+	runID, err := p.Submit(context.Background(), bl, aei.RunSpec{TaskRef: "t", Deadline: 5 * time.Second}, WithProvider("k8s-job"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := <-bl.dispatched
+	resp := post(t, srv.URL+"/aei/v1alpha1/complete", cred.Value, map[string]any{"run_id": runID})
+	resp.Body.Close()
+
+	got := obs.waitObserved(t, 1)
+	if got[0].Provider != "k8s-job" || got[0].Phase != phaseSucceeded {
+		t.Fatalf("observed %+v, want Succeeded attributed to k8s-job", got[0])
+	}
+
+	// The Handle's own name wins over the fallback.
+	fa := &fakeAsync{dispatched: make(chan aei.Credential, 1)}
+	runID, err = p.Submit(context.Background(), fa, aei.RunSpec{TaskRef: "t", Deadline: 5 * time.Second}, WithProvider("other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred = <-fa.dispatched
+	resp = post(t, srv.URL+"/aei/v1alpha1/complete", cred.Value, map[string]any{"run_id": runID})
+	resp.Body.Close()
+	if got := obs.waitObserved(t, 2); got[1].Provider != "fake" {
+		t.Fatalf("observed provider %q, want the Handle's fake", got[1].Provider)
+	}
+}
+
+// blockingSync is a synchronous Launcher whose Launch does not return until the
+// test releases it, like a provider that waits for its workload to exit.
+type blockingSync struct {
+	dispatched chan aei.Credential
+	release    chan struct{}
+}
+
+func (b *blockingSync) Launch(ctx context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
+	b.dispatched <- cred
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+	}
+	return aei.Handle{Provider: "sync-blocked", Ref: spec.ID}, nil
+}
+
 // fakeSync is a plain (synchronous) Launcher that returns at once.
 type fakeSync struct{}
 
