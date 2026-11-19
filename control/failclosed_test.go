@@ -172,7 +172,7 @@ func TestRedeemFailsRunWhenMintFails(t *testing.T) {
 // symptom when redemption fails.
 type redeemingDispatcher struct {
 	fakeWatch
-	p *Plane
+	p *Plane // the replica the runtime's /redeem lands on
 }
 
 func (redeemingDispatcher) PullsCredential() bool { return true }
@@ -200,6 +200,40 @@ func TestRedeemDuringDispatchKeepsSigningError(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		st, _ := p2.Status(id)
+		if st.Phase == phaseFailed {
+			if !strings.Contains(st.Err, "signing key unavailable") {
+				t.Fatalf("status err = %q; want the signing error", st.Err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run never failed: %+v", st)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// With replicas > 1 the runtime's /redeem can land on another replica, which
+// records the failure in the shared Store but cannot wake the dispatching
+// replica's waiter. The dispatcher still reports the signing error, not the
+// provider's "redeem status 500".
+func TestRedeemOnAnotherReplicaKeepsSigningError(t *testing.T) {
+	shared := newMemStore()
+	dispatcher := New(Config{Authority: failingAuthority{}, Store: shared})
+	receiver := New(Config{Authority: failingAuthority{}, Store: shared})
+
+	res, err := dispatcher.Run(context.Background(), &redeemingDispatcher{p: receiver}, aei.RunSpec{ID: "run-ha-sign"})
+	if err == nil || !strings.Contains(err.Error(), "signing key unavailable") {
+		t.Fatalf("Run err = %v; want the signing error", err)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "signing key unavailable") {
+		t.Fatalf("Run result err = %v; want the signing error", res.Err)
+	}
+
+	id, _ := dispatcher.Submit(context.Background(), &redeemingDispatcher{p: receiver}, aei.RunSpec{ID: "run-ha-sign2"})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		st, _ := dispatcher.Status(id)
 		if st.Phase == phaseFailed {
 			if !strings.Contains(st.Err, "signing key unavailable") {
 				t.Fatalf("status err = %q; want the signing error", st.Err)

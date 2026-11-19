@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
-# authority.sh provisions AEI's platform Ed25519 run-credential signing keypair in
-# the aei-signing secret, or reuses the one already there (`make authority` runs it;
-# docs/design.md, Contract 3). The controller refuses to start without a key, so
-# `make deploy` and `make dev-up` run this before they apply the controller.
+# authority.sh manages AEI's platform Ed25519 run-credential signing key (docs/
+# design.md, Contract 3). `make authority` runs it; `make deploy` and `make dev-up`
+# run its two steps around applying the controller:
 #
-# It never replaces a key. Verify-only apps (e.g. gofer's web tier) hold the public
-# half from their own deploy, so a silently swapped key would make them reject every
-# new run credential. Hence:
+#   authority.sh provision   create the key in the aei-signing secret, or reuse it
+#   authority.sh activate    roll the controller onto that key and wait for it
+#   authority.sh             both (the default)
+#
+# provision never replaces a key. Verify-only apps (e.g. gofer's web tier) hold the
+# public half from their own deploy, so a silently swapped key would make them
+# reject every new run credential. Hence:
 #   * Only a NotFound read means "no secret". Any other read failure stops.
 #   * A secret without a key is filled by a merge patch carrying the resourceVersion
 #     it was read at, so a concurrent writer turns the patch into a Conflict instead
-#     of being overwritten; on Conflict (or AlreadyExists for a create) it re-reads,
+#     of being overwritten. On Conflict (or AlreadyExists for a create) it re-reads,
 #     and a key someone else just wrote is reused.
-#   * When it creates a key for a controller that is already running, it restarts
-#     the controller and waits for the rollout before calling the key active.
+#
+# activate records the public key on the controller's pod template (annotation
+# agents.x-k8s.io/signing-public-key). A template without that exact key is patched,
+# which rolls the controller; either way it waits for the rollout to finish before
+# calling the key active. So a run interrupted after provisioning (a failed patch,
+# a rollout that timed out) finishes activation on the next run instead of
+# reporting success while the old pod still signs with something else. With no
+# controller yet, there is nothing to roll: it starts with the key.
 #
 # Env: KUBECTL (command plus flags, word-split; default "kubectl"), GENKEY (default
 # "go run ./hack/genkey"), ROLLOUT_TIMEOUT (default 180s).
@@ -25,6 +34,8 @@ ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-180s}
 NS=aei-system
 NAME=aei-signing
 DEPLOY=deploy/aei-controller
+ANNOTATION=agents.x-k8s.io/signing-public-key
+ANNOTATION_JSONPATH='{.spec.template.metadata.annotations.agents\.x-k8s\.io/signing-public-key}'
 ATTEMPTS=5
 
 # KUBECTL is deliberately unquoted: it carries --context/--kubeconfig flags.
@@ -45,52 +56,74 @@ gen() {
 	[ -n "$priv" ] && [ -n "$pub" ] || die "key generation printed no keypair"
 }
 
-provisioned=""
-for attempt in $(seq 1 "$ATTEMPTS"); do
-	if out=$(k get secret "$NAME" -o 'jsonpath={.metadata.resourceVersion} {.data.AEI_ED25519_PRIVATE_KEY}' 2>"$errf"); then
-		rv=${out%% *}
-		have=${out#* }
-		if [ -n "$have" ]; then
-			echo "platform Ed25519 authority already provisioned; reusing it (make public-key to read it)"
-			exit 0
+provision() {
+	local attempt out rv have
+	for attempt in $(seq 1 "$ATTEMPTS"); do
+		if out=$(k get secret "$NAME" -o 'jsonpath={.metadata.resourceVersion} {.data.AEI_ED25519_PRIVATE_KEY}' 2>"$errf"); then
+			rv=${out%% *}
+			have=${out#* }
+			if [ -n "$have" ]; then
+				echo "platform Ed25519 authority already provisioned; reusing it"
+				return 0
+			fi
+			[ -n "$rv" ] || die "secret $NAME has no resourceVersion; refusing an unconditional write"
+			gen
+			# The private key reaches kubectl on stdin (printf is a builtin), never argv.
+			if printf '{"metadata":{"resourceVersion":"%s"},"stringData":{"AEI_ED25519_PRIVATE_KEY":"%s","AEI_ED25519_PUBLIC_KEY":"%s"}}' \
+				"$rv" "$priv" "$pub" | k patch secret "$NAME" --type=merge --patch-file=/dev/stdin >/dev/null 2>"$errf"; then
+				echo "generated a platform Ed25519 keypair into secret $NAME"
+				return 0
+			fi
+			grep -q '(Conflict)\|the object has been modified' "$errf" ||
+				die "cannot add the key to secret $NAME: $(lasterr)"
+			echo "secret $NAME changed while provisioning (attempt $attempt); re-reading"
+		else
+			grep -q '(NotFound)' "$errf" ||
+				die "cannot read secret $NAME, so not treating it as missing: $(lasterr)"
+			gen
+			if printf 'AEI_ED25519_PRIVATE_KEY=%s\nAEI_ED25519_PUBLIC_KEY=%s\n' "$priv" "$pub" |
+				k create secret generic "$NAME" --from-env-file=/dev/stdin >/dev/null 2>"$errf"; then
+				echo "generated a platform Ed25519 keypair into new secret $NAME"
+				return 0
+			fi
+			# The API's AlreadyExists reaches us as kubectl's client message:
+			#   error: failed to create secret secrets "aei-signing" already exists
+			grep -q '(AlreadyExists)\|already exists' "$errf" ||
+				die "cannot create secret $NAME: $(lasterr)"
+			echo "secret $NAME appeared while provisioning (attempt $attempt); re-reading"
 		fi
-		[ -n "$rv" ] || die "secret $NAME has no resourceVersion; refusing an unconditional write"
-		gen
-		# The private key reaches kubectl on stdin (printf is a builtin), never argv.
-		if printf '{"metadata":{"resourceVersion":"%s"},"stringData":{"AEI_ED25519_PRIVATE_KEY":"%s","AEI_ED25519_PUBLIC_KEY":"%s"}}' \
-			"$rv" "$priv" "$pub" | k patch secret "$NAME" --type=merge --patch-file=/dev/stdin >/dev/null 2>"$errf"; then
-			provisioned=1
-			break
-		fi
-		grep -q '(Conflict)\|the object has been modified' "$errf" ||
-			die "cannot add the key to secret $NAME: $(lasterr)"
-		echo "secret $NAME changed while provisioning (attempt $attempt); re-reading"
-	else
-		grep -q '(NotFound)' "$errf" ||
-			die "cannot read secret $NAME, so not treating it as missing: $(lasterr)"
-		gen
-		if printf 'AEI_ED25519_PRIVATE_KEY=%s\nAEI_ED25519_PUBLIC_KEY=%s\n' "$priv" "$pub" |
-			k create secret generic "$NAME" --from-env-file=/dev/stdin >/dev/null 2>"$errf"; then
-			provisioned=1
-			break
-		fi
-		grep -q '(AlreadyExists)' "$errf" ||
-			die "cannot create secret $NAME: $(lasterr)"
-		echo "secret $NAME appeared while provisioning (attempt $attempt); re-reading"
-	fi
-done
-[ -n "$provisioned" ] || die "secret $NAME kept changing; gave up after $ATTEMPTS attempts"
+	done
+	die "secret $NAME kept changing; gave up after $ATTEMPTS attempts"
+}
 
-if k get "$DEPLOY" >/dev/null 2>"$errf"; then
-	echo "rolling the controller onto the new key..."
-	k rollout restart "$DEPLOY" >/dev/null 2>"$errf" ||
-		die "key provisioned but NOT active: restarting the controller failed: $(lasterr)"
+activate() {
+	local b64 key cur
+	b64=$(k get secret "$NAME" -o 'jsonpath={.data.AEI_ED25519_PUBLIC_KEY}' 2>"$errf") ||
+		die "cannot read secret $NAME: $(lasterr)"
+	key=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
+	[ -n "$key" ] || die "secret $NAME has no AEI_ED25519_PUBLIC_KEY; run: make authority"
+	if ! cur=$(k get "$DEPLOY" -o "jsonpath=$ANNOTATION_JSONPATH" 2>"$errf"); then
+		grep -q '(NotFound)' "$errf" ||
+			die "cannot read $DEPLOY, so the key is NOT known to be active: $(lasterr)"
+		echo "no controller yet; it starts with this key. app verify key (also at GET /aei/v1alpha1/authority once it is up):"
+		echo "  $key"
+		return 0
+	fi
+	if [ "$cur" != "$key" ]; then
+		echo "rolling the controller onto the signing key..."
+		printf '{"spec":{"template":{"metadata":{"annotations":{"%s":"%s"}}}}}' "$ANNOTATION" "$key" |
+			k patch "$DEPLOY" --type=merge --patch-file=/dev/stdin >/dev/null 2>"$errf" ||
+			die "key NOT active: cannot roll the controller onto it: $(lasterr)"
+	fi
 	k rollout status "$DEPLOY" --timeout="$ROLLOUT_TIMEOUT" ||
-		die "key provisioned but NOT active: the controller did not become ready on it (check: kubectl -n $NS get pods)"
-	echo "provisioned and active. app verify key (also at GET /aei/v1alpha1/authority):"
-else
-	grep -q '(NotFound)' "$errf" ||
-		die "key provisioned, but cannot read $DEPLOY to roll it: $(lasterr)"
-	echo "provisioned; the controller starts with it. app verify key (also at GET /aei/v1alpha1/authority once it is up):"
-fi
-echo "  $pub"
+		die "key NOT active: the controller did not become ready on it (check: kubectl -n $NS get pods)"
+	echo "signing key active. app verify key (also at GET /aei/v1alpha1/authority):"
+	echo "  $key"
+}
+
+case "${1:-all}" in
+provision) provision ;;
+activate) activate ;;
+all) provision && activate ;;
+*) die "usage: $0 [provision|activate|all]" ;;
+esac

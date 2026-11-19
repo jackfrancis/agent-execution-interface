@@ -245,7 +245,7 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 	if async, ok := launcher.(aei.AsyncLauncher); ok {
 		h, err := async.Dispatch(ctx, spec, cred)
 		if err != nil {
-			res := recorded(done, aei.Result{Err: err})
+			res := p.recorded(spec.ID, done, aei.Result{Err: err})
 			return res, res.Err
 		}
 		watch := make(chan aei.Result, 1)
@@ -270,7 +270,7 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 	case r := <-done:
 		return r, nil
 	case r := <-launch:
-		return recorded(done, r), nil
+		return p.recorded(spec.ID, done, r), nil
 	}
 }
 
@@ -404,7 +404,7 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 	if async, ok := launcher.(aei.AsyncLauncher); ok {
 		h, err := async.Dispatch(ctx, spec, cred)
 		if err != nil {
-			return recorded(done, aei.Result{Err: err}), h
+			return p.recorded(spec.ID, done, aei.Result{Err: err}), h
 		}
 		watch := make(chan aei.Result, 1)
 		go func() {
@@ -438,15 +438,18 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 			return r, aei.Handle{}
 		}
 	case l := <-launch:
-		return recorded(done, aei.Result{Err: l.err}), l.h
+		return p.recorded(spec.ID, done, aei.Result{Err: l.err}), l.h
 	}
 }
 
-// recorded prefers a terminal result already delivered on done over a provider
-// error. A runtime can fail its run while the provider is still dispatching — a
-// pull runtime whose /redeem hits a mint error, say — and the provider then
-// reports only the symptom ("redeem status 500"); the run should carry the cause.
-func recorded(done chan aei.Result, r aei.Result) aei.Result {
+// recorded prefers a terminal result the run already has over a provider error. A
+// runtime can fail its run while the provider is still dispatching — a pull runtime
+// whose /redeem hits a mint error, say — and the provider then reports only the
+// symptom ("redeem status 500"); the run should carry the cause. The outcome is
+// delivered on done when this replica served the runtime's call. When another
+// replica did (replicas > 1 behind one Service), it recorded the outcome in the
+// shared Store but could wake only its own waiters, so the Store is consulted too.
+func (p *Plane) recorded(runID string, done chan aei.Result, r aei.Result) aei.Result {
 	if r.Err == nil {
 		return r
 	}
@@ -454,8 +457,20 @@ func recorded(done chan aei.Result, r aei.Result) aei.Result {
 	case d := <-done:
 		return d
 	default:
-		return r
 	}
+	if st, ok := p.store.Run(runID); ok && st.Phase != phaseRunning {
+		return resultOf(st)
+	}
+	return r
+}
+
+// resultOf turns a recorded terminal RunState back into the Result it came from.
+func resultOf(st RunState) aei.Result {
+	res := aei.Result{ResultRef: st.ResultRef, Timing: st.Timing}
+	if st.Phase == phaseFailed {
+		res.Err = errors.New(st.Err)
+	}
+	return res
 }
 
 // --- completion registry (the callback/watch race) ---
