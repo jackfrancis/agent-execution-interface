@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	authnv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -161,7 +160,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			Scopes:   scopes,
 			Audience: app.Spec.Identity.Audience, // the app fixes the audience
 		},
-		Deadline: time.Duration(req.TimeoutSeconds) * time.Second,
+		Deadline: control.DeadlineFromSeconds(req.TimeoutSeconds),
 	}
 	runID, err := h.plane.Submit(r.Context(), launcher, spec, control.WithProvider(driver))
 	if err != nil {

@@ -32,7 +32,8 @@ const (
 // invariant (aei-sanity). It is the exact inverse of the runtime SDK's decoder.
 //
 // dispatchedAt stamps the dispatch-start for launcher-symmetric provisioning
-// timing; the absolute deadline is derived from it. Credential delivery follows
+// timing. The absolute deadline is spec.Cutoff: the plane's DeadlineAt when set,
+// else dispatchedAt plus Deadline. Credential delivery follows
 // cred.Kind: a Ticket rides AEI_RUN_TICKET (pull), anything else AEI_RUN_CREDENTIAL
 // (push). The broker URL is emitted only when it differs from the control URL
 // (B-with-default), and empty optional values are omitted so they cannot shadow a
@@ -52,8 +53,12 @@ func Injection(spec RunSpec, cred Credential, controlURL, brokerURL string, disp
 	}
 	if !dispatchedAt.IsZero() {
 		m[EnvDispatchedAt] = strconv.FormatInt(dispatchedAt.UnixMilli(), 10)
-		if spec.Deadline > 0 {
-			m[EnvDeadline] = strconv.FormatInt(dispatchedAt.Add(spec.Deadline).UnixMilli(), 10)
+	}
+	// The plane's explicit cutoff stands on its own; only the relative fallback
+	// (dispatchedAt + Deadline) needs the dispatch timestamp.
+	if !spec.DeadlineAt.IsZero() || !dispatchedAt.IsZero() {
+		if cutoff := spec.Cutoff(dispatchedAt); !cutoff.IsZero() {
+			m[EnvDeadline] = strconv.FormatInt(cutoff.UnixMilli(), 10)
 		}
 	}
 	if brokerURL != "" && brokerURL != controlURL {

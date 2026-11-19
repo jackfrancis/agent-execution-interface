@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -192,9 +193,17 @@ func (l *Launcher) Launch(ctx context.Context, spec aei.RunSpec, cred aei.Creden
 func (l *Launcher) job(spec aei.RunSpec, cred aei.Credential, dispatchedAt time.Time) *batchv1.Job {
 	backoff := int32(0)
 	ttl := defaultTTLAfterFinished
+	// activeDeadlineSeconds is the workload backstop for the plane's deadline:
+	// Kubernetes ends the Job at status.startTime + activeDeadlineSeconds. The Job
+	// starts no earlier than dispatchedAt, but startTime is stored at whole-second
+	// precision (rounded down), so the backstop is measured from the earliest
+	// representable start — dispatchedAt truncated to the second — and rounded up
+	// to whole seconds, at least 1 (0 would expire the Job at once). The plane
+	// enforces the exact deadline; the Job never ends before it.
 	var activeDeadline *int64
-	if spec.Deadline > 0 {
-		s := int64(spec.Deadline.Seconds())
+	if cutoff := spec.Cutoff(dispatchedAt); !cutoff.IsZero() {
+		earliestStart := dispatchedAt.Truncate(time.Second)
+		s := max(int64(math.Ceil(cutoff.Sub(earliestStart).Seconds())), 1)
 		activeDeadline = &s
 	}
 	ns, _ := runtimespec.Namespace(l.opts.Namespace, spec)
