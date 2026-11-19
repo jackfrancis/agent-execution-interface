@@ -272,6 +272,10 @@ Requirements this imposes on the standard:
   failed (`control.ErrDeadlineExceeded`) even if `Await` or `Launch` never
   returns. Every run has one — the plane applies a default when the caller sets
   none and caps a longer one (`control.Config.DefaultDeadline`, `MaxDeadline`).
+  The plane fixes the absolute cutoff before dispatch (`RunSpec.DeadlineAt`), and
+  providers derive `AEI_DEADLINE` and their workload backstops from it
+  (`RunSpec.Cutoff`), so provisioning time is spent from the budget rather than
+  added to it.
 - **"Done" is per-run, not per-workload.** For a durable runtime that keeps
   running, completion is a property of the *run*, not the termination of a
   workload — the callback carries the `runID`.

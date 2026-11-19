@@ -283,3 +283,15 @@ func TestTolerationsFromClassParameter(t *testing.T) {
 		t.Error("a malformed tolerations parameter must be an error")
 	}
 }
+
+// TestShutdownFollowsPlaneCutoff: the Sandbox's scheduled deletion is the plane's
+// cutoff plus grace, not dispatchedAt plus the full budget.
+func TestShutdownFollowsPlaneCutoff(t *testing.T) {
+	l := testLauncher()
+	cutoff := l.now().Add(40 * time.Second)
+	u := l.sandbox(aei.RunSpec{ID: "r", Deadline: time.Minute, DeadlineAt: cutoff}, aei.Credential{Value: "tok"}, l.now())
+	shutdown, _, _ := unstructured.NestedString(u.Object, "spec", "shutdownTime")
+	if want := cutoff.Add(shutdownGrace).UTC().Format(time.RFC3339); shutdown != want {
+		t.Errorf("spec.shutdownTime = %q, want %q (plane cutoff + grace)", shutdown, want)
+	}
+}

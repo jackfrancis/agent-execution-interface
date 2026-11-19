@@ -219,3 +219,28 @@ func TestTolerationsFromClassParameter(t *testing.T) {
 		t.Error("a malformed tolerations parameter must be an error")
 	}
 }
+
+// TestActiveDeadlineFollowsPlaneCutoff: the Job's activeDeadlineSeconds is the
+// budget left until the plane's cutoff, rounded up to whole seconds and never 0,
+// so the Job backstop never ends a run before the plane does.
+func TestActiveDeadlineFollowsPlaneCutoff(t *testing.T) {
+	l := testLauncher()
+	now := l.now()
+	for _, c := range []struct {
+		name string
+		spec aei.RunSpec
+		want int64
+	}{
+		{"sub-second budget rounds up to 1", aei.RunSpec{ID: "a", Deadline: 500 * time.Millisecond, DeadlineAt: now.Add(500 * time.Millisecond)}, 1},
+		{"fractional budget rounds up", aei.RunSpec{ID: "b", Deadline: 90 * time.Second, DeadlineAt: now.Add(2500 * time.Millisecond)}, 3},
+		{"provisioning time comes out of the budget", aei.RunSpec{ID: "c", Deadline: time.Minute, DeadlineAt: now.Add(40 * time.Second)}, 40},
+		{"cutoff already passed still gives 1", aei.RunSpec{ID: "d", Deadline: time.Second, DeadlineAt: now.Add(-time.Second)}, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			job := l.job(c.spec, aei.Credential{Value: "tok"}, now)
+			if got := job.Spec.ActiveDeadlineSeconds; got == nil || *got != c.want {
+				t.Errorf("activeDeadlineSeconds = %v, want %d", got, c.want)
+			}
+		})
+	}
+}

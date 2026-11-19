@@ -84,3 +84,15 @@ func TestInjectionPullUsesTicketAndBrokerSplit(t *testing.T) {
 		t.Error("no dispatchedAt ⇒ no absolute AEI_DEADLINE")
 	}
 }
+
+// TestInjectionUsesPlaneCutoff: when the control plane set DeadlineAt, AEI_DEADLINE
+// is that instant, not dispatchedAt plus the full budget — time spent provisioning
+// before the provider stamps dispatchedAt comes out of the run's budget.
+func TestInjectionUsesPlaneCutoff(t *testing.T) {
+	cutoff := time.UnixMilli(1789000040000) // 40s after the provider's dispatchedAt
+	spec := aei.RunSpec{ID: "r", Deadline: time.Minute, DeadlineAt: cutoff}
+	m := aei.Injection(spec, aei.Credential{Value: "tok"}, "http://cp", "", time.UnixMilli(1789000000000))
+	if got := m[aei.EnvDeadline]; got != "1789000040000" {
+		t.Errorf("AEI_DEADLINE = %q, want the plane's cutoff 1789000040000", got)
+	}
+}

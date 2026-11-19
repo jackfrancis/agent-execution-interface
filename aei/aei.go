@@ -68,6 +68,13 @@ type RunSpec struct {
 	// still terminates because Deadline bounds Await.
 	Deadline time.Duration
 
+	// DeadlineAt is the absolute cutoff the control plane enforces: the instant
+	// its timer for Deadline ends. The plane sets it before dispatch, so time a
+	// provider spends provisioning comes out of the run's budget instead of being
+	// added to it. A provider derives every deadline it hands on (AEI_DEADLINE, a
+	// workload backstop) from Cutoff, never from Deadline alone.
+	DeadlineAt time.Time
+
 	// Metadata is labels/annotations for observability. It is never semantic —
 	// nothing in AEI's behavior may depend on it.
 	Metadata map[string]string
@@ -213,4 +220,17 @@ type Warmer interface {
 type SessionWarmable interface {
 	Launcher
 	WarmsSession() bool
+}
+
+// Cutoff returns the run's absolute deadline: DeadlineAt when the control plane
+// set it, else from plus Deadline. It is the zero time when the run has neither.
+func (s RunSpec) Cutoff(from time.Time) time.Time {
+	switch {
+	case !s.DeadlineAt.IsZero():
+		return s.DeadlineAt
+	case s.Deadline > 0:
+		return from.Add(s.Deadline)
+	default:
+		return time.Time{}
+	}
 }

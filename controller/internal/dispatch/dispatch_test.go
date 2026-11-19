@@ -209,6 +209,35 @@ func TestDispatchWithoutTimeoutEndsAtDefault(t *testing.T) {
 	}
 }
 
+// TestDispatchOversizedTimeoutIsCapped: a timeoutSeconds too large for a
+// time.Duration saturates and is capped at the plane's maximum, rather than
+// wrapping to a deadline of a few hundred milliseconds.
+func TestDispatchOversizedTimeoutIsCapped(t *testing.T) {
+	srv := newTestServer(t) // default maximum: 1h
+	resp := do(t, http.MethodPost, srv.URL+"/aei/v1alpha1/dispatch", "pyfer", map[string]any{
+		"app":            "pyfer",
+		"taskRef":        "item://huge-timeout",
+		"timeoutSeconds": int64(18_446_744_074), // * time.Second wraps to ~290ms
+		"identity":       map[string]any{"subject": "github:1", "scopes": []string{"signals:read"}},
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("dispatch = %d, want 202", resp.StatusCode)
+	}
+	var out struct {
+		RunID string `json:"runId"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	<-testLauncher.dispatched // drain: this run never calls back
+
+	time.Sleep(600 * time.Millisecond) // well past the wrapped ~290ms
+	s := do(t, http.MethodGet, srv.URL+"/aei/v1alpha1/runs/"+out.RunID, "pyfer", nil)
+	var st struct{ Phase, Message string }
+	_ = json.NewDecoder(s.Body).Decode(&st)
+	if st.Phase != "Running" {
+		t.Errorf("status = %q %q, want Running under the 1h maximum", st.Phase, st.Message)
+	}
+}
+
 func TestDispatchAuthorization(t *testing.T) {
 	srv := newTestServer(t)
 	base := srv.URL + "/aei/v1alpha1/dispatch"

@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -218,10 +219,34 @@ func New(cfg Config) *Plane {
 	}
 }
 
+// applyDeadline sets spec's Deadline to its effective value and DeadlineAt to the
+// absolute cutoff the plane enforces, measured from now — before the credential is
+// minted and the provider is called, so provisioning time is spent from the
+// budget, and the runtime's AEI_DEADLINE is the instant the plane ends the run.
+func (p *Plane) applyDeadline(spec aei.RunSpec) aei.RunSpec {
+	spec.Deadline = p.effectiveDeadline(spec)
+	spec.DeadlineAt = time.Now().Add(spec.Deadline)
+	return spec
+}
+
+// DeadlineFromSeconds converts a caller's timeoutSeconds to a run Deadline without
+// overflowing time.Duration: a value too large to represent saturates (and is then
+// reduced to the plane's maximum), and zero or a negative value is 0 (the plane's
+// default). The dispatch API and the AgentRun controller both convert through it.
+func DeadlineFromSeconds(n int64) time.Duration {
+	switch {
+	case n <= 0:
+		return 0
+	case n > int64(math.MaxInt64/time.Second):
+		return time.Duration(math.MaxInt64)
+	default:
+		return time.Duration(n) * time.Second
+	}
+}
+
 // effectiveDeadline returns the deadline a run is held to: the plane default when
 // the caller set none, the plane maximum when the caller asked for more, and the
-// caller's value otherwise. Run and Submit store it back into the spec before
-// dispatch, so the runtime's AEI_DEADLINE matches what the plane enforces.
+// caller's value otherwise.
 func (p *Plane) effectiveDeadline(spec aei.RunSpec) time.Duration {
 	switch d := spec.Deadline; {
 	case d <= 0:
@@ -249,10 +274,10 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
-	spec.Deadline = p.effectiveDeadline(spec)
+	spec = p.applyDeadline(spec)
 	cred := p.mint(launcher, spec)
 
-	ctx, cancel := withRunDeadline(ctx, spec.Deadline)
+	ctx, cancel := withRunDeadline(ctx, spec)
 	defer cancel()
 
 	done := p.arm(spec.ID)
@@ -283,7 +308,7 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
-	spec.Deadline = p.effectiveDeadline(spec)
+	spec = p.applyDeadline(spec)
 	cred := p.mint(launcher, spec)
 	p.store.SetRunning(spec.ID)
 	done := p.arm(spec.ID)
@@ -292,26 +317,24 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 		defer p.disarm(spec.ID)
 		// The run outlives the submit request, so it runs on its own context
 		// bounded only by the run deadline (the universal backstop).
-		ctx, cancel := withRunDeadline(context.Background(), spec.Deadline)
+		ctx, cancel := withRunDeadline(context.Background(), spec)
 		defer cancel()
 		res, _ := p.race(ctx, launcher, spec, cred, done)
-		p.observe(spec, res)
-		p.finishRun(spec.ID, res)
+		// Commit first, then observe what the store holds: a callback that wrote
+		// before this run's own outcome is the outcome, and metrics must agree
+		// with GET /runs/{id}.
+		p.observe(spec, p.finishRun(spec.ID, res))
 	}()
 	return spec.ID, nil
 }
 
 // observe reports a run's terminal outcome to the metrics Observer (the metrics
 // seam). It fires once per Submit — the data-plane app path — with the run's
-// taskRef, terminal phase, and the provider-reported timing breakdown. The default
-// Observer is a no-op, so an unconfigured plane records nothing. The phase mirrors
-// finishRun's: a run with an error is Failed, otherwise Succeeded.
-func (p *Plane) observe(spec aei.RunSpec, res aei.Result) {
-	phase := phaseSucceeded
-	if res.Err != nil {
-		phase = phaseFailed
-	}
-	p.obs.ObserveRun(spec.TaskRef, phase, res.Timing)
+// taskRef and the terminal state the store recorded (whichever signal won the
+// first write), so metrics never disagree with Status. The default Observer is a
+// no-op, so an unconfigured plane records nothing.
+func (p *Plane) observe(spec aei.RunSpec, st RunState) {
+	p.obs.ObserveRun(spec.TaskRef, st.Phase, st.Timing)
 }
 
 // Status returns the current state of a submitted run, and whether it is known.
@@ -323,14 +346,19 @@ func (p *Plane) Status(runID string) (RunState, bool) {
 // (R4): the callback and the watch may both fire; whichever wins the race writes the
 // terminal state and logs a failure once, and the loser is a no-op. The durable write
 // is also what makes the outcome visible when a callback lands on a different replica
-// than the one that dispatched (the HA seam).
-func (p *Plane) finishRun(runID string, res aei.Result) {
+// than the one that dispatched (the HA seam). It returns the state the store holds
+// afterwards: res when this call won, else the earlier winner.
+func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 	st := RunState{Phase: phaseSucceeded, ResultRef: res.ResultRef, Timing: res.Timing}
 	if res.Err != nil {
 		st.Phase, st.Err = phaseFailed, res.Err.Error()
 	}
 	if !p.store.FinishRun(runID, st) {
-		return // a terminal outcome was already recorded
+		// A terminal outcome was already recorded; report that one.
+		if won, ok := p.store.Run(runID); ok && won.Phase != phaseRunning {
+			return won
+		}
+		return st
 	}
 	if res.Err != nil {
 		// Otherwise only visible via GET /runs/{id} (the data-plane path keeps no
@@ -338,13 +366,15 @@ func (p *Plane) finishRun(runID string, res aei.Result) {
 		// its CRD is missing — reads clearly in the message here.
 		p.log.Warn("run failed", "run_id", runID, "error", res.Err.Error())
 	}
+	return st
 }
 
 // race dispatches spec and returns the first terminal signal: the runtime's
 // /complete callback (delivered on done), the provider's result (Await, or Launch
 // returning for a provider without the async capability), or the deadline (ctx).
 // It is the shared completion core of Run (blocking) and Submit (non-blocking).
-// The returned error is non-nil only when the provider's Dispatch failed.
+// The returned error is non-nil only when an async provider's Dispatch did not
+// accept the run: Dispatch failed, or ctx ended before Dispatch returned.
 //
 // The deadline is enforced here, not delegated to the provider: when ctx ends,
 // race returns at once with the context's cause (ErrDeadlineExceeded for the run
@@ -357,15 +387,24 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		dispatchErr error
 	}
 	provider := make(chan outcome, 1)
+	// accepted closes once an async provider's Dispatch returns without error, so
+	// a deadline or cancellation that lands first is still reported as a failed
+	// dispatch rather than as an accepted run that ended.
+	accepted := make(chan struct{})
+	async, isAsync := launcher.(aei.AsyncLauncher)
+	if !isAsync {
+		close(accepted) // a plain provider has no separate dispatch step
+	}
 	go func() {
 		// The async capability lets us dispatch without blocking a worker and
 		// observe completion by watch; a plain provider blocks in Launch.
-		if async, ok := launcher.(aei.AsyncLauncher); ok {
+		if isAsync {
 			h, err := async.Dispatch(ctx, spec, cred)
 			if err != nil {
 				provider <- outcome{res: aei.Result{Err: err}, dispatchErr: err}
 				return
 			}
+			close(accepted)
 			r, _ := async.Await(ctx, h)
 			provider <- outcome{res: r}
 			return
@@ -383,6 +422,9 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		// run reads the same whichever signal won.
 		if ctx.Err() != nil && (errors.Is(o.res.Err, context.DeadlineExceeded) || errors.Is(o.res.Err, context.Canceled)) {
 			o.res.Err = context.Cause(ctx)
+			if o.dispatchErr != nil {
+				o.dispatchErr = o.res.Err
+			}
 		}
 		return o.res, o.dispatchErr
 	case <-ctx.Done():
@@ -392,15 +434,23 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 			return r, nil
 		default:
 		}
-		return aei.Result{Err: context.Cause(ctx)}, nil
+		cause := context.Cause(ctx)
+		select {
+		case <-accepted:
+			return aei.Result{Err: cause}, nil
+		default:
+			return aei.Result{Err: cause}, cause // Dispatch never accepted the run
+		}
 	}
 }
 
-// withRunDeadline bounds ctx by a run's deadline d (always positive once
-// effectiveDeadline has applied the plane default). When the deadline passes, the
-// context's cause is ErrDeadlineExceeded, which race records as the run's error.
-func withRunDeadline(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeoutCause(ctx, d, fmt.Errorf("%w after %s", ErrDeadlineExceeded, d))
+// withRunDeadline bounds ctx by the run's absolute cutoff (spec.DeadlineAt, set by
+// applyDeadline). When it passes, the context's cause is an error matching both
+// ErrDeadlineExceeded and context.DeadlineExceeded, which race records as the
+// run's error.
+func withRunDeadline(ctx context.Context, spec aei.RunSpec) (context.Context, context.CancelFunc) {
+	return context.WithDeadlineCause(ctx, spec.DeadlineAt,
+		fmt.Errorf("%w after %s: %w", ErrDeadlineExceeded, spec.Deadline, context.DeadlineExceeded))
 }
 
 // --- completion registry (the callback/watch race) ---
