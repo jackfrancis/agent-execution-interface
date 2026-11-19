@@ -11,7 +11,7 @@ import (
 )
 
 // fakeKubectl answers each kind of call from a queue file in its state dir: one
-// "exit|stdout|stderr" line per call, the last line repeating. It logs every call
+// "exit^stdout^stderr" line per call, the last line repeating. It logs every call
 // and saves the stdin of patch/create calls.
 const fakeKubectl = `#!/usr/bin/env bash
 d=$FAKE_DIR
@@ -32,7 +32,7 @@ f="$d/$op"
 [ -f "$f" ] || { echo "fake kubectl: no response queued for $op" >&2; exit 98; }
 line=$(head -n 1 "$f")
 if [ "$(wc -l < "$f")" -gt 1 ]; then tail -n +2 "$f" > "$f.next" && mv "$f.next" "$f"; fi
-IFS='|' read -r code out err <<< "$line"
+IFS='^' read -r code out err <<< "$line"
 [ -n "$out" ] && printf '%s' "$out"
 [ -n "$err" ] && echo "$err" >&2
 exit "$code"
@@ -43,20 +43,34 @@ echo AEI_ED25519_PRIVATE_KEY=PRIVKEY
 echo AEI_ED25519_PUBLIC_KEY=PUBKEY
 `
 
+// fakeDerive stands in for "genkey -public-from-private": PRIVKEY's public key is
+// PUBKEY, and anything else is an inconsistent key.
+const fakeDerive = `#!/usr/bin/env bash
+in=$(cat)
+[ "$in" = PRIVKEY ] || { echo "genkey: private key is inconsistent" >&2; exit 1; }
+echo PUBKEY
+`
+
 const (
-	notFound      = `1||Error from server (NotFound): secrets "aei-signing" not found`
-	deployMissing = `1||Error from server (NotFound): deployments.apps "aei-controller" not found`
-	unreachable   = `1||Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused`
-	conflict      = `1||Error from server (Conflict): Operation cannot be fulfilled on secrets "aei-signing": the object has been modified; please apply your changes to the latest version and try again`
+	notFound      = `1^^Error from server (NotFound): secrets "aei-signing" not found`
+	deployMissing = `1^^Error from server (NotFound): deployments.apps "aei-controller" not found`
+	unreachable   = `1^^Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused`
+	conflict      = `1^^Error from server (Conflict): Operation cannot be fulfilled on secrets "aei-signing": the object has been modified; please apply your changes to the latest version and try again`
 	// What kubectl actually prints for an API AlreadyExists on create secret: its
 	// client message, without "(AlreadyExists)".
-	alreadyExists = `1||error: failed to create secret secrets "aei-signing" already exists`
-	noKeyAtRV5    = `0|5 |`
-	hasKey        = `0|9 c29tZWtleQ==|`
-	pubKey        = `0|UFVCS0VZ|` // base64("PUBKEY")
-	onKey         = `0|PUBKEY|`   // the pod template already carries this key
-	notOnKey      = `0||`         // no (or another) key on the pod template
-	ok            = `0||`
+	alreadyExists = `1^^error: failed to create secret secrets "aei-signing" already exists`
+	noKeyAtRV5    = `0^5 ^`
+	hasKey        = `0^9 UFJJVktFWQ==^`
+	// activate's read: resourceVersion|private|public, base64 as the API returns
+	// them. base64("PRIVKEY") = UFJJVktFWQ==, base64("PUBKEY") = UFVCS0VZ.
+	pubKey   = `0^9|UFJJVktFWQ==|UFVCS0VZ^`
+	privOnly = `0^7|UFJJVktFWQ==|^`         // the old Deployment's documented setup
+	stalePub = `0^7|UFJJVktFWQ==|T0xES0VZ^` // public field = "OLDKEY"
+	badPriv  = `0^7|QkFES0VZ|^`             // base64("BADKEY"): unusable
+	noPriv   = `0^7||UFVCS0VZ^`
+	onKey    = `0^PUBKEY^` // the pod template already carries this key
+	notOnKey = `0^^`       // no (or another) key on the pod template
+	ok       = `0^^`
 )
 
 type result struct {
@@ -76,6 +90,7 @@ func run(t *testing.T, mode string, queues map[string][]string) result {
 	}
 	kubectl := write("kubectl", fakeKubectl, 0o755)
 	genkey := write("genkey", fakeGenkey, 0o755)
+	derive := write("derive", fakeDerive, 0o755)
 	for op, lines := range queues {
 		write(op, strings.Join(lines, "\n")+"\n", 0o644)
 	}
@@ -88,6 +103,7 @@ func run(t *testing.T, mode string, queues map[string][]string) result {
 		"FAKE_DIR="+dir,
 		"KUBECTL="+kubectl+" --context test",
 		"GENKEY="+genkey,
+		"DERIVE="+derive,
 	)
 	out, err := cmd.CombinedOutput()
 	read := func(name string) string { b, _ := os.ReadFile(filepath.Join(dir, name)); return string(b) }
@@ -233,11 +249,13 @@ func TestProvisionLeavesDeploymentAlone(t *testing.T) {
 // key active.
 func TestFailedActivationIsNotReportedActive(t *testing.T) {
 	for name, q := range map[string]map[string][]string{
+		"stale public key":  {"get-pub": {stalePub}},
+		"unusable private":  {"get-pub": {badPriv}},
+		"no private key":    {"get-pub": {noPriv}},
 		"patch fails":       {"get-pub": {pubKey}, "get-deploy": {notOnKey}, "patch-deploy": {`1||error: deployments.apps "aei-controller" is forbidden`}},
 		"rollout fails":     {"get-pub": {pubKey}, "get-deploy": {notOnKey}, "patch-deploy": {ok}, "status": {`1||error: timed out waiting for the condition`}},
 		"rollout stuck":     {"get-pub": {pubKey}, "get-deploy": {onKey}, "status": {`1||error: timed out waiting for the condition`}},
 		"deploy unreadable": {"get-pub": {pubKey}, "get-deploy": {unreachable}},
-		"no public key":     {"get-pub": {ok}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := run(t, "activate", q)
@@ -246,5 +264,43 @@ func TestFailedActivationIsNotReportedActive(t *testing.T) {
 				t.Errorf("reported the key active despite the failure:\n%s", r.out)
 			}
 		})
+	}
+}
+
+// An install whose secret holds only AEI_ED25519_PRIVATE_KEY (what the previous
+// Deployment documented) activates: the public key is derived, backfilled with a
+// patch conditioned on the resourceVersion read, and announced.
+func TestPrivateOnlySecretIsBackfilled(t *testing.T) {
+	r := run(t, "", map[string][]string{"get-secret": {hasKey}, "get-pub": {privOnly}, "patch-secret": {ok}, "get-deploy": {notOnKey}, "patch-deploy": {ok}, "status": {ok}})
+	mustSucceed(t, r)
+	if !strings.Contains(r.patchBody, `"resourceVersion":"7"`) || !strings.Contains(r.patchBody, `"AEI_ED25519_PUBLIC_KEY":"PUBKEY"`) {
+		t.Errorf("backfill patch = %q; want PUBKEY conditioned on resourceVersion 7", r.patchBody)
+	}
+	if strings.Contains(r.patchBody, "PRIVATE") {
+		t.Errorf("backfill patch rewrote the private key: %q", r.patchBody)
+	}
+	if !strings.Contains(r.deployPatch, "PUBKEY") || !strings.Contains(r.out, "signing key active") {
+		t.Errorf("want the derived key stamped and reported active:\n%s", r.out)
+	}
+}
+
+// A backfill that loses to a concurrent writer re-reads and uses what is there.
+func TestBackfillConflictRereads(t *testing.T) {
+	r := run(t, "activate", map[string][]string{"get-pub": {privOnly, pubKey}, "patch-secret": {conflict}, "get-deploy": {onKey}, "status": {ok}})
+	mustSucceed(t, r)
+	if n := strings.Count(r.calls, "patch secret"); n != 1 {
+		t.Errorf("patched %d times; want 1", n)
+	}
+}
+
+// A stale public field is never announced, and nothing is rolled onto it.
+func TestStalePublicKeyIsRejected(t *testing.T) {
+	r := run(t, "", map[string][]string{"get-secret": {hasKey}, "get-pub": {stalePub}})
+	mustFail(t, r)
+	if strings.Contains(r.out, "OLDKEY") || strings.Contains(r.calls, "patch") || strings.Contains(r.calls, "deploy") {
+		t.Errorf("acted on a stale public key:\n%s\ncalls:\n%s", r.out, r.calls)
+	}
+	if !strings.Contains(r.out, "does not match its private key") {
+		t.Errorf("output does not explain the mismatch:\n%s", r.out)
 	}
 }

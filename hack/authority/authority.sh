@@ -16,7 +16,12 @@
 #     of being overwritten. On Conflict (or AlreadyExists for a create) it re-reads,
 #     and a key someone else just wrote is reused.
 #
-# activate records the public key on the controller's pod template (annotation
+# activate first settles which public key to advertise: it DERIVES it from the
+# secret's private key (the key the controller signs with), so an install whose
+# secret holds only AEI_ED25519_PRIVATE_KEY (which the old Deployment documented)
+# gets the field backfilled by a conditional patch, and a stale
+# AEI_ED25519_PUBLIC_KEY that would not verify the controller's credentials is
+# rejected, never announced. It then records that key on the pod template (annotation
 # agents.x-k8s.io/signing-public-key). A template without that exact key is patched,
 # which rolls the controller; either way it waits for the rollout to finish before
 # calling the key active. So a run interrupted after provisioning (a failed patch,
@@ -25,11 +30,14 @@
 # controller yet, there is nothing to roll: it starts with the key.
 #
 # Env: KUBECTL (command plus flags, word-split; default "kubectl"), GENKEY (default
-# "go run ./hack/genkey"), ROLLOUT_TIMEOUT (default 180s).
+# "go run ./hack/genkey"), DERIVE (reads a base64 private key on stdin and prints its
+# public key; default "go run ./hack/genkey -public-from-private"), ROLLOUT_TIMEOUT
+# (default 180s).
 set -uo pipefail
 
 KUBECTL=${KUBECTL:-kubectl}
 GENKEY=${GENKEY:-go run ./hack/genkey}
+DERIVE=${DERIVE:-go run ./hack/genkey -public-from-private}
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-180s}
 NS=aei-system
 NAME=aei-signing
@@ -96,12 +104,46 @@ provision() {
 	die "secret $NAME kept changing; gave up after $ATTEMPTS attempts"
 }
 
+# verified_key sets $key to the public key that verifies the controller's
+# credentials: derived from the secret's private key, backfilled into a missing
+# AEI_ED25519_PUBLIC_KEY, and checked against a present one.
+key=""
+verified_key() {
+	local attempt out rv privb64 pubb64 derived stored
+	for attempt in $(seq 1 "$ATTEMPTS"); do
+		# '|' separates the fields (base64 never contains it), so an empty field
+		# cannot shift the others.
+		out=$(k get secret "$NAME" -o 'jsonpath={.metadata.resourceVersion}|{.data.AEI_ED25519_PRIVATE_KEY}|{.data.AEI_ED25519_PUBLIC_KEY}' 2>"$errf") ||
+			die "cannot read secret $NAME: $(lasterr)"
+		IFS='|' read -r rv privb64 pubb64 <<<"$out"
+		[ -n "$privb64" ] || die "secret $NAME has no AEI_ED25519_PRIVATE_KEY; run: make authority"
+		# The private key travels only through pipes, never argv.
+		derived=$(printf '%s' "$privb64" | base64 -d | $DERIVE 2>"$errf") && [ -n "$derived" ] ||
+			die "AEI_ED25519_PRIVATE_KEY in secret $NAME is unusable, and the controller will refuse it too: $(lasterr)"
+		stored=$(printf '%s' "$pubb64" | base64 -d 2>/dev/null)
+		if [ -n "$stored" ]; then
+			[ "$stored" = "$derived" ] ||
+				die "AEI_ED25519_PUBLIC_KEY in secret $NAME does not match its private key, so it cannot verify the controller's credentials; refusing to advertise it. Remove that field and re-run make authority to derive it."
+			key=$derived
+			return 0
+		fi
+		echo "secret $NAME has no AEI_ED25519_PUBLIC_KEY; deriving it from the private key"
+		[ -n "$rv" ] || die "secret $NAME has no resourceVersion; refusing an unconditional write"
+		if printf '{"metadata":{"resourceVersion":"%s"},"stringData":{"AEI_ED25519_PUBLIC_KEY":"%s"}}' "$rv" "$derived" |
+			k patch secret "$NAME" --type=merge --patch-file=/dev/stdin >/dev/null 2>"$errf"; then
+			key=$derived
+			return 0
+		fi
+		grep -q '(Conflict)\|the object has been modified' "$errf" ||
+			die "cannot add the public key to secret $NAME: $(lasterr)"
+		echo "secret $NAME changed while backfilling (attempt $attempt); re-reading"
+	done
+	die "secret $NAME kept changing; gave up after $ATTEMPTS attempts"
+}
+
 activate() {
-	local b64 key cur
-	b64=$(k get secret "$NAME" -o 'jsonpath={.data.AEI_ED25519_PUBLIC_KEY}' 2>"$errf") ||
-		die "cannot read secret $NAME: $(lasterr)"
-	key=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
-	[ -n "$key" ] || die "secret $NAME has no AEI_ED25519_PUBLIC_KEY; run: make authority"
+	local cur
+	verified_key
 	if ! cur=$(k get "$DEPLOY" -o "jsonpath=$ANNOTATION_JSONPATH" 2>"$errf"); then
 		grep -q '(NotFound)' "$errf" ||
 			die "cannot read $DEPLOY, so the key is NOT known to be active: $(lasterr)"
