@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -547,4 +548,62 @@ type cancelledLaunch struct{}
 
 func (cancelledLaunch) Launch(ctx context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
 	return aei.Handle{Ref: spec.ID}, ctx.Err()
+}
+
+// gatedAuthority is a TokenAuthority whose Mint waits for the test to open gate,
+// then records the scopes it was asked to mint.
+type gatedAuthority struct {
+	hmacAuthority
+	gate   chan struct{}
+	scopes chan []string
+}
+
+func (g gatedAuthority) Mint(c Claims) (string, error) {
+	<-g.gate
+	g.scopes <- slices.Clone(c.Scopes)
+	return g.hmacAuthority.Mint(c)
+}
+
+// TestMintSeesScopesAtSubmitTime: minting runs after Submit returns (and can
+// outlive a timed-out Run), so a caller that reuses its scopes slice for the next
+// run must not change the scopes minted for this one.
+func TestMintSeesScopesAtSubmitTime(t *testing.T) {
+	newAuth := func() gatedAuthority {
+		return gatedAuthority{hmacAuthority{secret: []byte("k"), now: time.Now}, make(chan struct{}), make(chan []string, 1)}
+	}
+	check := func(t *testing.T, auth gatedAuthority, scopes []string) {
+		t.Helper()
+		scopes[0] = "next-run:write" // the caller reuses its slice
+		close(auth.gate)
+		select {
+		case got := <-auth.scopes:
+			if !slices.Equal(got, []string{"signals:read"}) {
+				t.Errorf("minted scopes = %v, want [signals:read]", got)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("issuer never called")
+		}
+	}
+
+	t.Run("submit", func(t *testing.T) {
+		auth := newAuth()
+		p := New(Config{Authority: auth})
+		scopes := []string{"signals:read"}
+		if _, err := p.Submit(context.Background(), &recordLaunch{called: make(chan struct{}, 1)},
+			aei.RunSpec{ID: "s", Identity: aei.IdentityRequest{Scopes: scopes}}); err != nil {
+			t.Fatal(err)
+		}
+		check(t, auth, scopes)
+	})
+	t.Run("timed-out run", func(t *testing.T) {
+		auth := newAuth()
+		p := New(Config{Authority: auth})
+		scopes := []string{"signals:read"}
+		r, _ := p.Run(context.Background(), &recordLaunch{called: make(chan struct{}, 1)},
+			aei.RunSpec{ID: "r", Deadline: 10 * time.Millisecond, Identity: aei.IdentityRequest{Scopes: scopes}})
+		if !errors.Is(r.Err, ErrDeadlineExceeded) {
+			t.Fatalf("err = %v, want ErrDeadlineExceeded", r.Err)
+		}
+		check(t, auth, scopes)
+	})
 }

@@ -34,8 +34,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -230,6 +232,17 @@ func (p *Plane) applyDeadline(spec aei.RunSpec) aei.RunSpec {
 	return spec
 }
 
+// ownSpec returns spec with its own copies of the caller-owned slice and maps.
+// Minting and the provider run after Submit returns (and can outlive a timed-out
+// Run), so they must not read a slice or map the caller may reuse for its next
+// run.
+func ownSpec(spec aei.RunSpec) aei.RunSpec {
+	spec.Identity.Scopes = slices.Clone(spec.Identity.Scopes)
+	spec.Parameters = maps.Clone(spec.Parameters)
+	spec.Metadata = maps.Clone(spec.Metadata)
+	return spec
+}
+
 // DeadlineFromSeconds converts a caller's timeoutSeconds to a run Deadline without
 // overflowing time.Duration: a value too large to represent saturates (and is then
 // reduced to the plane's maximum), and zero or a negative value is 0 (the plane's
@@ -275,7 +288,7 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
-	spec = p.applyDeadline(spec)
+	spec = p.applyDeadline(ownSpec(spec))
 	ctx, cancel := withRunDeadline(ctx, spec)
 	defer cancel()
 	spec = withContextCutoff(ctx, spec) // a caller deadline sooner than the run's wins
@@ -308,7 +321,7 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
-	spec = p.applyDeadline(spec)
+	spec = p.applyDeadline(ownSpec(spec))
 	p.store.SetRunning(spec.ID)
 	done := p.arm(spec.ID)
 
