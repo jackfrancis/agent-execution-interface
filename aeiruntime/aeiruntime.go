@@ -23,6 +23,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -155,6 +156,10 @@ type Runtime struct {
 	brokerURL  string
 	cred       string // the run credential; in memory only, never logged (R2)
 	http       *http.Client
+	// oneShot marks a run on a workload substrate, where the process must exit
+	// for the provider's watch to see the outcome; Complete then bounds its
+	// retries by the run deadline (oneShotReportPlan).
+	oneShot bool
 }
 
 // Load runs the one decoder (metadata-first, env-fallback), then resolves the run
@@ -185,6 +190,13 @@ func Load(ctx context.Context, getenv func(string) string, metadata map[string]s
 	if brokerURL == "" {
 		brokerURL = controlURL // B-with-default: broker collapses onto control
 	}
+	// Reject an endpoint no request can be sent to now, rather than letting
+	// Complete retry a failure that can never clear.
+	for key, u := range map[string]string{EnvControlURL: controlURL, EnvBrokerURL: brokerURL} {
+		if err := checkEndpoint(u); err != nil {
+			return nil, fmt.Errorf("aeiruntime: %s: %w", key, err)
+		}
+	}
 
 	params, err := decodeParams(get(EnvParams))
 	if err != nil {
@@ -203,6 +215,9 @@ func Load(ctx context.Context, getenv func(string) string, metadata map[string]s
 		controlURL: controlURL,
 		brokerURL:  brokerURL,
 		http:       &http.Client{Timeout: requestTimeout},
+		// No message metadata means the env transport of a workload substrate
+		// (see Load's doc); the durable serve loop clears this for its runs.
+		oneShot: metadata == nil,
 	}
 
 	// Exactly one of credential/ticket is present (docs/runtime-abi.md §1.1). A
@@ -261,7 +276,9 @@ type completeRequest struct {
 // errors and 408/429/5xx responses are retried with jittered exponential backoff;
 // any other 4xx (an expired or foreign credential) is final, and so is a request
 // that cannot be built (an unencodable Timing such as NaN). Bound the total time
-// with ctx.
+// with ctx. On a workload substrate Complete also stops in time for the process to
+// exit before the run deadline (oneShotReportPlan), whether the SDK or the app
+// calls it.
 func (r *Runtime) Complete(ctx context.Context, runErr error, t Timing, resultRef string) error {
 	req := completeRequest{RunID: r.spec.RunID, ResultRef: resultRef, Timing: t}
 	if runErr != nil {
@@ -271,12 +288,20 @@ func (r *Runtime) Complete(ctx context.Context, runErr error, t Timing, resultRe
 	if err != nil {
 		return fmt.Errorf("aeiruntime: encode completion: %w", err)
 	}
+	retry := true
+	if r.oneShot {
+		budget, ok := oneShotReportPlan(r.spec.Deadline, time.Now())
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+		retry = ok
+	}
 	backoff := completeBackoffMin
 	for {
 		attemptCtx, cancel := context.WithTimeout(ctx, completeAttemptTimeout)
 		err := r.send(attemptCtx, r.controlURL+"/complete", r.cred, body, nil)
 		cancel()
-		if err == nil || !retryable(err) {
+		if err == nil || !retry || !retryable(err) {
 			return err
 		}
 		// Full jitter in [backoff/2, backoff) keeps many runtimes finishing at once
@@ -308,21 +333,37 @@ const (
 	// so it retries for at most oneShotCompletionBudget, and stops
 	// oneShotExitMargin before the run deadline: time for the process to exit, the
 	// pod status to update, and the provider's watch (a 2s poll) to observe it
-	// before the controller's own deadline. A run already inside that margin still
-	// gets oneShotMinBudget, enough for one prompt attempt.
+	// before the controller's own deadline. Inside that margin it makes one
+	// attempt of at most oneShotFinalAttempt and no retries.
 	oneShotCompletionBudget = 30 * time.Second
 	oneShotExitMargin       = 10 * time.Second
-	oneShotMinBudget        = time.Second
+	oneShotFinalAttempt     = 500 * time.Millisecond
 )
 
-// oneShotReportBudget is how long a one-shot workload that finished at now may
-// spend reporting its completion before it exits.
-func oneShotReportBudget(deadline, now time.Time) time.Duration {
-	budget := oneShotCompletionBudget
-	if !deadline.IsZero() {
-		budget = min(budget, deadline.Sub(now)-oneShotExitMargin)
+// oneShotReportPlan is how long a one-shot workload that finishes reporting at
+// now may spend on it, and whether it may retry. AEI_DEADLINE is the controller's
+// own cutoff once the plane stamps it (RunSpec.DeadlineAt); before that it is
+// the provider's dispatch time plus the full budget, slightly later.
+func oneShotReportPlan(deadline, now time.Time) (budget time.Duration, retry bool) {
+	if deadline.IsZero() {
+		return oneShotCompletionBudget, true
 	}
-	return max(budget, oneShotMinBudget)
+	if left := deadline.Sub(now) - oneShotExitMargin; left > 0 {
+		return min(oneShotCompletionBudget, left), true
+	}
+	return oneShotFinalAttempt, false
+}
+
+// checkEndpoint reports whether raw is an absolute http(s) URL with a host.
+func checkEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("want an http:// or https:// URL with a host, got %q", raw)
+	}
+	return nil
 }
 
 // statusError is a non-2xx response from the control plane or broker.
@@ -436,9 +477,9 @@ func Main(getenv func(string) string, metadata map[string]string, fn func(contex
 }
 
 // runOneShot is Main on a workload substrate: Load, run fn under the deadline,
-// report completion, and return the process exit code. Reporting is bounded by
-// oneShotReportBudget so a callback outage cannot keep the process alive past the
-// point where the provider's watch can still observe a successful exit.
+// report completion, and return the process exit code. Complete bounds the
+// report by oneShotReportPlan, so a callback outage cannot keep the process alive
+// past the point where the provider's watch can still observe a successful exit.
 func runOneShot(getenv func(string) string, metadata map[string]string, fn func(context.Context, *Runtime) error) int {
 	rt, err := Load(context.Background(), getenv, metadata)
 	if err != nil {
@@ -446,7 +487,7 @@ func runOneShot(getenv func(string) string, metadata map[string]string, fn func(
 		return 2
 	}
 	timing, runErr := runTask(context.Background(), rt, fn)
-	reportCompletion(rt, runErr, timing, oneShotReportBudget(rt.spec.Deadline, time.Now()))
+	reportCompletion(rt, runErr, timing, oneShotCompletionBudget)
 	if runErr != nil {
 		fmt.Fprintln(os.Stderr, "aeiruntime: run failed:", runErr)
 		return 1

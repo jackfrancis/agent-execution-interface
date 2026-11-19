@@ -11,24 +11,123 @@ import (
 	"time"
 )
 
-// TestOneShotReportBudget: a one-shot workload stops retrying in time to exit
-// before its deadline, and always gets at least one prompt attempt.
-func TestOneShotReportBudget(t *testing.T) {
+// TestOneShotReportPlan: a one-shot workload stops retrying in time to exit
+// before its deadline, and inside the exit margin makes one brief attempt only.
+func TestOneShotReportPlan(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
-		name     string
-		deadline time.Time
-		want     time.Duration
+		name      string
+		deadline  time.Time
+		want      time.Duration
+		wantRetry bool
 	}{
-		{"no deadline", time.Time{}, oneShotCompletionBudget},
-		{"distant deadline", now.Add(10 * time.Minute), oneShotCompletionBudget},
-		{"near deadline", now.Add(15 * time.Second), 15*time.Second - oneShotExitMargin},
-		{"inside the exit margin", now.Add(3 * time.Second), oneShotMinBudget},
-		{"past the deadline", now.Add(-time.Minute), oneShotMinBudget},
+		{"no deadline", time.Time{}, oneShotCompletionBudget, true},
+		{"distant deadline", now.Add(10 * time.Minute), oneShotCompletionBudget, true},
+		{"near deadline", now.Add(15 * time.Second), 15*time.Second - oneShotExitMargin, true},
+		{"inside the exit margin", now.Add(3 * time.Second), oneShotFinalAttempt, false},
+		{"past the deadline", now.Add(-time.Minute), oneShotFinalAttempt, false},
 	}
 	for _, c := range cases {
-		if got := oneShotReportBudget(c.deadline, now); got != c.want {
-			t.Errorf("%s: budget = %v, want %v", c.name, got, c.want)
+		got, retry := oneShotReportPlan(c.deadline, now)
+		if got != c.want || retry != c.wantRetry {
+			t.Errorf("%s: plan = (%v, retry %v), want (%v, retry %v)", c.name, got, retry, c.want, c.wantRetry)
+		}
+	}
+}
+
+// failingControl is a control plane whose /complete always answers 503.
+func failingControl(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &attempts
+}
+
+func oneShotEnv(controlURL string, deadline time.Time) func(string) string {
+	env := map[string]string{
+		EnvRunID:      "run-oneshot",
+		EnvCredential: "push-tok",
+		EnvControlURL: controlURL,
+		EnvDeadline:   strconv.FormatInt(deadline.UnixMilli(), 10),
+	}
+	return func(k string) string { return env[k] }
+}
+
+// TestOneShotExplicitCompleteRespectsExitMargin: a workload that calls Complete
+// itself, to publish a result ref, is held to the same exit margin as the SDK's
+// own report, so it still exits in time for the watch to see success.
+func TestOneShotExplicitCompleteRespectsExitMargin(t *testing.T) {
+	srv, attempts := failingControl(t)
+	deadline := time.Now().Add(oneShotExitMargin + 2*time.Second)
+	code := runOneShot(oneShotEnv(srv.URL, deadline), nil, func(_ context.Context, rt *Runtime) error {
+		// context.Background: the app sets no bound of its own.
+		_ = rt.Complete(context.Background(), nil, Timing{}, "res://published")
+		return nil
+	})
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	if latest := deadline.Add(-oneShotExitMargin + time.Second); time.Now().After(latest) {
+		t.Errorf("exited %v after the exit margin began; want before it", time.Since(deadline.Add(-oneShotExitMargin)))
+	}
+	if attempts.Load() < 2 {
+		t.Errorf("attempts = %d, want the explicit report retried within its budget", attempts.Load())
+	}
+}
+
+// TestOneShotInsideExitMarginMakesOneAttempt: once inside the exit margin, a
+// failed report is not retried.
+func TestOneShotInsideExitMarginMakesOneAttempt(t *testing.T) {
+	srv, attempts := failingControl(t)
+	rt, err := Load(context.Background(), oneShotEnv(srv.URL, time.Now().Add(3*time.Second)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Complete(context.Background(), nil, Timing{}, ""); err == nil {
+		t.Fatal("want the 503 returned")
+	}
+	if attempts.Load() != 1 {
+		t.Errorf("attempts = %d, want 1", attempts.Load())
+	}
+}
+
+// TestOneShotFinalAttemptIsBrief: the single attempt inside the exit margin gives
+// up after oneShotFinalAttempt against a controller that never answers.
+func TestOneShotFinalAttemptIsBrief(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) }) // runs before srv.Close
+	rt, err := Load(context.Background(), oneShotEnv(srv.URL, time.Now().Add(time.Second)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := rt.Complete(context.Background(), nil, Timing{}, ""); err == nil {
+		t.Fatal("want a timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > oneShotFinalAttempt+500*time.Millisecond {
+		t.Errorf("final attempt took %v, want about %v", elapsed, oneShotFinalAttempt)
+	}
+}
+
+// TestLoadRejectsUnusableEndpoints: a control or broker URL no request can be
+// sent to fails Load, instead of a Complete that retries forever.
+func TestLoadRejectsUnusableEndpoints(t *testing.T) {
+	for _, tc := range []struct{ key, value string }{
+		{EnvControlURL, "controller.default.svc"},
+		{EnvControlURL, "ftp://controller.default.svc"},
+		{EnvControlURL, "http://"},
+		{EnvBrokerURL, "broker.default.svc:8080"},
+	} {
+		env := map[string]string{EnvRunID: "r", EnvCredential: "tok", EnvControlURL: "http://cp.default.svc"}
+		env[tc.key] = tc.value
+		if _, err := Load(context.Background(), func(k string) string { return env[k] }, nil); err == nil {
+			t.Errorf("%s=%q: want Load to fail", tc.key, tc.value)
 		}
 	}
 }

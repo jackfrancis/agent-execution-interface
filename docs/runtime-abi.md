@@ -209,7 +209,10 @@ Content-Type: application/json
   harmless no-op that still returns `202`. Because a repeat is harmless, the SDK
   retries a failed call (network error, `408`, `429`, `5xx`) with backoff until its
   context ends; any other `4xx` is final. On a durable substrate the callback is the
-  only success signal, so a dropped call must not end the run as a timeout.
+  only success signal, so a dropped call must not end the run as a timeout. A
+  one-shot workload must exit for its provider's watch to see the outcome, so there
+  the SDK stops retrying 10s before `AEI_DEADLINE` (one brief attempt once inside
+  that margin), including when the app calls `Complete` itself.
 - **`result_ref` is an opaque pointer, not payload.** When set, AEI stores it on
   `AgentRun.status.resultRef` for observability and **never parses it** — where the
   actual result lives (a worklist item, an object-store key) is app-defined.

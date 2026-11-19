@@ -113,6 +113,9 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	// The app registration lives in the caller's own namespace.
 	var app aeiv1.AgentApp
 	if err := h.client.Get(r.Context(), types.NamespacedName{Namespace: caller.Namespace, Name: req.App}, &app); err != nil {
+		if timedOut(w, r) {
+			return
+		}
 		http.Error(w, "unknown app", http.StatusNotFound)
 		return
 	}
@@ -130,6 +133,9 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 
 	class, err := h.resolveClass(r.Context(), app.Spec.ProviderClassName)
 	if err != nil {
+		if timedOut(w, r) {
+			return
+		}
 		http.Error(w, "provider class unavailable", http.StatusBadGateway)
 		return
 	}
@@ -165,8 +171,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	// The 202 and its run id must reach the caller, or the caller's retry launches
 	// a second run. If the lookups above used up the request's deadline (the
 	// listener sets one shorter than its write timeout), refuse before launching.
-	if r.Context().Err() != nil {
-		http.Error(w, "dispatch timed out before submitting; no run was started", http.StatusServiceUnavailable)
+	if timedOut(w, r) {
 		return
 	}
 	runID, err := h.plane.Submit(r.Context(), launcher, spec, control.WithProvider(driver))
@@ -191,8 +196,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	}
 	// Authorize: only a dispatcher of the owning app may read its runs.
 	var app aeiv1.AgentApp
-	if err := h.client.Get(r.Context(), types.NamespacedName{Namespace: o.Namespace, Name: o.App}, &app); err != nil ||
-		caller.Namespace != o.Namespace || !contains(app.Spec.Dispatchers, caller.ServiceAccount) {
+	err := h.client.Get(r.Context(), types.NamespacedName{Namespace: o.Namespace, Name: o.App}, &app)
+	if err != nil && timedOut(w, r) {
+		return
+	}
+	if err != nil || caller.Namespace != o.Namespace || !contains(app.Spec.Dispatchers, caller.ServiceAccount) {
 		http.Error(w, "caller not authorized for run", http.StatusForbidden)
 		return
 	}
@@ -223,10 +231,26 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (Caller, 
 	}
 	caller, err := h.auth.Authenticate(r.Context(), bearer)
 	if err != nil {
+		if timedOut(w, r) {
+			return Caller{}, false
+		}
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return Caller{}, false
 	}
 	return caller, true
+}
+
+// timedOut answers 503 when the request's deadline has passed. The listener sets
+// that deadline shorter than its write timeout, so a lookup it cuts short is
+// reported as retryable, not as the lookup's own verdict (401, 403, 404), and a
+// dispatch stops before launching a run whose response could not be delivered.
+// Nothing has changed when it answers, so the caller can safely retry.
+func timedOut(w http.ResponseWriter, r *http.Request) bool {
+	if r.Context().Err() == nil {
+		return false
+	}
+	http.Error(w, "request deadline exceeded; nothing was started, retry", http.StatusServiceUnavailable)
+	return true
 }
 
 // launcherForClass builds (and caches) the launcher bound to a resolved provider

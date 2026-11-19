@@ -127,6 +127,10 @@ func handleTask(w http.ResponseWriter, r *http.Request, getenv func(string) stri
 		return
 	}
 
+	// A standing actor keeps serving after a run, so its reports keep the full
+	// retry budget rather than the one-shot exit bound.
+	run.oneShot = false
+
 	// Accepted: run detached and report completion out-of-band. Ack immediately —
 	// the provider dispatches non-blocking and drives completion off the callback.
 	go func() {
