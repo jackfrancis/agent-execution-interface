@@ -342,34 +342,14 @@ e2e: up smoke ## full loop: stand AEI up, then drive a run to Succeeded
 # secret; apps consume only the public key (`public-key`) and feed the platform
 # nothing secret. The controller refuses to start without a key, and the default
 # install ships none, so deploy and dev-up run this BEFORE applying the controller.
-# Idempotent: an existing key is always reused, never rotated. A verify-only app
-# (e.g. gofer's web tier) reads the public key at its own deploy time, so a new key
-# means redeploying that app; `undeploy` deletes the aei-system namespace and the
-# key with it. The private key reaches kubectl on stdin, never on a command line.
-# If it creates a key while a controller is already running (an install from
-# before the key came first), it rolls the controller onto it.
+# It never replaces a key: a verify-only app (e.g. gofer's web tier) reads the public
+# key at its own deploy time, so a new key means redeploying that app. `undeploy`
+# deletes the aei-system namespace and the key with it. hack/authority/authority.sh
+# has the details (conditional writes, rollout wait); its tests use a fake kubectl.
 .PHONY: authority
-authority: check-cluster ## provision the platform Ed25519 signing keypair before the controller starts (idempotent; never rotates)
+authority: check-cluster ## provision the platform Ed25519 signing keypair before the controller starts (idempotent; never replaces a key)
 	@$(KUBECTL) apply -f controller/config/manager/namespace.yaml >/dev/null
-	@if $(KUBECTL) -n aei-system get secret aei-signing -o jsonpath='{.data.AEI_ED25519_PRIVATE_KEY}' 2>/dev/null | grep -q .; then \
-		echo "platform Ed25519 authority already provisioned; reusing it (make public-key to read it)"; \
-	else \
-		echo "generating a platform Ed25519 keypair..."; \
-		keys=$$(go run ./hack/genkey) || exit 1; \
-		pub=$$(printf '%s\n' "$$keys" | sed -n 's/^AEI_ED25519_PUBLIC_KEY=//p'); \
-		if $(KUBECTL) -n aei-system get secret aei-signing >/dev/null 2>&1; then \
-			printf '%s\n' "$$keys" | sed -n 's/^\(AEI_ED25519_[A-Z_]*\)=\(.*\)$$/"\1":"\2"/p' | paste -sd, - | \
-				sed 's/^/{"stringData":{/; s/$$/}}/' | \
-				$(KUBECTL) -n aei-system patch secret aei-signing --type=merge --patch-file=/dev/stdin >/dev/null || exit 1; \
-		else \
-			printf '%s\n' "$$keys" | \
-				$(KUBECTL) -n aei-system create secret generic aei-signing --from-env-file=/dev/stdin >/dev/null || exit 1; \
-		fi; \
-		if $(KUBECTL) -n aei-system get deploy/aei-controller >/dev/null 2>&1; then \
-			$(KUBECTL) -n aei-system rollout restart deploy/aei-controller; \
-		fi; \
-		echo "provisioned. app verify key (also at GET /aei/v1alpha1/authority):"; echo "  $$pub"; \
-	fi
+	@KUBECTL="$(KUBECTL)" hack/authority/authority.sh
 
 .PHONY: public-key
 public-key: check-cluster ## print AEI's run-credential verification (public) key for app developers

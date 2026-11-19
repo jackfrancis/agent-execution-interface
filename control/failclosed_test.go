@@ -49,16 +49,28 @@ func (l *countingLauncher) Launch(context.Context, aei.RunSpec, aei.Credential) 
 	return aei.Handle{}, nil
 }
 
+// legacyEmptyKeyToken was minted by the pre-fail-closed HMAC authority with an
+// EMPTY secret (exp 2100-01-01): what an unkeyed plane used to hand out. Anyone
+// can forge such a token, so an unkeyed authority must never accept it.
+const legacyEmptyKeyToken = "eyJydW4iOiJsZWdhY3kiLCJzdWIiOiJ1MSIsImV4cCI6NDEwMjQ0NDgwMH0.h-Tsiz8LIY0EAeJpDnEgLloq7Er4iaw0hhu8u6D62ls"
+
 // An unkeyed HMAC authority must not mint (an empty key is forgeable) nor verify.
 func TestHMACAuthorityWithoutSecretFailsClosed(t *testing.T) {
 	a := hmacAuthority{now: time.Now}
 	if tok, err := a.Mint(Claims{RunID: "r", Exp: time.Now().Add(time.Hour).Unix()}); err == nil {
 		t.Fatalf("unkeyed HMAC minted %q; want an error", tok)
 	}
-	other := hmacAuthority{secret: []byte("k"), now: time.Now}
-	tok, _ := other.Mint(Claims{RunID: "r", Exp: time.Now().Add(time.Hour).Unix()})
-	if _, ok := a.Verify(tok); ok {
-		t.Fatal("unkeyed HMAC verified a token")
+	// The fixture really is a valid empty-key signature, so only the empty-key
+	// guard in Verify stands between it and acceptance.
+	b, sig, _ := strings.Cut(legacyEmptyKeyToken, ".")
+	if a.sign(b) != sig {
+		t.Fatal("fixture is not an empty-key HMAC signature")
+	}
+	if c, ok := a.Verify(legacyEmptyKeyToken); ok {
+		t.Fatalf("unkeyed HMAC verified a forgeable empty-key token: %+v", c)
+	}
+	if _, ok := New(Config{}).verifyToken(legacyEmptyKeyToken); ok {
+		t.Fatal("an unkeyed plane verified a forgeable empty-key token")
 	}
 }
 
@@ -89,12 +101,10 @@ func TestRunFailsWhenMintFails(t *testing.T) {
 	}
 }
 
-// recordingObserver captures terminal phases.
-type recordingObserver struct{ phases []string }
+// recordingObserver captures each run observation.
+type recordingObserver struct{ runs []RunObservation }
 
-func (o *recordingObserver) ObserveRun(_ string, phase string, _ aei.Timing) {
-	o.phases = append(o.phases, phase)
-}
+func (o *recordingObserver) ObserveRun(r RunObservation) { o.runs = append(o.runs, r) }
 
 // Submit (the data-plane path): a mint error records the run Failed, visible at
 // GET /runs/{id}, and never dispatches it.
@@ -102,7 +112,7 @@ func TestSubmitMarksRunFailedWhenMintFails(t *testing.T) {
 	obs := &recordingObserver{}
 	p := New(Config{Authority: failingAuthority{}, Observer: obs})
 	l := &countingLauncher{}
-	id, err := p.Submit(context.Background(), l, aei.RunSpec{ID: "run-s"})
+	id, err := p.Submit(context.Background(), l, aei.RunSpec{ID: "run-s", TaskRef: "t"}, WithProvider("k8s-job"))
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
@@ -116,8 +126,11 @@ func TestSubmitMarksRunFailedWhenMintFails(t *testing.T) {
 	if l.launched != 0 {
 		t.Errorf("launched %d times; a run without a credential must not dispatch", l.launched)
 	}
-	if len(obs.phases) != 1 || obs.phases[0] != phaseFailed {
-		t.Errorf("observed phases %v; want [Failed]", obs.phases)
+	if len(obs.runs) != 1 {
+		t.Fatalf("observed %d runs; want exactly 1", len(obs.runs))
+	}
+	if r := obs.runs[0]; r.Phase != phaseFailed || r.Provider != "k8s-job" || r.TaskRef != "t" {
+		t.Errorf("observation = %+v; want Failed, attributed to k8s-job and task t", r)
 	}
 }
 
@@ -151,5 +164,51 @@ func TestRedeemFailsRunWhenMintFails(t *testing.T) {
 		}
 	default:
 		t.Error("a waiting Run/Submit was not woken with the failure")
+	}
+}
+
+// redeemingDispatcher is a pull provider whose runtime redeems its ticket while
+// Dispatch is still running (as agent-substrate does) and reports only the HTTP
+// symptom when redemption fails.
+type redeemingDispatcher struct {
+	fakeWatch
+	p *Plane
+}
+
+func (redeemingDispatcher) PullsCredential() bool { return true }
+func (d redeemingDispatcher) Dispatch(_ context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
+	if _, _, ok, err := d.p.redeem(cred.Value); !ok || err != nil {
+		return aei.Handle{}, errors.New("redeem status 500")
+	}
+	return aei.Handle{Ref: spec.ID}, nil
+}
+
+// A mint error at redemption during Dispatch reaches the AgentRun (Run's result)
+// and the run store as the cause, not as the provider's "redeem status 500".
+func TestRedeemDuringDispatchKeepsSigningError(t *testing.T) {
+	p := New(Config{Authority: failingAuthority{}})
+	res, err := p.Run(context.Background(), &redeemingDispatcher{p: p}, aei.RunSpec{ID: "run-sub"})
+	if err == nil || !strings.Contains(err.Error(), "signing key unavailable") {
+		t.Fatalf("Run err = %v; want the signing error", err)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "signing key unavailable") {
+		t.Fatalf("Run result err = %v; want the signing error", res.Err)
+	}
+
+	p2 := New(Config{Authority: failingAuthority{}})
+	id, _ := p2.Submit(context.Background(), &redeemingDispatcher{p: p2}, aei.RunSpec{ID: "run-sub2"})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		st, _ := p2.Status(id)
+		if st.Phase == phaseFailed {
+			if !strings.Contains(st.Err, "signing key unavailable") {
+				t.Fatalf("status err = %q; want the signing error", st.Err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run never failed: %+v", st)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

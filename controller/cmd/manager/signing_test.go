@@ -26,6 +26,13 @@ func TestConfigureSigning(t *testing.T) {
 	}
 	edKey := base64.StdEncoding.EncodeToString(priv)
 	strong := base64.StdEncoding.EncodeToString(make([]byte, 32)) // 44 bytes
+	// The right seed with another key's public half: 64 bytes, but inconsistent.
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := append(append([]byte{}, priv.Seed()...), otherPub...)
+	mismatched := base64.StdEncoding.EncodeToString(bad)
 
 	for _, tc := range []struct {
 		name    string
@@ -40,6 +47,7 @@ func TestConfigureSigning(t *testing.T) {
 		{name: "short secret", env: map[string]string{"AEI_SIGNING_SECRET": "too-short"}, wantErr: "want at least 32"},
 		{name: "ed25519 not base64", env: map[string]string{"AEI_ED25519_PRIVATE_KEY": "!!!"}, wantErr: "not valid base64"},
 		{name: "ed25519 wrong size", env: map[string]string{"AEI_ED25519_PRIVATE_KEY": base64.StdEncoding.EncodeToString([]byte("short"))}, wantErr: "want a 64-byte"},
+		{name: "ed25519 mismatched public half", env: map[string]string{"AEI_ED25519_PRIVATE_KEY": mismatched}, wantErr: "public half does not match its seed"},
 		{name: "strong hmac secret", env: map[string]string{"AEI_SIGNING_SECRET": strong}},
 		{name: "ed25519 key", env: map[string]string{"AEI_ED25519_PRIVATE_KEY": edKey}, wantEd: true},
 		{name: "ed25519 wins over placeholder secret", env: map[string]string{"AEI_ED25519_PRIVATE_KEY": edKey, "AEI_SIGNING_SECRET": "replace-me"}, wantEd: true},

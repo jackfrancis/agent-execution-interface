@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
@@ -39,7 +40,14 @@ func configureSigning(cfg *control.Config, getenv func(string) string) (string, 
 		if len(raw) != ed25519.PrivateKeySize {
 			return "", fmt.Errorf("AEI_ED25519_PRIVATE_KEY is %d bytes; want a %d-byte Ed25519 private key", len(raw), ed25519.PrivateKeySize)
 		}
-		cfg.Authority = control.NewEd25519Authority(ed25519.PrivateKey(raw))
+		// A Go Ed25519 private key is seed || public key. Signing uses the seed and
+		// embeds the second half in the signature computation, so a mismatched half
+		// mints credentials that the advertised public key cannot verify.
+		priv := ed25519.PrivateKey(raw)
+		if !bytes.Equal(ed25519.NewKeyFromSeed(priv.Seed()), priv) {
+			return "", errors.New("AEI_ED25519_PRIVATE_KEY is inconsistent: its public half does not match its seed")
+		}
+		cfg.Authority = control.NewEd25519Authority(priv)
 		return "Ed25519 (asymmetric, sole-minter)", nil
 	}
 	secret := getenv("AEI_SIGNING_SECRET")

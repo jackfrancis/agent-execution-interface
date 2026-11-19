@@ -245,7 +245,8 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 	if async, ok := launcher.(aei.AsyncLauncher); ok {
 		h, err := async.Dispatch(ctx, spec, cred)
 		if err != nil {
-			return aei.Result{Err: err}, err
+			res := recorded(done, aei.Result{Err: err})
+			return res, res.Err
 		}
 		watch := make(chan aei.Result, 1)
 		go func() {
@@ -269,7 +270,7 @@ func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec
 	case r := <-done:
 		return r, nil
 	case r := <-launch:
-		return r, nil
+		return recorded(done, r), nil
 	}
 }
 
@@ -306,7 +307,7 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 		// Fail closed: the run is recorded Failed (visible at GET /runs/{id}) and
 		// never dispatched with an empty credential.
 		res := aei.Result{Err: err}
-		p.observe(spec, res)
+		p.observe(spec, aei.Handle{Provider: o.provider}, res, 0)
 		p.finishRun(spec.ID, res)
 		return spec.ID, nil
 	}
@@ -403,7 +404,7 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 	if async, ok := launcher.(aei.AsyncLauncher); ok {
 		h, err := async.Dispatch(ctx, spec, cred)
 		if err != nil {
-			return aei.Result{Err: err}, h
+			return recorded(done, aei.Result{Err: err}), h
 		}
 		watch := make(chan aei.Result, 1)
 		go func() {
@@ -437,7 +438,23 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 			return r, aei.Handle{}
 		}
 	case l := <-launch:
-		return aei.Result{Err: l.err}, l.h
+		return recorded(done, aei.Result{Err: l.err}), l.h
+	}
+}
+
+// recorded prefers a terminal result already delivered on done over a provider
+// error. A runtime can fail its run while the provider is still dispatching — a
+// pull runtime whose /redeem hits a mint error, say — and the provider then
+// reports only the symptom ("redeem status 500"); the run should carry the cause.
+func recorded(done chan aei.Result, r aei.Result) aei.Result {
+	if r.Err == nil {
+		return r
+	}
+	select {
+	case d := <-done:
+		return d
+	default:
+		return r
 	}
 }
 
