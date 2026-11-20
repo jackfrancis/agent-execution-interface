@@ -16,9 +16,10 @@ import (
 	"github.com/jackfrancis/agent-execution-interface/control"
 )
 
-// durationBuckets span sub-second to the typical run deadline (~15m), sized for
-// agent runs (seconds to minutes) rather than the default web-latency buckets.
-var durationBuckets = []float64{0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180, 300, 600, 900}
+// durationBuckets span tens of milliseconds (a short queue wait or a fast provider
+// create) to the typical run deadline (~15m), sized for agent runs (seconds to
+// minutes) rather than the default web-latency buckets.
+var durationBuckets = []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180, 300, 600, 900}
 
 // Collector implements control.Observer, recording each run's terminal outcome
 // into Prometheus series labeled by task_ref, phase, and provider. It owns a
@@ -51,7 +52,8 @@ func New() *Collector {
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "aei_run_duration_seconds",
 			Help: "AEI run timing in seconds, by task, phase, provider, and stage. " +
-				"stage=total is the controller-measured wall-clock from dispatch to the terminal signal, recorded for every run; " +
+				"stage=total is the controller-measured wall-clock from admission to the terminal signal, recorded for every run; " +
+				"queue (waiting for a create slot) and dispatch (an async provider's create: credential mint plus Dispatch) are controller-measured, recorded when measured; " +
 				"provisioning (waiting for the provider to start the runtime), runtime, and model are the runtime's report, each recorded only when reported.",
 			Buckets: durationBuckets,
 		}, append(append([]string(nil), runLabels...), "stage")),
@@ -82,7 +84,11 @@ func New() *Collector {
 // runtime's report is optional (docs/runtime-abi.md §3), so each reported stage is
 // recorded only when it carries a value: a positive duration (from any source,
 // including a provider's Await that predates aei.Timing.Measured) or a zero the
-// source marked measured. An omitted stage adds no sample. The call counters are created for
+// source marked measured. An omitted stage adds no sample. Stages "queue" and
+// "dispatch" are the controller's own measurements, recorded when the run reached
+// them (RunObservation.QueueMeasured, DispatchMeasured): together with
+// "provisioning" they are the time spent waiting on the platform and the provider,
+// apart from the runtime's work and its "model" share. The call counters are created for
 // every run and grow only by a positive count; a negative count (a malformed
 // report) is ignored rather than passed to Counter.Add, which would panic.
 func (c *Collector) ObserveRun(o control.RunObservation) {
@@ -98,6 +104,12 @@ func (c *Collector) ObserveRun(o control.RunObservation) {
 		c.duration.WithLabelValues(taskRef, o.Phase, provider, name).Observe(seconds)
 	}
 	observe("total", o.Duration.Seconds())
+	if o.QueueMeasured {
+		observe("queue", o.QueueWait.Seconds())
+	}
+	if o.DispatchMeasured {
+		observe("dispatch", o.DispatchLatency.Seconds())
+	}
 	t := o.Timing
 	for _, s := range []struct {
 		name    string
