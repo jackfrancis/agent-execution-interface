@@ -295,7 +295,7 @@ func TestCallbackBeforeCommitIsWhatObserversSee(t *testing.T) {
 	p := New(Config{Secret: []byte("k"), Observer: obs})
 	p.store.SetRunning("r")
 	p.store.FinishRun("r", RunState{Phase: phaseSucceeded, ResultRef: "cb"})
-	p.observe(aei.RunSpec{TaskRef: "t"}, aei.Handle{}, p.finishRun("r", aei.Result{Err: ErrDeadlineExceeded}), 0)
+	p.observe(aei.RunSpec{TaskRef: "t"}, aei.Handle{}, p.finishRun("r", aei.Result{Err: ErrDeadlineExceeded}), time.Time{}, time.Time{}, runStages{})
 	if got := obs.snapshot(); len(got) != 1 || got[0].Phase != phaseSucceeded {
 		t.Errorf("observed %+v, want one Succeeded", got)
 	}
@@ -513,7 +513,7 @@ func TestQueuedCallbackBeatsProviderCancellation(t *testing.T) {
 		ctx, cancel := withRunDeadline(context.Background(), spec)
 		done := make(chan aei.Result, 1)
 		done <- aei.Result{ResultRef: "cb"}
-		r, _, err := p.race(ctx, &cancelledLaunch{}, spec, done, func() {}, nil)
+		r, _, err := p.race(ctx, &cancelledLaunch{}, spec, done, func() {}, nil, nil)
 		cancel()
 		if err != nil || r.Err != nil || r.ResultRef != "cb" {
 			t.Fatalf("iteration %d: got (%+v, %v), want the queued callback", i, r, err)

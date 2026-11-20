@@ -454,12 +454,29 @@ plane (the dispatch API, `Plane.Submit`); declarative `AgentRun` resources, whic
 the reconciler runs through `Plane.Run`, report their timing in
 `AgentRun.status.timing` and do not appear in these series. Every series is
 labeled by `task_ref`, `phase`, and `provider`: `aei_runs_total`;
-`aei_run_duration_seconds` by `stage`, where `total` is the run's wall-clock as
-the controller measured it (recorded for every submitted run, including one
-ended by the watch or the deadline) and `provisioning`, `runtime`, and `model`
-are the runtime's report (each recorded only when the run reported it); and
-`aei_run_model_calls_total` / `aei_run_tool_calls_total`. Time waiting for the
-provider is the `provisioning` stage; time in the model is the `model` stage.
+`aei_run_duration_seconds` by `stage`; and `aei_run_model_calls_total` /
+`aei_run_tool_calls_total`. The stages:
+
+| Stage | Measured by | What it covers |
+| --- | --- | --- |
+| `total` | controller | admission to the terminal signal; every submitted run, including one ended by the watch or the deadline |
+| `queue` | controller | waiting for a create slot (`MaxConcurrentCreates`); a run that ended while queued waited its whole `total` |
+| `dispatch` | controller | an async provider's create: minting the run credential plus `Dispatch`. Not recorded for a plain provider, whose `Launch` is the whole run |
+| `provisioning` | runtime | dispatch-start to the runtime working (cold start or resume) |
+| `runtime` | runtime | the runtime's own work |
+| `model` | runtime | the model share of `runtime` |
+
+The runtime's stages are recorded only when the run reported them. Time waiting
+on the platform and the provider is `queue`, then `dispatch`, then
+`provisioning`; time in the model is `model`. The stages run in that order but
+are not strictly additive: providers stamp `AEI_DISPATCHED_AT` inside `Dispatch`,
+so `provisioning` starts before `dispatch` ends and the two overlap. How much
+depends on the provider. The pod-shaped providers (k8s-job, agent-sandbox) stamp
+it just before creating the workload, so the overlap is that create call.
+agent-substrate stamps it after ensuring the actor and before sending the run,
+and retries the router's "actor unavailable" response with backoff until the
+actor resumes; every retry reuses the stamp, so a durable cold start's whole
+warm-up appears in both `dispatch` and `provisioning`.
 
 ---
 

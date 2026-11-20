@@ -166,6 +166,39 @@ func TestCollectorRecordsUnmarkedPositiveDuration(t *testing.T) {
 	}
 }
 
+// The controller's queue wait and dispatch latency are their own stages, apart
+// from the runtime's provisioning and model time, and each is recorded only when
+// the run reached it.
+func TestCollectorRecordsQueueAndDispatch(t *testing.T) {
+	c := New()
+	c.ObserveRun(control.RunObservation{
+		TaskRef: "github-review", Phase: "Succeeded", Provider: "agent-sandbox", Duration: 40 * time.Second,
+		QueueWait: 3 * time.Second, QueueMeasured: true,
+		DispatchLatency: 500 * time.Millisecond, DispatchMeasured: true,
+		Timing: aei.Timing{ProvisioningSeconds: 6, RuntimeSeconds: 30, ModelSeconds: 20,
+			Measured: aei.StageProvisioning | aei.StageRuntime | aei.StageModel},
+	})
+	c.ObserveRun(control.RunObservation{
+		TaskRef: "github-review", Phase: "Failed", Provider: "agent-sandbox", Duration: 15 * time.Second,
+		QueueWait: 15 * time.Second, QueueMeasured: true, // ended in the queue
+	})
+
+	f := gather(t, c)
+	ok := map[string]string{"task_ref": "github-review", "phase": "Succeeded", "provider": "agent-sandbox"}
+	for stage, want := range map[string]float64{"queue": 3, "dispatch": 0.5, "provisioning": 6, "model": 20, "total": 40} {
+		if got, present := f.value("aei_run_duration_seconds", withStage(ok, stage)); !present || got != want {
+			t.Errorf("stage %s = %v (present %v), want %v", stage, got, present, want)
+		}
+	}
+	failed := map[string]string{"task_ref": "github-review", "phase": "Failed", "provider": "agent-sandbox"}
+	if got, _ := f.value("aei_run_duration_seconds", withStage(failed, "queue")); got != 15 {
+		t.Errorf("queued run's queue stage = %v, want 15", got)
+	}
+	if _, present := f.value("aei_run_duration_seconds", withStage(failed, "dispatch")); present {
+		t.Error("a run that never reached Dispatch should record no dispatch stage")
+	}
+}
+
 func withStage(l map[string]string, stage string) map[string]string {
 	out := map[string]string{"stage": stage}
 	for k, v := range l {
