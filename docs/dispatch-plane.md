@@ -82,7 +82,16 @@ Content-Type: application/json
 ```
 
 The body is the `AgentRunSpec` fields (camelCase — the same CRD schema the app SDK
-already models) plus `app`. `providerClassName` is ignored: the `AgentApp` fixes
+already models) plus `app`. Every run has a deadline the controller enforces
+itself: an omitted or zero `timeoutSeconds` gets the controller's default (15m,
+`-run-default-timeout`), and a value above its maximum (1h, `-run-max-timeout`)
+is reduced to the maximum (a value too large to represent is treated as above the
+maximum). The deadline is an absolute instant fixed when the controller accepts the
+run, so minting the run credential and provisioning count against it, and the runtime's `AEI_DEADLINE` is
+that same instant. When it passes before the runtime's callback or the provider
+reports an outcome, the run ends `Failed` with a `run deadline exceeded` message,
+whether or not the provider honors cancellation; a callback that arrives later does
+not change it. `providerClassName` is ignored: the `AgentApp` fixes
 the class. Dispatch is **non-blocking** — the run outlives the request; its
 outcome lands off-API (below).
 
@@ -91,22 +100,22 @@ Dispatch is also **bounded**. The control plane runs at most
 provider and both ingresses, and lets at most `--max-queued-runs` dispatched runs
 wait for one (default 128) — the limits ZZ's orchestrator applied. A run stops
 counting against either limit once its create returns; awaiting completion holds
-no slot. Minting the run credential and the provider's `Dispatch` together get
-at most `--create-timeout` (default 2m); past it the create is abandoned and the
-run fails, so one unavailable substrate or credential backend cannot stall the
-others; a `Dispatch` that has already accepted the workload is watched, not
-failed. Each credential backend (the ticket store, the signing authority, and
-each provider's `PullsCredential`) has at most twice `--max-concurrent-creates`
-calls outstanding, including ones abandoned at the timeout, so an outage in one
-does not stop runs that need only another. A credential's expiry is set once its
-call has capacity, so waiting for it does not shorten the credential's life. (A provider without the async capability
-blocks in `Launch` for the whole run, so it holds its slot until `Launch` returns,
-bounded by the run deadline, or 15m if the run has none.)
-The run credential is minted, and the provider handed the run's remaining time,
-only once the create starts, so time in the queue spends neither a pull ticket nor
-the workload's own deadline.
-An AgentRun waits in the same queue rather than being refused. Beyond the queue
-limit the request is refused at once, with nothing recorded:
+no slot. Minting the run credential and the provider's `Dispatch` together get at
+most `--create-timeout` (default 2m); past it the create is abandoned and the run
+fails, so one unavailable substrate or credential backend cannot stall the others.
+A `Dispatch` that has already accepted the workload is watched, not failed. A
+provider without the async capability blocks in `Launch` for the whole run, so it
+holds its slot until `Launch` returns, bounded by the run's deadline.
+
+The credential is minted only once the create starts, so time in the queue does
+not spend a pull ticket, and its expiry is set once its call has capacity. Each
+credential backend — the ticket store, the signing authority, and each provider
+class's `PullsCredential` — has at most twice `--max-concurrent-creates` calls
+outstanding, including ones abandoned at the timeout, so an outage in one does not
+stop runs that need only another. Time in the queue does count against the run's
+deadline, which is fixed when the run is submitted. An AgentRun waits in the same
+queue rather than being refused. Beyond the queue limit the request is refused at
+once, with nothing recorded:
 
 ```http
 429 Too Many Requests

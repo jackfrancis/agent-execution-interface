@@ -408,7 +408,9 @@ Settled after review; recorded so the rationale survives.
   string keeps AEI's reserved surface minimal and gives the app exactly one decode
   site. (Considered a nested metadata object; rejected as more surface for no gain.)
 - **Deadline — absolute unix-millis (`AEI_DEADLINE`).** Robust to dispatch
-  latency and symmetric with `AEI_DISPATCHED_AT`. (Considered a seconds budget;
+  latency and symmetric with `AEI_DISPATCHED_AT`. It is the control plane's own
+  cutoff (`RunSpec.DeadlineAt`), fixed before dispatch, so the runtime stops by the
+  instant the plane would record a timeout. (Considered a seconds budget;
   rejected as ambiguous once dispatch latency is non-trivial.)
 - **Result pointer — an opaque `result_ref` on `/complete`.** Carried for
   `status.resultRef` observability and **never parsed**; where the result lives is

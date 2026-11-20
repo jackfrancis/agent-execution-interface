@@ -38,12 +38,15 @@ import (
 
 func main() {
 	var abiAddr string
+	var runDefaultTimeout, runMaxTimeout time.Duration
 	flag.StringVar(&abiAddr, "abi-addr", ":8080", "address to serve the runtime ABI (/complete, /redeem, /vend)")
 	var maxCreates, maxQueued int
 	flag.IntVar(&maxCreates, "max-concurrent-creates", control.DefaultMaxConcurrentCreates, "maximum provider creates (Dispatch/Launch) in progress at once, across all providers")
 	flag.IntVar(&maxQueued, "max-queued-runs", control.DefaultMaxQueued, "maximum dispatched runs waiting for a create slot; beyond it /dispatch answers 429")
 	var createTimeout time.Duration
 	flag.DurationVar(&createTimeout, "create-timeout", control.DefaultCreateTimeout, "maximum time minting a run credential plus an async provider's Dispatch may hold a create slot; the create is abandoned and the run fails at it")
+	flag.DurationVar(&runDefaultTimeout, "run-default-timeout", 0, "deadline for a run dispatched without a timeout (0 = 15m)")
+	flag.DurationVar(&runMaxTimeout, "run-max-timeout", 0, "longest deadline a run may have; a longer timeout is reduced to it (0 = 1h)")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -67,6 +70,10 @@ func main() {
 		MaxConcurrentCreates: maxCreates,
 		MaxQueued:            maxQueued,
 		CreateTimeout:        createTimeout,
+		// Every run gets a deadline the controller enforces itself: a dispatch or
+		// AgentRun without a timeout gets the default, and a longer one is capped.
+		DefaultDeadline: runDefaultTimeout,
+		MaxDeadline:     runMaxTimeout,
 	}
 	// An app with an asymmetric identity posture (a sole-minter control tier and a
 	// verify-only app tier) provisions the control plane with its Ed25519 private

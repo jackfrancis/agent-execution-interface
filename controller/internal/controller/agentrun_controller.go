@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -84,15 +83,17 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	go r.runAndReport(req.NamespacedName, launcher, toRunSpec(&run, class))
+	go r.runAndReport(req.NamespacedName, launcher, toRunSpec(&run, class), class.Name)
 	return ctrl.Result{}, nil
 }
 
 // runAndReport drives the run to completion through the shared plane (blocking:
 // it races the callback, the watch, and the deadline) and records the terminal
-// outcome on the AgentRun's status, retrying on write conflicts.
-func (r *AgentRunReconciler) runAndReport(nn types.NamespacedName, launcher aei.Launcher, spec aei.RunSpec) {
-	res, _ := r.Plane.Run(context.Background(), launcher, spec)
+// outcome on the AgentRun's status, retrying on write conflicts. className is the
+// launcher's provider class, its stable identity for the plane's per-provider
+// credential-check bound.
+func (r *AgentRunReconciler) runAndReport(nn types.NamespacedName, launcher aei.Launcher, spec aei.RunSpec, className string) {
+	res, _ := r.Plane.Run(context.Background(), launcher, spec, control.WithProviderClass(className))
 
 	_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var run aeiv1.AgentRun
@@ -204,7 +205,7 @@ func toRunSpec(run *aeiv1.AgentRun, class *aeiv1.AgentProviderClass) aei.RunSpec
 			Scopes:   run.Spec.Identity.Scopes,
 			Audience: run.Spec.Identity.Audience,
 		},
-		Deadline:     time.Duration(run.Spec.TimeoutSeconds) * time.Second,
+		Deadline:     control.DeadlineFromSeconds(run.Spec.TimeoutSeconds),
 		AppNamespace: run.Namespace,
 		Session:      run.Spec.Session,
 		Metadata: map[string]string{

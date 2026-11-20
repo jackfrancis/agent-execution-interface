@@ -74,7 +74,7 @@ type gated struct {
 	peak     atomic.Int32
 
 	mu        sync.Mutex
-	deadlines map[string]time.Duration // spec.Deadline each Dispatch was handed
+	deadlines map[string]time.Duration // budget left (to the run's cutoff) at each Dispatch
 	creds     map[string]aei.Credential
 }
 
@@ -94,7 +94,8 @@ func (g *gated) Dispatch(_ context.Context, spec aei.RunSpec, cred aei.Credentia
 	if g.deadlines == nil {
 		g.deadlines, g.creds = map[string]time.Duration{}, map[string]aei.Credential{}
 	}
-	g.deadlines[spec.ID], g.creds[spec.ID] = spec.Deadline, cred
+	// The budget the provider has left: until the cutoff the plane enforces.
+	g.deadlines[spec.ID], g.creds[spec.ID] = time.Until(spec.Cutoff(time.Now())), cred
 	g.mu.Unlock()
 	if g.entered != nil {
 		g.entered <- spec.ID
@@ -643,30 +644,30 @@ func TestOutstandingMintsBounded(t *testing.T) {
 }
 
 // ctxLaunch is a plain Launcher that runs until its context ends, recording the
-// Deadline it was handed.
+// budget it was handed (until the run's cutoff).
 type ctxLaunch struct{ handed chan time.Duration }
 
 func (c ctxLaunch) Launch(ctx context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
-	c.handed <- spec.Deadline
+	c.handed <- time.Until(spec.Cutoff(time.Now()))
 	<-ctx.Done()
 	return aei.Handle{}, ctx.Err()
 }
 
-// A plain provider's Launch holds its create slot until it returns, so a run with
-// no deadline still gets one; one that waits on ctx then ends and frees the slot.
-func TestPlainLaunchGetsFallbackDeadline(t *testing.T) {
-	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1})
-	p.launchDeadline = 100 * time.Millisecond
+// A plain provider's Launch holds its create slot until it returns, so a run
+// dispatched with no timeout must still have a deadline: the plane default. A
+// Launch that waits on ctx then ends and frees the slot.
+func TestPlainLaunchWithoutTimeoutEndsAtDefaultDeadline(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, DefaultDeadline: 100 * time.Millisecond})
 	l := ctxLaunch{handed: make(chan time.Duration, 1)}
 	id, err := p.Submit(context.Background(), l, aei.RunSpec{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if d := <-l.handed; d <= 0 || d > 100*time.Millisecond {
-		t.Errorf("Launch was handed Deadline %v, want the fallback (<= 100ms)", d)
+		t.Errorf("Launch was handed a budget of %v, want the default deadline (<= 100ms)", d)
 	}
 	if st := mustTerminal(t, p, id); st.Phase != phaseFailed {
-		t.Fatalf("deadline-less plain run = %+v, want Failed at the fallback deadline", st)
+		t.Fatalf("plain run without a timeout = %+v, want Failed at the default deadline", st)
 	}
 	good, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{})
 	if err != nil {
@@ -820,6 +821,88 @@ func TestCapabilityChecksIsolatedPerLauncher(t *testing.T) {
 
 	close(stuck.release)
 	waitFor(t, func() bool { return capabilityPools(p) == 0 }) // no entry outlives its calls
+}
+
+// valuePull is a launcher used by value whose type is comparable but whose value
+// is not: cfg, an interface field, holds a slice. Its PullsCredential blocks on
+// block when that is set.
+type valuePull struct {
+	cfg   any
+	block chan struct{}
+}
+
+func (v valuePull) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	return aei.Handle{}, nil
+}
+func (v valuePull) Dispatch(_ context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	return aei.Handle{Ref: spec.ID}, nil
+}
+func (v valuePull) Await(context.Context, aei.Handle) (aei.Result, error) {
+	return aei.Result{ResultRef: "value"}, nil
+}
+func (v valuePull) PullsCredential() bool {
+	if v.block != nil {
+		<-v.block
+	}
+	return true
+}
+
+// A launcher whose type is comparable but whose value is not (an interface field
+// holding a slice) must not panic as a map key while the plane's lock is held:
+// that left the mutex locked and every later submission and callback blocked.
+func TestNonComparableLauncherValueDoesNotWedgePlane(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog})
+	l := valuePull{cfg: []string{"a", "b"}}
+	for i := range 2 {
+		id, err := p.Submit(context.Background(), l, aei.RunSpec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := mustTerminal(t, p, id); st.Phase != phaseSucceeded {
+			t.Fatalf("run %d with a non-comparable launcher value = %+v, want Succeeded", i, st)
+		}
+	}
+	if r, err := p.Run(context.Background(), l, aei.RunSpec{Deadline: 2 * time.Second}); err != nil || r.Err != nil {
+		t.Fatalf("Run with a non-comparable launcher value = %+v, %v", r, err)
+	}
+	locked := make(chan struct{})
+	go func() { p.mu.Lock(); p.mu.Unlock(); close(locked) }()
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("the plane's mutex was left locked")
+	}
+}
+
+// Separately configured launchers of one type, used by value with no comparable
+// identity, get their own PullsCredential permits when the caller names their
+// provider class, on both Submit and Run.
+func TestValueLaunchersIsolatedByProviderClass(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 30 * time.Millisecond})
+	stuck := valuePull{cfg: []string{"stuck"}, block: make(chan struct{})}
+	defer close(stuck.block)
+	for range 2 { // both of the stuck class's permits held by blocked calls
+		id, err := p.Submit(context.Background(), stuck, aei.RunSpec{}, WithProviderClass("stuck"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := mustTerminal(t, p, id); st.Phase != phaseFailed {
+			t.Fatalf("stuck class run = %+v, want Failed", st)
+		}
+	}
+
+	healthy := valuePull{cfg: []string{"healthy"}}
+	id, err := p.Submit(context.Background(), healthy, aei.RunSpec{}, WithProviderClass("healthy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := mustTerminal(t, p, id); st.Phase != phaseSucceeded {
+		t.Fatalf("healthy class (Submit) while another is stuck = %+v, want Succeeded", st)
+	}
+	r, err := p.Run(context.Background(), healthy, aei.RunSpec{Deadline: 2 * time.Second}, WithProviderClass("healthy"))
+	if err != nil || r.Err != nil || r.ResultRef != "value" {
+		t.Fatalf("healthy class (Run) while another is stuck = %+v, %v; want Succeeded", r, err)
+	}
 }
 
 func waitFor(t *testing.T, cond func() bool) {
