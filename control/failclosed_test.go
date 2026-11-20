@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -101,10 +102,41 @@ func TestRunFailsWhenMintFails(t *testing.T) {
 	}
 }
 
-// recordingObserver captures each run observation.
-type recordingObserver struct{ runs []RunObservation }
+// recordingObserver captures each run observation (Submit observes from its own
+// goroutine, hence the lock).
+type recordingObserver struct {
+	mu   sync.Mutex
+	runs []RunObservation
+}
 
-func (o *recordingObserver) ObserveRun(r RunObservation) { o.runs = append(o.runs, r) }
+func (o *recordingObserver) ObserveRun(r RunObservation) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.runs = append(o.runs, r)
+}
+
+func (o *recordingObserver) snapshot() []RunObservation {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]RunObservation(nil), o.runs...)
+}
+
+// waitFailed polls a submitted run until it is Failed (minting runs under the
+// run's deadline, after Submit returns) and returns its state.
+func waitFailed(t *testing.T, p *Plane, id string) RunState {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if st, _ := p.Status(id); st.Phase == phaseFailed {
+			return st
+		}
+		if time.Now().After(deadline) {
+			st, _ := p.Status(id)
+			t.Fatalf("run %s never failed: %+v", id, st)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
 
 // Submit (the data-plane path): a mint error records the run Failed, visible at
 // GET /runs/{id}, and never dispatches it.
@@ -116,20 +148,22 @@ func TestSubmitMarksRunFailedWhenMintFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
-	st, ok := p.Status(id)
-	if !ok || st.Phase != phaseFailed {
-		t.Fatalf("status = %+v (known=%v); want Failed", st, ok)
-	}
+	st := waitFailed(t, p, id)
 	if !strings.Contains(st.Err, "signing key unavailable") {
 		t.Errorf("status error %q should carry the mint failure", st.Err)
 	}
 	if l.launched != 0 {
 		t.Errorf("launched %d times; a run without a credential must not dispatch", l.launched)
 	}
-	if len(obs.runs) != 1 {
-		t.Fatalf("observed %d runs; want exactly 1", len(obs.runs))
+	// The observation follows the store write in the same goroutine.
+	var runs []RunObservation
+	for end := time.Now().Add(time.Second); len(runs) == 0 && time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+		runs = obs.snapshot()
 	}
-	if r := obs.runs[0]; r.Phase != phaseFailed || r.Provider != "k8s-job" || r.TaskRef != "t" {
+	if len(runs) != 1 {
+		t.Fatalf("observed %d runs; want exactly 1", len(runs))
+	}
+	if r := runs[0]; r.Phase != phaseFailed || r.Provider != "k8s-job" || r.TaskRef != "t" {
 		t.Errorf("observation = %+v; want Failed, attributed to k8s-job and task t", r)
 	}
 }
@@ -188,28 +222,19 @@ func (d redeemingDispatcher) Dispatch(_ context.Context, spec aei.RunSpec, cred 
 func TestRedeemDuringDispatchKeepsSigningError(t *testing.T) {
 	p := New(Config{Authority: failingAuthority{}})
 	res, err := p.Run(context.Background(), &redeemingDispatcher{p: p}, aei.RunSpec{ID: "run-sub"})
-	if err == nil || !strings.Contains(err.Error(), "signing key unavailable") {
-		t.Fatalf("Run err = %v; want the signing error", err)
-	}
 	if res.Err == nil || !strings.Contains(res.Err.Error(), "signing key unavailable") {
 		t.Fatalf("Run result err = %v; want the signing error", res.Err)
+	}
+	// The runtime's recorded outcome and the provider's report race; either way
+	// the error Run returns is nil or that same cause, never "redeem status 500".
+	if err != nil && !strings.Contains(err.Error(), "signing key unavailable") {
+		t.Fatalf("Run err = %v; want nil or the signing error", err)
 	}
 
 	p2 := New(Config{Authority: failingAuthority{}})
 	id, _ := p2.Submit(context.Background(), &redeemingDispatcher{p: p2}, aei.RunSpec{ID: "run-sub2"})
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		st, _ := p2.Status(id)
-		if st.Phase == phaseFailed {
-			if !strings.Contains(st.Err, "signing key unavailable") {
-				t.Fatalf("status err = %q; want the signing error", st.Err)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("run never failed: %+v", st)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if st := waitFailed(t, p2, id); !strings.Contains(st.Err, "signing key unavailable") {
+		t.Fatalf("status err = %q; want the signing error", st.Err)
 	}
 }
 
@@ -223,26 +248,17 @@ func TestRedeemOnAnotherReplicaKeepsSigningError(t *testing.T) {
 	receiver := New(Config{Authority: failingAuthority{}, Store: shared})
 
 	res, err := dispatcher.Run(context.Background(), &redeemingDispatcher{p: receiver}, aei.RunSpec{ID: "run-ha-sign"})
-	if err == nil || !strings.Contains(err.Error(), "signing key unavailable") {
-		t.Fatalf("Run err = %v; want the signing error", err)
-	}
 	if res.Err == nil || !strings.Contains(res.Err.Error(), "signing key unavailable") {
 		t.Fatalf("Run result err = %v; want the signing error", res.Err)
 	}
+	// The runtime's recorded outcome and the provider's report race; either way
+	// the error Run returns is nil or that same cause, never "redeem status 500".
+	if err != nil && !strings.Contains(err.Error(), "signing key unavailable") {
+		t.Fatalf("Run err = %v; want nil or the signing error", err)
+	}
 
 	id, _ := dispatcher.Submit(context.Background(), &redeemingDispatcher{p: receiver}, aei.RunSpec{ID: "run-ha-sign2"})
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		st, _ := dispatcher.Status(id)
-		if st.Phase == phaseFailed {
-			if !strings.Contains(st.Err, "signing key unavailable") {
-				t.Fatalf("status err = %q; want the signing error", st.Err)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("run never failed: %+v", st)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if st := waitFailed(t, dispatcher, id); !strings.Contains(st.Err, "signing key unavailable") {
+		t.Fatalf("status err = %q; want the signing error", st.Err)
 	}
 }

@@ -47,7 +47,10 @@ type AgentRunSpec struct {
 	// +optional
 	Requirements Requirements `json:"requirements,omitempty"`
 
-	// TimeoutSeconds bounds the run's wall clock and is the completion backstop.
+	// TimeoutSeconds bounds the run's wall clock and is the completion backstop:
+	// the controller ends the run as Failed when it passes. Unset or zero uses the
+	// controller's default (15m unless configured); a value above the controller's
+	// maximum (1h unless configured) is reduced to it.
 	// +optional
 	TimeoutSeconds int64 `json:"timeoutSeconds,omitempty"`
 }

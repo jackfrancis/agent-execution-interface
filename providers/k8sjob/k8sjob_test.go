@@ -219,3 +219,55 @@ func TestTolerationsFromClassParameter(t *testing.T) {
 		t.Error("a malformed tolerations parameter must be an error")
 	}
 }
+
+// TestActiveDeadlineFollowsPlaneCutoff: the Job's activeDeadlineSeconds is the
+// budget left until the plane's cutoff, rounded up to whole seconds and never 0,
+// so the Job backstop never ends a run before the plane does.
+func TestActiveDeadlineFollowsPlaneCutoff(t *testing.T) {
+	l := testLauncher()
+	now := l.now()
+	for _, c := range []struct {
+		name string
+		spec aei.RunSpec
+		want int64
+	}{
+		{"sub-second budget rounds up to 1", aei.RunSpec{ID: "a", Deadline: 500 * time.Millisecond, DeadlineAt: now.Add(500 * time.Millisecond)}, 1},
+		{"fractional budget rounds up", aei.RunSpec{ID: "b", Deadline: 90 * time.Second, DeadlineAt: now.Add(2500 * time.Millisecond)}, 3},
+		{"provisioning time comes out of the budget", aei.RunSpec{ID: "c", Deadline: time.Minute, DeadlineAt: now.Add(40 * time.Second)}, 40},
+		{"cutoff already passed still gives 1", aei.RunSpec{ID: "d", Deadline: time.Second, DeadlineAt: now.Add(-time.Second)}, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			job := l.job(c.spec, aei.Credential{Value: "tok"}, now)
+			if got := job.Spec.ActiveDeadlineSeconds; got == nil || *got != c.want {
+				t.Errorf("activeDeadlineSeconds = %v, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+// TestActiveDeadlineCoversFractionalStart: Kubernetes stores the Job's startTime
+// rounded down to the second, so a Job dispatched 900ms into a second with a
+// 500ms budget must get 2s — 1s from the stored start would expire it 400ms
+// before the plane's cutoff.
+func TestActiveDeadlineCoversFractionalStart(t *testing.T) {
+	l := testLauncher()
+	for _, c := range []struct {
+		name   string
+		offset time.Duration // into the second at dispatch
+		budget time.Duration
+		want   int64
+	}{
+		{"900ms in, 500ms budget", 900 * time.Millisecond, 500 * time.Millisecond, 2},
+		{"100ms in, 500ms budget", 100 * time.Millisecond, 500 * time.Millisecond, 1},
+		{"999ms in, 5m budget", 999 * time.Millisecond, 5 * time.Minute, 301},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dispatched := l.now().Add(c.offset)
+			cutoff := dispatched.Add(c.budget)
+			job := l.job(aei.RunSpec{ID: "f", Deadline: c.budget, DeadlineAt: cutoff}, aei.Credential{Value: "tok"}, dispatched)
+			if got := job.Spec.ActiveDeadlineSeconds; got == nil || *got != c.want {
+				t.Errorf("activeDeadlineSeconds = %v, want %d", got, c.want)
+			}
+		})
+	}
+}

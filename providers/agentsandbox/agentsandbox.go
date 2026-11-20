@@ -266,8 +266,8 @@ func (l *Launcher) sandbox(spec aei.RunSpec, cred aei.Credential, dispatchedAt t
 	u.SetLabels(runtimespec.Labels(spec))
 	_ = unstructured.SetNestedMap(u.Object, podMap, "spec", "podTemplate", "spec")
 	_ = unstructured.SetNestedStringMap(u.Object, runtimespec.Labels(spec), "spec", "podTemplate", "metadata", "labels")
-	if spec.Deadline > 0 {
-		shutdownAt := dispatchedAt.Add(spec.Deadline + shutdownGrace).UTC().Format(time.RFC3339)
+	if cutoff := spec.Cutoff(dispatchedAt); !cutoff.IsZero() {
+		shutdownAt := cutoff.Add(shutdownGrace).UTC().Format(time.RFC3339)
 		// Both fields sit directly under spec in the Sandbox API. A path the CRD
 		// does not define is pruned by the API server without an error, which leaves
 		// the default policy (Retain) and no shutdown time: the Sandbox then outlives

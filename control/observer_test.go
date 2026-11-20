@@ -60,7 +60,7 @@ func TestSubmitObservesTerminalRun(t *testing.T) {
 	}
 	waitTerminal(t, p, runID)
 
-	got := obs.snapshot()
+	got := obs.waitObserved(t, 1)
 	if len(got) != 1 {
 		t.Fatalf("expected exactly one observation, got %d", len(got))
 	}
@@ -84,7 +84,7 @@ func TestSubmitObservesFailedRun(t *testing.T) {
 	}
 	waitTerminal(t, p, runID)
 
-	got := obs.snapshot()
+	got := obs.waitObserved(t, 1)
 	if len(got) != 1 || got[0].Phase != phaseFailed || got[0].TaskRef != "github-ingest" {
 		t.Fatalf("observed %+v, want one Failed github-ingest observation", got)
 	}
@@ -187,7 +187,7 @@ func TestSubmitObservesTimedOutRunDuration(t *testing.T) {
 	<-fa.dispatched
 	waitTerminal(t, p, runID)
 
-	got := obs.snapshot()
+	got := obs.waitObserved(t, 1)
 	if len(got) != 1 {
 		t.Fatalf("expected exactly one observation, got %d", len(got))
 	}
@@ -213,7 +213,7 @@ func TestSubmitObservesSyncProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitTerminal(t, p, runID)
-	if got := obs.snapshot(); len(got) != 1 || got[0].Provider != "sync-fake" || got[0].Phase != phaseSucceeded {
+	if got := obs.waitObserved(t, 1); len(got) != 1 || got[0].Provider != "sync-fake" || got[0].Phase != phaseSucceeded {
 		t.Fatalf("observed %+v, want one Succeeded run from sync-fake", got)
 	}
 }

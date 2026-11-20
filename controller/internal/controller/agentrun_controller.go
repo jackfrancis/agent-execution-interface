@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -204,7 +203,7 @@ func toRunSpec(run *aeiv1.AgentRun, class *aeiv1.AgentProviderClass) aei.RunSpec
 			Scopes:   run.Spec.Identity.Scopes,
 			Audience: run.Spec.Identity.Audience,
 		},
-		Deadline:     time.Duration(run.Spec.TimeoutSeconds) * time.Second,
+		Deadline:     control.DeadlineFromSeconds(run.Spec.TimeoutSeconds),
 		AppNamespace: run.Namespace,
 		Session:      run.Spec.Session,
 		Metadata: map[string]string{

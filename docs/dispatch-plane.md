@@ -82,7 +82,16 @@ Content-Type: application/json
 ```
 
 The body is the `AgentRunSpec` fields (camelCase — the same CRD schema the app SDK
-already models) plus `app`. `providerClassName` is ignored: the `AgentApp` fixes
+already models) plus `app`. Every run has a deadline the controller enforces
+itself: an omitted or zero `timeoutSeconds` gets the controller's default (15m,
+`-run-default-timeout`), and a value above its maximum (1h, `-run-max-timeout`)
+is reduced to the maximum (a value too large to represent is treated as above the
+maximum). The deadline is an absolute instant fixed when the controller accepts the
+run, so minting the run credential and provisioning count against it, and the runtime's `AEI_DEADLINE` is
+that same instant. When it passes before the runtime's callback or the provider
+reports an outcome, the run ends `Failed` with a `run deadline exceeded` message,
+whether or not the provider honors cancellation; a callback that arrives later does
+not change it. `providerClassName` is ignored: the `AgentApp` fixes
 the class. Dispatch is **non-blocking** — the run outlives the request; its
 outcome lands off-API (below).
 
