@@ -93,7 +93,7 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // launcher's provider class, its stable identity for the plane's per-provider
 // credential-check bound.
 func (r *AgentRunReconciler) runAndReport(nn types.NamespacedName, launcher aei.Launcher, spec aei.RunSpec, className string) {
-	res, _ := r.Plane.Run(context.Background(), launcher, spec, control.WithProviderClass(className))
+	res, _ := r.Plane.RunWithOptions(context.Background(), launcher, spec, control.WithProviderClass(className))
 
 	_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var run aeiv1.AgentRun

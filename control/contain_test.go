@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -732,7 +733,7 @@ func TestTicketStoreOutageDoesNotBlockTokenRuns(t *testing.T) {
 func capabilityPools(p *Plane) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.capabilityCalls)
+	return len(p.providerPools)
 }
 
 // A credential's expiry is set once its step holds a permit, not when the run
@@ -899,9 +900,154 @@ func TestValueLaunchersIsolatedByProviderClass(t *testing.T) {
 	if st := mustTerminal(t, p, id); st.Phase != phaseSucceeded {
 		t.Fatalf("healthy class (Submit) while another is stuck = %+v, want Succeeded", st)
 	}
-	r, err := p.Run(context.Background(), healthy, aei.RunSpec{Deadline: 2 * time.Second}, WithProviderClass("healthy"))
+	r, err := p.RunWithOptions(context.Background(), healthy, aei.RunSpec{Deadline: 2 * time.Second}, WithProviderClass("healthy"))
 	if err != nil || r.Err != nil || r.ResultRef != "value" {
 		t.Fatalf("healthy class (Run) while another is stuck = %+v, %v; want Succeeded", r, err)
+	}
+}
+
+// Run keeps the signature callers may have declared in their own interfaces.
+var _ interface {
+	Run(context.Context, aei.Launcher, aei.RunSpec) (aei.Result, error)
+} = (*Plane)(nil)
+
+// deafDispatch is an AsyncLauncher whose Dispatch ignores its context: it returns
+// a handle only when release is closed, however long that takes.
+type deafDispatch struct {
+	release chan struct{}
+	calls   *atomic.Int32
+}
+
+func (d deafDispatch) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	return aei.Handle{}, nil
+}
+func (d deafDispatch) Dispatch(_ context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	d.calls.Add(1)
+	defer d.calls.Add(-1)
+	<-d.release
+	return aei.Handle{Ref: spec.ID}, nil
+}
+func (d deafDispatch) Await(context.Context, aei.Handle) (aei.Result, error) {
+	return aei.Result{ResultRef: "late"}, nil
+}
+
+// A Dispatch that ignores cancellation holds the global create slot only until
+// the create timeout. While it stays blocked, healthy providers dispatch; the deaf
+// provider's own in-flight calls are bounded (2*MaxConcurrentCreates), its next
+// run is refused at once, and a workload it accepts late is watched, not orphaned.
+func TestDeafDispatchDoesNotHoldGlobalSlot(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 30 * time.Millisecond})
+	deaf := deafDispatch{release: make(chan struct{}), calls: new(atomic.Int32)}
+
+	var deafRuns []string
+	for range 2 { // fill the deaf provider's in-flight permits
+		id, err := p.Submit(context.Background(), deaf, aei.RunSpec{Deadline: 10 * time.Second}, WithProviderClass("deaf"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		deafRuns = append(deafRuns, id)
+	}
+	waitFor(t, func() bool { return deaf.calls.Load() == 2 })
+
+	refused, err := p.Submit(context.Background(), deaf, aei.RunSpec{Deadline: 10 * time.Second}, WithProviderClass("deaf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := mustTerminal(t, p, refused); st.Phase != phaseFailed || !strings.Contains(st.Err, "still in flight past the create timeout") {
+		t.Fatalf("third deaf run = %+v, want refused at once", st)
+	}
+
+	// Healthy dispatch while both deaf calls are still blocked.
+	for _, path := range []string{"submit", "run"} {
+		if path == "submit" {
+			id, err := p.Submit(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{Deadline: 2 * time.Second}, WithProviderClass("healthy"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st := mustTerminal(t, p, id); st.Phase != phaseSucceeded {
+				t.Fatalf("healthy Submit while a Dispatch ignores cancellation = %+v, want Succeeded", st)
+			}
+		} else if r, err := p.RunWithOptions(context.Background(), &fakeWatch{result: aei.Result{ResultRef: "fine"}}, aei.RunSpec{Deadline: 2 * time.Second}, WithProviderClass("healthy")); err != nil || r.Err != nil {
+			t.Fatalf("healthy Run while a Dispatch ignores cancellation = %+v, %v", r, err)
+		}
+	}
+	if n := deaf.calls.Load(); n != 2 {
+		t.Fatalf("deaf Dispatch calls in flight = %d, want still 2", n)
+	}
+
+	close(deaf.release) // the deaf provider accepts both workloads, late
+	for _, id := range deafRuns {
+		if st := mustTerminal(t, p, id); st.Phase != phaseSucceeded || st.ResultRef != "late" {
+			t.Fatalf("late-accepted deaf run = %+v, want watched to Succeeded", st)
+		}
+	}
+	waitFor(t, func() bool { return capabilityPools(p) == 0 })
+}
+
+// A plain run that never reached Launch (it waited in the queue past its
+// deadline) is reported as undispatched.
+func TestQueuedPlainRunReportedUndispatched(t *testing.T) {
+	g := &gated{gate: make(chan struct{}), entered: make(chan string, 1)}
+	defer close(g.gate)
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1})
+	if _, err := p.Submit(context.Background(), g, aei.RunSpec{Deadline: 5 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	<-g.entered // a healthy create holds the only slot
+
+	l := ctxLaunch{handed: make(chan time.Duration, 1)}
+	r, err := p.Run(context.Background(), l, aei.RunSpec{Deadline: 50 * time.Millisecond})
+	if err == nil || r.Err == nil || !errors.Is(err, ErrDeadlineExceeded) {
+		t.Fatalf("queued plain Run = %+v, %v; want a dispatch error at the deadline", r, err)
+	}
+	select {
+	case <-l.handed:
+		t.Fatal("Launch was entered")
+	default:
+	}
+}
+
+// nanPull is a value launcher whose only field is NaN: comparable, but never
+// equal to itself. Its PullsCredential blocks until release.
+type nanPull struct {
+	f       float64
+	release chan struct{}
+	calls   *atomic.Int32
+}
+
+func (n nanPull) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	return aei.Handle{}, nil
+}
+func (n nanPull) Dispatch(_ context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	return aei.Handle{Ref: spec.ID}, nil
+}
+func (n nanPull) Await(context.Context, aei.Handle) (aei.Result, error) {
+	return aei.Result{}, nil
+}
+func (n nanPull) PullsCredential() bool {
+	n.calls.Add(1)
+	defer n.calls.Add(-1)
+	<-n.release
+	return true
+}
+
+// A launcher value containing NaN still maps to one permit pool, so its calls stay
+// bounded instead of each run creating a fresh pool.
+func TestNaNLauncherStaysBounded(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog, MaxConcurrentCreates: 1, CreateTimeout: 30 * time.Millisecond})
+	l := nanPull{f: math.NaN(), release: make(chan struct{}), calls: new(atomic.Int32)}
+	defer close(l.release)
+	for i := range 4 {
+		id, err := p.Submit(context.Background(), l, aei.RunSpec{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := mustTerminal(t, p, id); st.Phase != phaseFailed {
+			t.Fatalf("run %d = %+v, want Failed", i, st)
+		}
+	}
+	if n := l.calls.Load(); n != 2 {
+		t.Fatalf("PullsCredential calls in flight = %d, want 2 (one bounded pool)", n)
 	}
 }
 

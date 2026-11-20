@@ -103,9 +103,13 @@ counting against either limit once its create returns; awaiting completion holds
 no slot. Minting the run credential and the provider's `Dispatch` together get at
 most `--create-timeout` (default 2m); past it the create is abandoned and the run
 fails, so one unavailable substrate or credential backend cannot stall the others.
-A `Dispatch` that has already accepted the workload is watched, not failed. A
-provider without the async capability blocks in `Launch` for the whole run, so it
-holds its slot until `Launch` returns, bounded by the run's deadline.
+A `Dispatch` that ignores cancellation gives up its global slot at the timeout
+anyway; the run keeps waiting for it until its deadline (a workload accepted late
+is watched, not orphaned), and it counts against its own provider class's limit
+of twice `--max-concurrent-creates` in-flight `Dispatch` calls, beyond which that
+provider's next runs are refused at once. A provider without the async capability
+blocks in `Launch` for the whole run, so it holds its slot until `Launch` returns,
+bounded by the run's deadline; such a `Launch` must honor cancellation.
 
 The credential is minted only once the create starts, so time in the queue does
 not spend a pull ticket, and its expiry is set once its call has capacity. Each
