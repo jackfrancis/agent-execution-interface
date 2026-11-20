@@ -61,21 +61,24 @@ const (
 	alreadyExists = `1^^error: failed to create secret secrets "aei-signing" already exists`
 	noKeyAtRV5    = `0^5 ^`
 	hasKey        = `0^9 UFJJVktFWQ==^`
-	// activate's read: resourceVersion|private|public, base64 as the API returns
-	// them. base64("PRIVKEY") = UFJJVktFWQ==, base64("PUBKEY") = UFVCS0VZ.
-	pubKey   = `0^9|UFJJVktFWQ==|UFVCS0VZ^`
-	privOnly = `0^7|UFJJVktFWQ==|^`         // the old Deployment's documented setup
-	stalePub = `0^7|UFJJVktFWQ==|T0xES0VZ^` // public field = "OLDKEY"
-	badPriv  = `0^7|QkFES0VZ|^`             // base64("BADKEY"): unusable
-	noPriv   = `0^7||UFVCS0VZ^`
-	onKey    = `0^PUBKEY^` // the pod template already carries this key
-	notOnKey = `0^^`       // no (or another) key on the pod template
-	ok       = `0^^`
+	// activate's and public-key's read: resourceVersion|immutable|private|public,
+	// base64 as the API returns them. base64("PRIVKEY") = UFJJVktFWQ==,
+	// base64("PUBKEY") = UFVCS0VZ.
+	pubKey        = `0^9||UFJJVktFWQ==|UFVCS0VZ^`
+	privOnly      = `0^7||UFJJVktFWQ==|^`         // the old Deployment's documented setup
+	immutablePriv = `0^7|true|UFJJVktFWQ==|^`     // same, but the secret is immutable
+	stalePub      = `0^7||UFJJVktFWQ==|T0xES0VZ^` // public field = "OLDKEY"
+	immutableBad  = `0^7|true|UFJJVktFWQ==|T0xES0VZ^`
+	badPriv       = `0^7||QkFES0VZ|^` // base64("BADKEY"): unusable
+	noPriv        = `0^7|||UFVCS0VZ^`
+	onKey         = `0^PUBKEY^` // the pod template already carries this key
+	notOnKey      = `0^^`       // no (or another) key on the pod template
+	ok            = `0^^`
 )
 
 type result struct {
-	out, calls, patchBody, createBody, deployPatch string
-	err                                            error
+	out, stdout, calls, patchBody, createBody, deployPatch string
+	err                                                    error
 }
 
 func run(t *testing.T, mode string, queues map[string][]string) result {
@@ -105,10 +108,12 @@ func run(t *testing.T, mode string, queues map[string][]string) result {
 		"GENKEY="+genkey,
 		"DERIVE="+derive,
 	)
-	out, err := cmd.CombinedOutput()
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
 	read := func(name string) string { b, _ := os.ReadFile(filepath.Join(dir, name)); return string(b) }
 	return result{
-		out: string(out), calls: read("calls"), err: err,
+		out: stdout.String() + stderr.String(), stdout: stdout.String(), calls: read("calls"), err: err,
 		patchBody: read("patch-secret.stdin"), createBody: read("create-secret.stdin"), deployPatch: read("patch-deploy.stdin"),
 	}
 }
@@ -250,6 +255,7 @@ func TestProvisionLeavesDeploymentAlone(t *testing.T) {
 func TestFailedActivationIsNotReportedActive(t *testing.T) {
 	for name, q := range map[string]map[string][]string{
 		"stale public key":  {"get-pub": {stalePub}},
+		"immutable, stale":  {"get-pub": {immutableBad}},
 		"unusable private":  {"get-pub": {badPriv}},
 		"no private key":    {"get-pub": {noPriv}},
 		"patch fails":       {"get-pub": {pubKey}, "get-deploy": {notOnKey}, "patch-deploy": {`1||error: deployments.apps "aei-controller" is forbidden`}},
@@ -302,5 +308,57 @@ func TestStalePublicKeyIsRejected(t *testing.T) {
 	}
 	if !strings.Contains(r.out, "does not match its private key") {
 		t.Errorf("output does not explain the mismatch:\n%s", r.out)
+	}
+}
+
+// An immutable secret cannot take the backfill: activation uses the derived key
+// without writing to the secret.
+func TestImmutableSecretUsesDerivedKey(t *testing.T) {
+	r := run(t, "", map[string][]string{"get-secret": {hasKey}, "get-pub": {immutablePriv}, "get-deploy": {notOnKey}, "patch-deploy": {ok}, "status": {ok}})
+	mustSucceed(t, r)
+	if strings.Contains(r.calls, "patch secret") {
+		t.Errorf("wrote to an immutable secret; calls:\n%s", r.calls)
+	}
+	if !strings.Contains(r.deployPatch, "PUBKEY") || !strings.Contains(r.out, "signing key active") {
+		t.Errorf("want the derived key stamped and reported active:\n%s", r.out)
+	}
+}
+
+// make public-key derives and checks the key, never writes, and prints only it.
+func TestPublicKeyIsDerivedAndReadOnly(t *testing.T) {
+	for name, read := range map[string]string{"both fields": pubKey, "private only": privOnly, "immutable private only": immutablePriv} {
+		t.Run(name, func(t *testing.T) {
+			r := run(t, "public-key", map[string][]string{"get-pub": {read}})
+			mustSucceed(t, r)
+			if r.stdout != "PUBKEY\n" {
+				t.Errorf("stdout = %q; want exactly the derived key", r.stdout)
+			}
+			if strings.Contains(r.calls, "patch") || strings.Contains(r.calls, "create") || strings.Contains(r.calls, "deploy") {
+				t.Errorf("public-key did more than read the secret; calls:\n%s", r.calls)
+			}
+		})
+	}
+}
+
+// make public-key fails, printing no key, when the stored key is stale, the
+// private key is unusable, or nothing is provisioned.
+func TestPublicKeyRefusesBadSecrets(t *testing.T) {
+	for name, q := range map[string]map[string][]string{
+		"stale public key": {"get-pub": {stalePub}},
+		"unusable private": {"get-pub": {badPriv}},
+		"no private key":   {"get-pub": {noPriv}},
+		"no secret":        {"get-pub": {notFound}},
+		"unreadable":       {"get-pub": {unreachable}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := run(t, "public-key", q)
+			mustFail(t, r)
+			if r.stdout != "" || strings.Contains(r.out, "OLDKEY") {
+				t.Errorf("printed a key despite the failure: stdout %q\n%s", r.stdout, r.out)
+			}
+			if name == "no secret" && !strings.Contains(r.out, "make authority") {
+				t.Errorf("output does not point at make authority:\n%s", r.out)
+			}
+		})
 	}
 }

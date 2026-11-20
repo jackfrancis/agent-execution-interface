@@ -363,11 +363,13 @@ authority: check-cluster ## provision the platform Ed25519 signing key (never re
 	@$(AUTHORITY_NS)
 	@$(AUTHORITY)
 
+# public-key prints the key that verifies the controller's credentials: derived from
+# the secret's private key and checked against its AEI_ED25519_PUBLIC_KEY (a stale
+# field fails instead of being printed). It is read-only, and works when that field
+# is absent (e.g. an immutable secret holding only the private key).
 .PHONY: public-key
 public-key: check-cluster ## print AEI's run-credential verification (public) key for app developers
-	@pub=$$($(KUBECTL) -n aei-system get secret aei-signing -o jsonpath='{.data.AEI_ED25519_PUBLIC_KEY}' 2>/dev/null | base64 -d 2>/dev/null); \
-		test -n "$$pub" || { echo "no Ed25519 authority provisioned — run: make authority"; exit 1; }; \
-		echo "$$pub"
+	@$(AUTHORITY) public-key
 
 ## ── samples & smoke test (k8s-job: no external substrate) ─────────────────────
 
