@@ -206,7 +206,13 @@ Content-Type: application/json
   **its own** run.
 - **Idempotent (R4).** The callback and the watch/deadline may both fire; the
   outcome is recorded **exactly once**. A duplicate or unknown `run_id` is a
-  harmless no-op that still returns `202`.
+  harmless no-op that still returns `202`. Because a repeat is harmless, the SDK
+  retries a failed call (network error, `408`, `429`, `5xx`) with backoff until its
+  context ends; any other `4xx` is final. On a durable substrate the callback is the
+  only success signal, so a dropped call must not end the run as a timeout. A
+  one-shot workload must exit for its provider's watch to see the outcome, so there
+  the SDK stops retrying 10s before `AEI_DEADLINE` (one brief attempt once inside
+  that margin), including when the app calls `Complete` itself.
 - **`result_ref` is an opaque pointer, not payload.** When set, AEI stores it on
   `AgentRun.status.resultRef` for observability and **never parses it** — where the
   actual result lives (a worklist item, an object-store key) is app-defined.
@@ -279,7 +285,7 @@ extra burdens:
 | **R1** per-run values ride the dispatch | the *per-run* keys in §1.1; decoder reads metadata-first so durable substrates get them out-of-band, never baked |
 | **R2** no credential at rest | only a short-TTL credential **or** single-use ticket is injected; downstream secrets are vended (§2.3), never injected; persisting/snapshotting providers MUST use the ticket |
 | **R3** multiplex-safe or declare | the decoder yields a fresh `RunSpec` per run; the runtime MUST NOT retain cross-run globals, else declare `runtimeLifecycle: perRun` |
-| **R4** idempotent completion | `/complete` is best-effort `202` + deadline backstop; server records once |
+| **R4** idempotent completion | `/complete` returns `202`, SDK retries failed calls, deadline backstop; server records once |
 
 ---
 
@@ -317,8 +323,8 @@ func (r *Runtime) Spec() RunSpec
 func (r *Runtime) Vend(ctx context.Context, provider string) (Credential, error)
 
 // Complete reports the terminal outcome (seam 3), optionally with an opaque
-// result_ref the platform stores on status.resultRef but never parses. Safe to
-// call once; the platform dedupes against the watch/deadline backstop.
+// result_ref the platform stores on status.resultRef but never parses. Retries a
+// failed delivery until ctx ends; the platform records the first outcome only.
 func (r *Runtime) Complete(ctx context.Context, runErr error, t Timing, resultRef string) error
 
 // Main is the "little boilerplate": Load → run(fn) under the deadline → Complete.
