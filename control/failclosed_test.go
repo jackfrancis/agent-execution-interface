@@ -1,8 +1,10 @@
 package control
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -311,14 +313,15 @@ func TestStalledStoreLookupHonorsDeadline(t *testing.T) {
 // acknowledges only after the run's deadline.
 type lateAckDispatcher struct {
 	fakeWatch
-	receiver *Plane
-	ackAfter time.Duration
+	receiver    *Plane
+	recordAfter time.Duration // when the peer's /redeem records the failure (default 30ms)
+	ackAfter    time.Duration
 }
 
 func (lateAckDispatcher) PullsCredential() bool { return true }
 func (d lateAckDispatcher) Dispatch(_ context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
 	go func() {
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(cmp.Or(d.recordAfter, 30*time.Millisecond))
 		d.receiver.redeem(cred.Value) // fails to mint; records the failure in the shared Store
 	}()
 	time.Sleep(d.ackAfter) // ignores cancellation, like a slow provider
@@ -351,5 +354,126 @@ func TestFailureRecordedBeforeTimeoutWins(t *testing.T) {
 	}
 	if st, _ := dispatcher.Status("run-late-ack"); !strings.Contains(st.Err, "signing key unavailable") {
 		t.Errorf("Status err = %q; Run and Status disagree", st.Err)
+	}
+}
+
+// hungStore is a shared Store whose Run and FinishRun calls hang until release
+// closes, counting how many are outstanding at once.
+type hungStore struct {
+	*memStore
+	release           chan struct{}
+	mu                sync.Mutex
+	inflight, maxSeen int
+}
+
+func (s *hungStore) enter() {
+	s.mu.Lock()
+	s.inflight++
+	s.maxSeen = max(s.maxSeen, s.inflight)
+	s.mu.Unlock()
+	<-s.release
+	s.mu.Lock()
+	s.inflight--
+	s.mu.Unlock()
+}
+func (s *hungStore) Run(id string) (RunState, bool) { s.enter(); return s.memStore.Run(id) }
+func (s *hungStore) FinishRun(id string, st RunState) bool {
+	s.enter()
+	return s.memStore.FinishRun(id, st)
+}
+func (s *hungStore) peak() int { s.mu.Lock(); defer s.mu.Unlock(); return s.maxSeen }
+
+// blockUntilDone is a plain provider whose Launch runs until the run's context ends.
+type blockUntilDone struct{}
+
+func (blockUntilDone) Launch(ctx context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	<-ctx.Done()
+	return aei.Handle{Ref: spec.ID}, ctx.Err()
+}
+
+// During a Store outage, the run watch and Run's commit cannot pile up stuck
+// Store calls: however many runs go by, outstanding calls stay within the plane's
+// Store permits, and each Run still returns shortly after its deadline.
+func TestStoreOutageBoundsOutstandingCalls(t *testing.T) {
+	st := &hungStore{memStore: newMemStore(), release: make(chan struct{})}
+	defer close(st.release)
+	p := New(Config{Secret: []byte("k"), Store: st, Logger: quietLog, MaxConcurrentCreates: 1})
+	const limit = 2 // the Store permits: 2*MaxConcurrentCreates
+
+	const deadline = 60 * time.Millisecond
+	for i := range 8 {
+		start := time.Now()
+		res, _ := p.Run(context.Background(), blockUntilDone{}, aei.RunSpec{ID: fmt.Sprintf("outage-%d", i), Deadline: deadline})
+		if elapsed := time.Since(start); elapsed > deadline+minCommitGrace+300*time.Millisecond {
+			t.Fatalf("run %d took %v during the outage; want about its deadline plus the commit grace", i, elapsed)
+		}
+		if res.Err == nil {
+			t.Fatalf("run %d succeeded; want the deadline", i)
+		}
+	}
+	if n := st.peak(); n > limit {
+		t.Fatalf("%d Store calls outstanding at once; want at most the %d Store permits", n, limit)
+	}
+}
+
+// A failure a peer replica records after the watch's last poll — 25ms before the
+// deadline — is still the run's outcome: Run commits through the Store, finds the
+// peer's outcome first, and agrees with Status.
+func TestFailureRecordedJustBeforeDeadlineWins(t *testing.T) {
+	shared := newMemStore()
+	dispatcher := New(Config{Authority: failingAuthority{}, Store: shared, Logger: quietLog})
+	receiver := New(Config{Authority: failingAuthority{}, Store: shared, Logger: quietLog})
+
+	const deadline = 300 * time.Millisecond
+	res, _ := dispatcher.Run(context.Background(),
+		&lateAckDispatcher{receiver: receiver, recordAfter: deadline - 25*time.Millisecond, ackAfter: 3 * deadline},
+		aei.RunSpec{ID: "run-last-moment", Deadline: deadline})
+
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "signing key unavailable") {
+		t.Fatalf("Run result err = %v; want the signing failure recorded before the deadline", res.Err)
+	}
+	if st, _ := dispatcher.Status("run-last-moment"); st.Err != res.Err.Error() {
+		t.Errorf("Status err = %q, Run err = %q; they disagree", st.Err, res.Err)
+	}
+}
+
+// completingLauncher is a plain provider whose runtime's /complete lands on a
+// peer replica (with a result and timing) before Launch itself returns success.
+type completingLauncher struct {
+	t       *testing.T
+	peerURL string
+}
+
+func (l completingLauncher) Launch(_ context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
+	resp := post(l.t, l.peerURL+"/aei/v1alpha1/complete", cred.Value, map[string]any{
+		"run_id": spec.ID, "result_ref": "res://peer", "timing": map[string]any{"tool_calls": 2},
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		l.t.Errorf("peer /complete status = %d, want 202", resp.StatusCode)
+	}
+	return aei.Handle{Ref: spec.ID}, nil // success, carrying no result of its own
+}
+
+// A completion a peer accepted before the provider returned success is the run's
+// outcome: Run reports the peer's result reference and timing, as Status does,
+// not the provider's empty success.
+func TestPeerCompletionWinsOverProviderSuccess(t *testing.T) {
+	shared := newMemStore()
+	secret := []byte("shared-secret")
+	dispatcher := New(Config{Secret: secret, Store: shared, Logger: quietLog})
+	receiver := New(Config{Secret: secret, Store: shared, Logger: quietLog})
+	srv := httptest.NewServer(receiver.Handler())
+	defer srv.Close()
+
+	res, err := dispatcher.Run(context.Background(), completingLauncher{t: t, peerURL: srv.URL}, aei.RunSpec{ID: "run-peer-done", Deadline: 2 * time.Second})
+	if err != nil || res.Err != nil {
+		t.Fatalf("Run = (%+v, %v); want success", res, err)
+	}
+	if res.ResultRef != "res://peer" || res.Timing.ToolCalls != 2 {
+		t.Fatalf("Run result = ref %q, tool calls %d; want the peer's res://peer and 2", res.ResultRef, res.Timing.ToolCalls)
+	}
+	if st, _ := dispatcher.Status("run-peer-done"); st.ResultRef != res.ResultRef || st.Timing.ToolCalls != res.Timing.ToolCalls {
+		t.Errorf("Status = %+v; Run and Status disagree", st)
 	}
 }

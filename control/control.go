@@ -242,6 +242,7 @@ type Plane struct {
 	providerPools map[poolKey]*permitPool // per provider: PullsCredential and in-flight Dispatch (guarded by mu)
 	ticketCalls   chan struct{}           // Store.PutTicket (pull credential)
 	tokenCalls    chan struct{}           // TokenAuthority.Mint (pushed credential)
+	storeCalls    chan struct{}           // Store.Run / FinishRun for the run watch and Run's commit
 
 	defaultDeadline time.Duration // applied to a run with no Deadline
 	maxDeadline     time.Duration // cap on a run's Deadline
@@ -294,6 +295,7 @@ func New(cfg Config) *Plane {
 		providerPools: map[poolKey]*permitPool{},
 		ticketCalls:   make(chan struct{}, 2*creates),
 		tokenCalls:    make(chan struct{}, 2*creates),
+		storeCalls:    make(chan struct{}, 2*creates),
 		waiters:       map[string]chan aei.Result{},
 
 		defaultDeadline: defaultDeadline,
@@ -418,6 +420,18 @@ func (p *Plane) RunWithOptions(ctx context.Context, launcher aei.Launcher, spec 
 	// race releases admission when the create gives its slot back, which for a
 	// blocking Launch can be after Run returns.
 	res, _, err = p.race(ctx, launcher, spec, done, release, providerKey(launcher, o.class))
+	// Commit through the Store, first writer wins, and report what it holds, so
+	// Run and GET /runs/{id} agree: an outcome a peer replica recorded first (a
+	// /complete, or a /redeem that failed to mint) is this run's outcome, even
+	// when it landed after the last watch poll or while the provider was
+	// succeeding. An outcome this run won keeps its own error value (errors.Is
+	// still matches ErrDeadlineExceeded).
+	if st, won, ok := p.commitRun(ctx, spec, res); ok && !won {
+		res = resultOf(st)
+		if err != nil {
+			err = res.Err // still "not accepted", but with the recorded cause
+		}
+	}
 	return res, err
 }
 
@@ -554,6 +568,12 @@ func (p *Plane) Status(runID string) (RunState, bool) {
 // than the one that dispatched (the HA seam). It returns the state the store holds
 // afterwards: res when this call won, else the earlier winner.
 func (p *Plane) finishRun(runID string, res aei.Result) RunState {
+	st, _ := p.commit(runID, res)
+	return st
+}
+
+// commit is finishRun that also reports whether this call's outcome won.
+func (p *Plane) commit(runID string, res aei.Result) (RunState, bool) {
 	st := RunState{Phase: phaseSucceeded, ResultRef: res.ResultRef, Timing: res.Timing}
 	if res.Err != nil {
 		st.Phase, st.Err = phaseFailed, res.Err.Error()
@@ -561,9 +581,9 @@ func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 	if !p.store.FinishRun(runID, st) {
 		// A terminal outcome was already recorded; report that one.
 		if won, ok := p.store.Run(runID); ok && won.Phase != phaseRunning {
-			return won
+			return won, false
 		}
-		return st
+		return st, false
 	}
 	if res.Err != nil {
 		// Otherwise only visible via GET /runs/{id} (the data-plane path keeps no
@@ -571,7 +591,7 @@ func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 		// its CRD is missing — reads clearly in the message here.
 		p.log.Warn("run failed", "run_id", runID, "error", res.Err.Error())
 	}
-	return st
+	return st, true
 }
 
 // race dispatches spec and returns the first terminal signal: the runtime's
@@ -745,9 +765,9 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 	// such an outcome ends the run within its deadline and Run, Submit and
 	// GET /runs/{id} all report the same cause.
 	stored := make(chan aei.Result, 1)
-	stopWatch := make(chan struct{})
-	defer close(stopWatch)
-	go p.watchStored(ctx, spec.ID, stored, stopWatch)
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	go p.watchStored(watchCtx, spec.ID, stored)
 
 	select {
 	case r := <-done:
@@ -756,14 +776,6 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		return r, getHandle(), nil
 	case o := <-provider:
 		r, err := providerOutcome(ctx, done, o.res, o.dispatchErr)
-		if rec, ok := p.recorded(ctx, spec.ID, done, r); ok {
-			// The run already has its outcome (e.g. a redeem-time mint failure the
-			// provider reports only as "redeem status 500"): that is the cause.
-			if err != nil {
-				err = rec.Err
-			}
-			return rec, getHandle(), err
-		}
 		return r, getHandle(), err
 	case <-ctx.Done():
 		// A runtime callback that landed together with the deadline, or an
@@ -825,58 +837,10 @@ func withContextCutoff(ctx context.Context, spec aei.RunSpec) aei.RunSpec {
 	return spec
 }
 
-// recorded prefers a terminal result the run already has over a provider error. A
-// runtime can fail its run while the provider is still dispatching — a pull runtime
-// whose /redeem hits a mint error, say — and the provider then reports only the
-// symptom ("redeem status 500"); the run should carry the cause. The outcome is
-// delivered on done when this replica served the runtime's call. When another
-// replica did (replicas > 1 behind one Service), it recorded the outcome in the
-// shared Store but could wake only its own waiters, so the Store is consulted too,
-// for no longer than ctx allows.
-//
-// It reports false — keep the provider's result — when r succeeded or the run has
-// no recorded outcome yet.
-func (p *Plane) recorded(ctx context.Context, runID string, done chan aei.Result, r aei.Result) (aei.Result, bool) {
-	if r.Err == nil {
-		return r, false
-	}
-	select {
-	case d := <-done:
-		return d, true
-	default:
-	}
-	return p.storedOutcome(ctx, runID)
-}
-
-// storedOutcome reads the run's terminal outcome from the Store, if it has one,
-// without outliving ctx: a shared Store that stalls cannot hold a run past its
-// deadline. A read still in flight when ctx ends is abandoned (its result goes to
-// a buffered channel nobody reads).
-func (p *Plane) storedOutcome(ctx context.Context, runID string) (aei.Result, bool) {
-	type read struct {
-		st RunState
-		ok bool
-	}
-	ch := make(chan read, 1)
-	go func() {
-		st, ok := p.store.Run(runID)
-		ch <- read{st, ok && st.Phase != phaseRunning}
-	}()
-	select {
-	case r := <-ch:
-		if r.ok {
-			return resultOf(r.st), true
-		}
-		return aei.Result{}, false
-	case <-ctx.Done():
-		return aei.Result{}, false
-	}
-}
-
 // Store watch cadence: a tenth of the run's remaining budget, within these bounds.
 // A long run polls about once a second; a short one often enough to finish well
-// inside its deadline. A shared Store sees one Run read per interval per run in
-// flight on this replica.
+// inside its deadline. A shared Store sees at most one Run read per interval per
+// run in flight on this replica.
 const (
 	minStorePoll = 5 * time.Millisecond
 	maxStorePoll = time.Second
@@ -894,24 +858,58 @@ func storePollInterval(ctx context.Context) time.Duration {
 
 // watchStored polls the Store for a terminal outcome recorded for runID — by
 // another replica, which cannot wake this one's waiters — and delivers the first
-// one on out. It stops when stop closes or ctx ends. Each read happens on this
-// goroutine, so a Store that stalls delays only the watch, never the run.
-func (p *Plane) watchStored(ctx context.Context, runID string, out chan<- aei.Result, stop <-chan struct{}) {
+// one on out, so such an outcome ends the run promptly. It stops when ctx ends
+// (race cancels it when the run settles). Each read holds one of the plane's
+// Store permits until it returns, so a Store outage strands at most that many
+// reads, however many runs are in flight.
+func (p *Plane) watchStored(ctx context.Context, runID string, out chan<- aei.Result) {
 	t := time.NewTicker(storePollInterval(ctx))
 	defer t.Stop()
 	for {
 		select {
-		case <-stop:
-			return
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
-		if st, ok := p.store.Run(runID); ok && st.Phase != phaseRunning {
+		var (
+			st RunState
+			ok bool
+		)
+		if p.bounded(ctx, p.storeCalls, nil, runID, "run status read", func() { st, ok = p.store.Run(runID) }) != nil {
+			continue // ctx ended, or the read is still outstanding
+		}
+		if ok && st.Phase != phaseRunning {
 			out <- resultOf(st) // buffered (1); delivered at most once
 			return
 		}
 	}
+}
+
+// commitGrace bounds how long Run waits, past the moment its race settled, to
+// commit the outcome through the Store: a tenth of the run's deadline, within
+// these bounds.
+const (
+	minCommitGrace = 50 * time.Millisecond
+	maxCommitGrace = time.Second
+)
+
+// commitRun records Run's outcome in the Store, first writer wins, and returns
+// the outcome the Store holds: res when this commit won, or the outcome another
+// writer recorded first — a peer replica's /complete, or a /redeem that failed to
+// mint. That makes Run's result and GET /runs/{id} the same outcome however the
+// signals interleaved, including one recorded just before the deadline. The
+// commit holds a Store permit and waits at most the commit grace, so a Store
+// outage cannot hold Run; then Run keeps its own result (ok is false), which is
+// all this replica can know while the Store does not answer.
+func (p *Plane) commitRun(ctx context.Context, spec aei.RunSpec, res aei.Result) (st RunState, won, ok bool) {
+	grace := min(max(spec.Deadline/10, minCommitGrace), maxCommitGrace)
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), grace)
+	defer cancel()
+	if err := p.bounded(cctx, p.storeCalls, nil, spec.ID, "run status commit", func() { st, won = p.commit(spec.ID, res) }); err != nil {
+		p.log.Warn("run outcome not committed to the store; reporting this replica's", "run_id", spec.ID, "error", err.Error())
+		return RunState{}, false, false
+	}
+	return st, won, true
 }
 
 // resultOf turns a recorded terminal RunState back into the Result it came from.
