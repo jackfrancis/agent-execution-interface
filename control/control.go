@@ -509,12 +509,24 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		provider <- outcome{res: aei.Result{Err: err}}
 	}()
 
+	// With replicas > 1 the runtime's call (a /complete, or a /redeem that fails
+	// to mint) can land on another replica, which records the outcome in the
+	// shared Store but can wake only its own waiters. Watch the Store too, so
+	// such an outcome ends the run within its deadline and Run, Submit and
+	// GET /runs/{id} all report the same cause.
+	stored := make(chan aei.Result, 1)
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go p.watchStored(ctx, spec.ID, stored, stopWatch)
+
 	select {
 	case r := <-done:
 		return r, getHandle(), nil
+	case r := <-stored:
+		return r, getHandle(), nil
 	case o := <-provider:
 		r, err := providerOutcome(ctx, done, o.res, o.dispatchErr)
-		if rec, ok := p.recorded(spec.ID, done, r); ok {
+		if rec, ok := p.recorded(ctx, spec.ID, done, r); ok {
 			// The run already has its outcome (e.g. a redeem-time mint failure the
 			// provider reports only as "redeem status 500"): that is the cause.
 			if err != nil {
@@ -524,9 +536,12 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		}
 		return r, getHandle(), err
 	case <-ctx.Done():
-		// A runtime callback that landed together with the deadline still wins.
+		// A runtime callback that landed together with the deadline, or an
+		// outcome the Store watch picked up, still wins.
 		select {
 		case r := <-done:
+			return r, getHandle(), nil
+		case r := <-stored:
 			return r, getHandle(), nil
 		default:
 		}
@@ -586,11 +601,12 @@ func withContextCutoff(ctx context.Context, spec aei.RunSpec) aei.RunSpec {
 // symptom ("redeem status 500"); the run should carry the cause. The outcome is
 // delivered on done when this replica served the runtime's call. When another
 // replica did (replicas > 1 behind one Service), it recorded the outcome in the
-// shared Store but could wake only its own waiters, so the Store is consulted too.
+// shared Store but could wake only its own waiters, so the Store is consulted too,
+// for no longer than ctx allows.
 //
 // It reports false — keep the provider's result — when r succeeded or the run has
 // no recorded outcome yet.
-func (p *Plane) recorded(runID string, done chan aei.Result, r aei.Result) (aei.Result, bool) {
+func (p *Plane) recorded(ctx context.Context, runID string, done chan aei.Result, r aei.Result) (aei.Result, bool) {
 	if r.Err == nil {
 		return r, false
 	}
@@ -599,10 +615,73 @@ func (p *Plane) recorded(runID string, done chan aei.Result, r aei.Result) (aei.
 		return d, true
 	default:
 	}
-	if st, ok := p.store.Run(runID); ok && st.Phase != phaseRunning {
-		return resultOf(st), true
+	return p.storedOutcome(ctx, runID)
+}
+
+// storedOutcome reads the run's terminal outcome from the Store, if it has one,
+// without outliving ctx: a shared Store that stalls cannot hold a run past its
+// deadline. A read still in flight when ctx ends is abandoned (its result goes to
+// a buffered channel nobody reads).
+func (p *Plane) storedOutcome(ctx context.Context, runID string) (aei.Result, bool) {
+	type read struct {
+		st RunState
+		ok bool
 	}
-	return r, false
+	ch := make(chan read, 1)
+	go func() {
+		st, ok := p.store.Run(runID)
+		ch <- read{st, ok && st.Phase != phaseRunning}
+	}()
+	select {
+	case r := <-ch:
+		if r.ok {
+			return resultOf(r.st), true
+		}
+		return aei.Result{}, false
+	case <-ctx.Done():
+		return aei.Result{}, false
+	}
+}
+
+// Store watch cadence: a tenth of the run's remaining budget, within these bounds.
+// A long run polls about once a second; a short one often enough to finish well
+// inside its deadline. A shared Store sees one Run read per interval per run in
+// flight on this replica.
+const (
+	minStorePoll = 5 * time.Millisecond
+	maxStorePoll = time.Second
+)
+
+// storePollInterval returns how often watchStored reads the Store for a run whose
+// context is ctx.
+func storePollInterval(ctx context.Context) time.Duration {
+	d := maxStorePoll
+	if dl, ok := ctx.Deadline(); ok {
+		d = time.Until(dl) / 10
+	}
+	return min(max(d, minStorePoll), maxStorePoll)
+}
+
+// watchStored polls the Store for a terminal outcome recorded for runID — by
+// another replica, which cannot wake this one's waiters — and delivers the first
+// one on out. It stops when stop closes or ctx ends. Each read happens on this
+// goroutine, so a Store that stalls delays only the watch, never the run.
+func (p *Plane) watchStored(ctx context.Context, runID string, out chan<- aei.Result, stop <-chan struct{}) {
+	t := time.NewTicker(storePollInterval(ctx))
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if st, ok := p.store.Run(runID); ok && st.Phase != phaseRunning {
+			out <- resultOf(st) // buffered (1); delivered at most once
+			return
+		}
+	}
 }
 
 // resultOf turns a recorded terminal RunState back into the Result it came from.

@@ -262,3 +262,94 @@ func TestRedeemOnAnotherReplicaKeepsSigningError(t *testing.T) {
 		t.Fatalf("status err = %q; want the signing error", st.Err)
 	}
 }
+
+// stallingStore is a shared Store whose Run reads hang until release closes (a
+// slow or partitioned backing store).
+type stallingStore struct {
+	*memStore
+	release chan struct{}
+}
+
+func (s stallingStore) Run(runID string) (RunState, bool) {
+	<-s.release
+	return s.memStore.Run(runID)
+}
+
+// The Store lookup that follows a mint error honors the run's deadline: a stalled
+// shared Store cannot hold the run open past it.
+func TestStalledStoreLookupHonorsDeadline(t *testing.T) {
+	st := stallingStore{memStore: newMemStore(), release: make(chan struct{})}
+	defer close(st.release)
+	p := New(Config{Authority: failingAuthority{}, Store: st})
+
+	const deadline = 100 * time.Millisecond
+	type out struct {
+		res aei.Result
+		err error
+	}
+	got := make(chan out, 1)
+	start := time.Now()
+	go func() {
+		res, err := p.Run(context.Background(), &countingLauncher{}, aei.RunSpec{ID: "run-stall", Deadline: deadline})
+		got <- out{res, err}
+	}()
+	select {
+	case o := <-got:
+		if elapsed := time.Since(start); elapsed > deadline+300*time.Millisecond {
+			t.Errorf("Run returned after %v; want about its %v deadline", elapsed, deadline)
+		}
+		if o.res.Err == nil || !strings.Contains(o.res.Err.Error(), "signing key unavailable") {
+			t.Errorf("Run result err = %v; want the mint error", o.res.Err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run blocked on a stalled Store read past its deadline")
+	}
+}
+
+// lateAckDispatcher is a pull provider whose runtime redeems its ticket on
+// another replica shortly after dispatch, while the provider's own Dispatch
+// acknowledges only after the run's deadline.
+type lateAckDispatcher struct {
+	fakeWatch
+	receiver *Plane
+	ackAfter time.Duration
+}
+
+func (lateAckDispatcher) PullsCredential() bool { return true }
+func (d lateAckDispatcher) Dispatch(_ context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		d.receiver.redeem(cred.Value) // fails to mint; records the failure in the shared Store
+	}()
+	time.Sleep(d.ackAfter) // ignores cancellation, like a slow provider
+	return aei.Handle{}, errors.New("redeem status 500")
+}
+
+// A signing failure another replica records before the deadline is the run's
+// outcome, even when the provider's acknowledgment arrives after the deadline:
+// Run ends with it, within the deadline, and agrees with Status.
+func TestFailureRecordedBeforeTimeoutWins(t *testing.T) {
+	shared := newMemStore()
+	dispatcher := New(Config{Authority: failingAuthority{}, Store: shared})
+	receiver := New(Config{Authority: failingAuthority{}, Store: shared})
+
+	const deadline = 300 * time.Millisecond
+	start := time.Now()
+	res, _ := dispatcher.Run(context.Background(),
+		&lateAckDispatcher{receiver: receiver, ackAfter: 3 * deadline},
+		aei.RunSpec{ID: "run-late-ack", Deadline: deadline})
+	elapsed := time.Since(start)
+
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "signing key unavailable") {
+		t.Fatalf("Run result err = %v; want the signing failure recorded before the deadline", res.Err)
+	}
+	if errors.Is(res.Err, ErrDeadlineExceeded) {
+		t.Fatalf("Run reported the deadline, not the recorded cause: %v", res.Err)
+	}
+	if elapsed >= deadline {
+		t.Errorf("Run took %v; want it to end within its %v deadline", elapsed, deadline)
+	}
+	if st, _ := dispatcher.Status("run-late-ack"); !strings.Contains(st.Err, "signing key unavailable") {
+		t.Errorf("Status err = %q; Run and Status disagree", st.Err)
+	}
+}
