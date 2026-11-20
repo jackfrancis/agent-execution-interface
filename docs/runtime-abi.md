@@ -327,11 +327,46 @@ func (r *Runtime) Vend(ctx context.Context, provider string) (Credential, error)
 // failed delivery until ctx ends; the platform records the first outcome only.
 func (r *Runtime) Complete(ctx context.Context, runErr error, t Timing, resultRef string) error
 
+// SetModelTiming records the run's model share (seconds waiting on the model,
+// model calls, tool calls) for the completion report Main sends when fn returns.
+// Safe from any goroutine; each call replaces the last (send a running total).
+func (r *Runtime) SetModelTiming(seconds float64, modelCalls, toolCalls int)
+
 // Main is the "little boilerplate": Load → run(fn) under the deadline → Complete.
 // A workload's entrypoint is one line: aeiruntime.Main(os.Getenv, nil, myWork).
 func Main(getenv func(string) string, metadata map[string]string,
     fn func(context.Context, *Runtime) error)
 ```
+
+`Main` sends **one** completion report per run, on either lifecycle (one-shot or
+the durable serve loop), carrying the provisioning and runtime timing it measures
+itself plus whatever `fn` recorded with `SetModelTiming`. So an app that wants
+`model_seconds`, `model_calls` and `tool_calls` on `AgentRun.status.timing` calls
+`rt.SetModelTiming` before `fn` returns and never calls `Complete` itself:
+
+```go
+func myWork(ctx context.Context, rt *aeiruntime.Runtime) error {
+    stats, err := review(ctx, rt) // the app's own model/tool loop
+    rt.SetModelTiming(stats.ModelSeconds, stats.ModelCalls, stats.ToolCalls)
+    return err
+}
+```
+
+A call marks the model stage measured (§3), so a run that made no model calls
+reports `model_seconds: 0` instead of omitting it; a run that never calls it
+omits `model_seconds`. Seconds that are negative, NaN or infinite are not a
+measurement and leave `model_seconds` omitted (the counts are still sent, a
+negative count as `0`), so a bad value cannot make the report unencodable. The
+wire format of `/complete` is unchanged — this only fills fields of the timing
+object (§3) the SDK already sends.
+
+Calling `Complete` from `fn` remains possible — it is the way to publish a
+`result_ref` — but the platform records only the **first** report (R4), so the
+SDK's own report that follows is a duplicate that changes nothing, and on a
+capacity-capped durable actor that duplicate's delivery keeps the run's
+concurrency slot (`AEI_MAX_CONCURRENT_RUNS`) occupied until it is acknowledged.
+Prefer `SetModelTiming` for timing; the run's slot is then freed as soon as the
+single report is acknowledged.
 
 A durable (A2A) entrypoint passes the message metadata instead of `nil`; the same
 `fn` runs unchanged. That single difference — `nil` vs. a metadata map — is the

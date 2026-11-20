@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -28,6 +29,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -160,6 +162,19 @@ type Runtime struct {
 	// for the provider's watch to see the outcome; Complete then bounds its
 	// retries by the run deadline (oneShotReportPlan).
 	oneShot bool
+
+	// model is the app's model share for the SDK's own completion report, set by
+	// SetModelTiming from any goroutine and read by runTask once fn returns.
+	modelMu sync.Mutex
+	model   *modelTiming
+}
+
+// modelTiming is the model share an app records with SetModelTiming.
+type modelTiming struct {
+	seconds    float64
+	measured   bool // seconds is a usable measurement (finite, non-negative)
+	modelCalls int
+	toolCalls  int
 }
 
 // Load runs the one decoder (metadata-first, env-fallback), then resolves the run
@@ -262,6 +277,48 @@ func (r *Runtime) Vend(ctx context.Context, provider string) (Credential, error)
 		return Credential{}, err
 	}
 	return Credential{Value: out.Credential, ExpiresIn: out.ExpiresIn}, nil
+}
+
+// SetModelTiming records the run's model share — total seconds spent waiting on
+// the model, and how many model and tool calls the run made — for the completion
+// report the SDK sends when the function passed to Main returns, so an app gets
+// full timing on either substrate without calling Complete itself. Each call
+// replaces the previous values (report a running total, not increments); it is
+// safe to call from any goroutine, but set it before that function returns: a
+// later call may not be reported. A call marks the model stage measured, so a run that made no model
+// calls reports model_seconds 0 rather than omitting it. Seconds that are negative,
+// NaN, or infinite are not a measurement and leave model_seconds omitted (the
+// counts are still sent); a negative count is sent as 0. It affects only the SDK's
+// own report, not a Timing the app passes to Complete.
+func (r *Runtime) SetModelTiming(seconds float64, modelCalls, toolCalls int) {
+	m := &modelTiming{
+		seconds:    seconds,
+		measured:   seconds >= 0 && !math.IsInf(seconds, 0), // false for NaN too
+		modelCalls: max(modelCalls, 0),
+		toolCalls:  max(toolCalls, 0),
+	}
+	if !m.measured {
+		m.seconds = 0
+	}
+	r.modelMu.Lock()
+	r.model = m
+	r.modelMu.Unlock()
+}
+
+// applyModelTiming merges the model share recorded by SetModelTiming, if any,
+// into t.
+func (r *Runtime) applyModelTiming(t *Timing) {
+	r.modelMu.Lock()
+	m := r.model
+	r.modelMu.Unlock()
+	if m == nil {
+		return
+	}
+	t.ModelCalls, t.ToolCalls = m.modelCalls, m.toolCalls
+	if m.measured {
+		t.ModelSeconds = m.seconds
+		t.Measured |= StageModel
+	}
 }
 
 // completeRequest is the POST /complete body (docs/runtime-abi.md §2.2).
@@ -479,9 +536,10 @@ func (r *Runtime) send(ctx context.Context, url, bearer string, body []byte, out
 // platform selects the lifecycle through injected config, so the substrate is an
 // operational choice, not conditional application code.
 //
-// An app that needs model/tool timing or a result_ref should call Complete itself
-// (a duplicate is a harmless no-op, R4). On a one-shot failure it exits non-zero
-// after reporting.
+// An app reports its model share (model seconds, model and tool calls) with
+// Runtime.SetModelTiming, which Main merges into its own single report; only an
+// app that needs a result_ref calls Complete itself (the platform records the
+// first report, R4). On a one-shot failure it exits non-zero after reporting.
 func Main(getenv func(string) string, metadata map[string]string, fn func(context.Context, *Runtime) error) {
 	// Durable substrate: a standing actor sets AEI_SERVE_ADDR, so run the long-lived
 	// serve loop instead of one shot. main() and fn are identical either way.
@@ -521,9 +579,10 @@ func runOneShot(getenv func(string) string, metadata map[string]string, fn func(
 }
 
 // runTask runs fn once under the run's deadline (AEI_DEADLINE) and returns the
-// outcome with launcher-symmetric provisioning + runtime timing. It is the single
-// run bracket shared by the one-shot Main and the durable serve loop, so a run is
-// driven identically on either substrate.
+// outcome with launcher-symmetric provisioning + runtime timing, plus any model
+// share fn recorded with SetModelTiming. It is the single run bracket shared by
+// the one-shot Main and the durable serve loop, so a run is driven identically on
+// either substrate.
 func runTask(ctx context.Context, rt *Runtime, fn func(context.Context, *Runtime) error) (Timing, error) {
 	start := time.Now()
 	t := Timing{Measured: StageRuntime}
@@ -541,6 +600,7 @@ func runTask(ctx context.Context, rt *Runtime, fn func(context.Context, *Runtime
 	defer cancel()
 	runErr := fn(runCtx, rt)
 	t.RuntimeSeconds = time.Since(start).Seconds()
+	rt.applyModelTiming(&t)
 	return t, runErr
 }
 
