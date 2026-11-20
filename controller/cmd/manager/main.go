@@ -1,13 +1,13 @@
 // Command manager is the AEI reference operator: it runs the AgentRun reconciler
 // and serves the runtime ABI (/complete, /redeem, /vend) so dispatched runtimes
-// can call back. It blank-imports the providers it supports; adding a provider is
-// a new import, no core change (the database/sql pattern).
+// can call back, and the dispatch API on a listener of its own. It blank-imports
+// the providers it supports; adding a provider is a new import, no core change
+// (the database/sql pattern).
 package main
 
 import (
 	"flag"
 	"log/slog"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -35,9 +35,13 @@ import (
 )
 
 func main() {
-	var abiAddr string
+	var abiAddr, dispatchAddr, dispatchAudience string
+	var acceptLegacyTokens bool
 	var runDefaultTimeout, runMaxTimeout time.Duration
-	flag.StringVar(&abiAddr, "abi-addr", ":8080", "address to serve the runtime ABI (/complete, /redeem, /vend)")
+	flag.StringVar(&abiAddr, "abi-addr", ":8080", "address to serve the runtime ABI (/complete, /redeem, /vend, /authority) and /metrics")
+	flag.StringVar(&dispatchAddr, "dispatch-addr", "", "address to serve the dispatch API (/dispatch, /runs/{id}) on its own listener, so a NetworkPolicy can restrict it by port (default: the -abi-addr host on port 8081)")
+	flag.StringVar(&dispatchAudience, "dispatch-audience", dispatch.DefaultAudience, "token audience the dispatch API requests in its TokenReview; callers project a ServiceAccount token for it")
+	flag.BoolVar(&acceptLegacyTokens, "accept-legacy-dispatch-tokens", true, "also accept a caller's default ServiceAccount token (the apiserver's audience) while apps move to the dispatch audience")
 	var maxCreates, maxQueued int
 	flag.IntVar(&maxCreates, "max-concurrent-creates", control.DefaultMaxConcurrentCreates, "maximum provider creates (Dispatch/Launch) in progress at once, across all providers")
 	flag.IntVar(&maxQueued, "max-queued-runs", control.DefaultMaxQueued, "maximum dispatched runs waiting for a create slot; beyond it /dispatch answers 429")
@@ -103,22 +107,36 @@ func main() {
 		log.Error(err, "unable to build clientset")
 		os.Exit(1)
 	}
-	disp := dispatch.NewHandler(plane, buildAuthenticator(clientset, log), mgr.GetClient())
+	auth := buildAuthenticator(clientset, dispatch.TokenReviewOptions{
+		Audience:     dispatchAudience,
+		AcceptLegacy: acceptLegacyTokens,
+		Log:          log.WithName("dispatch"),
+	}, log)
+	disp := dispatch.NewHandler(plane, auth, mgr.GetClient())
 
-	// One server carries both the runtime ABI (/complete, /redeem, /vend) and the
-	// data-plane dispatch API (/dispatch, /runs/{id}). The manager runs it, so it
-	// stops with the controllers on SIGTERM and drains in-flight requests first.
-	mux := http.NewServeMux()
-	plane.RegisterRoutes(mux)
-	disp.RegisterRoutes(mux)
-	// Per-run timing and process health for Prometheus to scrape.
-	mux.Handle("GET /metrics", runMetrics.Handler())
-	if err := mgr.Add(&httpServer{
-		name: "abi", addr: abiAddr, handler: mux,
-		timeouts: defaultServerTimeouts, log: log,
-	}); err != nil {
-		log.Error(err, "unable to add AEI HTTP server")
+	// Two listeners, so a NetworkPolicy (which matches ports, not paths) can admit
+	// runtime pods and Prometheus to the ABI while only apps reach dispatch. The
+	// manager runs both, so they stop with the controllers on SIGTERM and drain
+	// in-flight requests first.
+	dispatchAddr, separate, err := resolveDispatchAddr(abiAddr, dispatchAddr)
+	if err != nil {
+		log.Error(err, "invalid listener addresses")
 		os.Exit(1)
+	}
+	abiMux, dispatchMux := newMuxes(plane, disp, runMetrics.Handler(), dispatchOnABIListener)
+	servers := []*httpServer{{name: "abi", addr: abiAddr, handler: abiMux}}
+	if separate {
+		servers = append(servers, &httpServer{name: "dispatch", addr: dispatchAddr, handler: dispatchMux})
+	} else {
+		log.Info("dispatch is served only on the ABI listener: -abi-addr already uses the default dispatch port; set -dispatch-addr to give dispatch its own listener",
+			"abiAddr", abiAddr)
+	}
+	for _, s := range servers {
+		s.timeouts, s.log = defaultServerTimeouts, log
+		if err := mgr.Add(s); err != nil {
+			log.Error(err, "unable to add AEI HTTP server", "server", s.name)
+			os.Exit(1)
+		}
 	}
 
 	r := &ctrlpkg.AgentRunReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Plane: plane}
@@ -135,7 +153,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("starting AEI controller", "abiAddr", abiAddr, "providers", aei.Names())
+	log.Info("starting AEI controller", "abiAddr", abiAddr, "dispatchAddr", dispatchAddr,
+		"dispatchAudience", dispatchAudience, "acceptLegacyDispatchTokens", acceptLegacyTokens, "providers", aei.Names())
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited")
 		os.Exit(1)
@@ -143,18 +162,19 @@ func main() {
 }
 
 // buildAuthenticator selects how the data-plane dispatch API authenticates callers.
-// The reference path is a Kubernetes TokenReview: no shared secret, but one apiserver
-// call per dispatch. When AEI_SPIFFE_TRUST_DOMAIN, AEI_SPIFFE_AUDIENCE, and
+// The reference path is a Kubernetes TokenReview for the dispatch audience: no shared
+// secret, but one apiserver call per dispatch (two for a legacy token while tr
+// accepts them). When AEI_SPIFFE_TRUST_DOMAIN, AEI_SPIFFE_AUDIENCE, and
 // AEI_SPIFFE_TRUST_BUNDLE_FILE are all set, it uses the OFFLINE SPIFFE JWT-SVID
 // authenticator instead — verifying the caller's SVID against the mounted trust
 // bundle with no apiserver round-trip (roadmap Phase 6). The bundle file is a JWKS,
 // as SPIRE publishes.
-func buildAuthenticator(clientset kubernetes.Interface, log logr.Logger) dispatch.Authenticator {
+func buildAuthenticator(clientset kubernetes.Interface, tr dispatch.TokenReviewOptions, log logr.Logger) dispatch.Authenticator {
 	td := strings.TrimSpace(os.Getenv("AEI_SPIFFE_TRUST_DOMAIN"))
 	aud := strings.TrimSpace(os.Getenv("AEI_SPIFFE_AUDIENCE"))
 	bundlePath := strings.TrimSpace(os.Getenv("AEI_SPIFFE_TRUST_BUNDLE_FILE"))
 	if td == "" || aud == "" || bundlePath == "" {
-		return dispatch.NewTokenReviewer(clientset)
+		return dispatch.NewTokenReviewer(clientset, tr)
 	}
 	jwks, err := os.ReadFile(bundlePath)
 	if err != nil {

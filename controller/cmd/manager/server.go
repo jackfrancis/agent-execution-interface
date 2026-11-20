@@ -3,12 +3,68 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/go-logr/logr"
+
+	"github.com/jackfrancis/agent-execution-interface/control"
+	"github.com/jackfrancis/agent-execution-interface/controller/internal/dispatch"
 )
+
+// dispatchOnABIListener keeps the dispatch API on the ABI listener too, where apps
+// called it before it had a listener of its own. It is transitional: once apps
+// call the dispatch listener, it goes, and a NetworkPolicy can then keep runtime
+// pods away from dispatch.
+const dispatchOnABIListener = true
+
+// defaultDispatchPort is the dispatch listener's port when -dispatch-addr is not set.
+const defaultDispatchPort = "8081"
+
+// resolveDispatchAddr picks the dispatch listener's address and reports whether it
+// gets a listener of its own. An explicit -dispatch-addr is used as given, and must
+// differ from -abi-addr. Without one, dispatch listens on the ABI listener's host
+// at defaultDispatchPort, so an installation that binds the ABI to one interface
+// (say loopback) does not start serving dispatch on every interface after an
+// upgrade. An installation whose ABI already uses that port keeps dispatch on the
+// ABI listener alone, as before, rather than failing to bind it twice.
+func resolveDispatchAddr(abiAddr, dispatchAddr string) (addr string, separate bool, err error) {
+	if dispatchAddr != "" {
+		if dispatchAddr == abiAddr {
+			return "", false, fmt.Errorf("-dispatch-addr %q must differ from -abi-addr", dispatchAddr)
+		}
+		return dispatchAddr, true, nil
+	}
+	host, port, err := net.SplitHostPort(abiAddr)
+	if err != nil {
+		return "", false, fmt.Errorf("-abi-addr %q: %w", abiAddr, err)
+	}
+	if port == defaultDispatchPort {
+		if !dispatchOnABIListener {
+			return "", false, fmt.Errorf("-abi-addr %q uses the default dispatch port; set -dispatch-addr", abiAddr)
+		}
+		return abiAddr, false, nil
+	}
+	return net.JoinHostPort(host, defaultDispatchPort), true, nil
+}
+
+// newMuxes builds the handlers for the two listeners. The ABI listener carries the
+// routes runtime pods call (/complete, /redeem, /vend, /authority) and /metrics for
+// Prometheus; the dispatch listener carries only /dispatch and /runs/{id}, which
+// apps call. withDispatch also mounts the dispatch routes on the ABI listener.
+func newMuxes(plane *control.Plane, disp *dispatch.Handler, metrics http.Handler, withDispatch bool) (abi, dispatchMux *http.ServeMux) {
+	abi = http.NewServeMux()
+	plane.RegisterRoutes(abi)
+	abi.Handle("GET /metrics", metrics)
+	if withDispatch {
+		disp.RegisterRoutes(abi)
+	}
+	dispatchMux = http.NewServeMux()
+	disp.RegisterRoutes(dispatchMux)
+	return abi, dispatchMux
+}
 
 // serverTimeouts bounds how long one connection may hold the listener. Runtime pods
 // reach this listener by design, so a stalled or hostile client must not be able to
@@ -42,8 +98,7 @@ var defaultServerTimeouts = serverTimeouts{
 // it with the controllers and, on SIGTERM, cancels its context: the listener stops
 // accepting and in-flight requests get up to Shutdown to finish. A runtime whose
 // /complete call is refused while the pod drains retries against the next replica
-// (aeiruntime.Complete). To serve another listener (for example a separate
-// dispatch port), add another httpServer with its own address and handler.
+// (aeiruntime.Complete). The manager runs one for the ABI and one for dispatch.
 type httpServer struct {
 	name     string
 	addr     string

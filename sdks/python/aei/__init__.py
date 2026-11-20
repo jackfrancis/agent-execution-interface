@@ -16,11 +16,12 @@ never appears here (a Go controller resolves the run's ``AgentProviderClass`` an
 dispatches it).
 """
 
-from .client import AeiClient
+from .client import AeiClient, TokenFileError
 from .models import AgentRunSpec, Identity, Requirements, Result, Timing
 
 __all__ = [
     "AeiClient",
+    "TokenFileError",
     "AgentRunSpec",
     "Identity",
     "Requirements",
