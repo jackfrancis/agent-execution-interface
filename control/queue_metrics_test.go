@@ -162,9 +162,10 @@ func (s *slowStore) FinishRun(runID string, st RunState) bool {
 	return s.memStore.FinishRun(runID, st)
 }
 
-// lateDispatch is an AsyncLauncher whose Dispatch ignores cancellation and returns
-// only when the test lets it, after the run's deadline has already won.
+// lateDispatch is an AsyncLauncher whose Dispatch signals that it has started,
+// then ignores cancellation and returns only when the test lets it.
 type lateDispatch struct {
+	entered  chan struct{}
 	proceed  chan struct{}
 	returned chan struct{}
 }
@@ -174,6 +175,7 @@ func (l *lateDispatch) Launch(ctx context.Context, spec aei.RunSpec, cred aei.Cr
 }
 
 func (l *lateDispatch) Dispatch(_ context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	close(l.entered)
 	<-l.proceed
 	defer close(l.returned)
 	return aei.Handle{Provider: "late", Ref: spec.ID}, nil
@@ -183,20 +185,24 @@ func (l *lateDispatch) Await(context.Context, aei.Handle) (aei.Result, error) {
 	return aei.Result{}, nil
 }
 
-// The stage times freeze when the run's outcome is decided. A Dispatch that
-// returns while the terminal store write is still in progress (after the deadline
-// won) is not counted as measured, and the run's duration ends before the write.
+// The stage times freeze when the run's outcome is decided. Here the outcome
+// arrives while Dispatch is blocked; a Dispatch that returns while the terminal
+// store write is still in progress is not counted as measured, and the run's
+// duration ends before the write.
 func TestStageTimesFreezeWhenOutcomeIsDecided(t *testing.T) {
 	store := &slowStore{memStore: newMemStore(), finishEntered: make(chan struct{}), finishRelease: make(chan struct{})}
 	obs := &captureObserver{}
 	p := New(Config{Secret: []byte("k"), Logger: quietLog, Observer: obs, Store: store})
-	l := &lateDispatch{proceed: make(chan struct{}), returned: make(chan struct{})}
+	l := &lateDispatch{entered: make(chan struct{}), proceed: make(chan struct{}), returned: make(chan struct{})}
 
 	before := time.Now()
-	if _, err := p.Submit(context.Background(), l, aei.RunSpec{TaskRef: "t", Deadline: 50 * time.Millisecond}); err != nil {
+	id, err := p.Submit(context.Background(), l, aei.RunSpec{TaskRef: "t", Deadline: 5 * time.Second})
+	if err != nil {
 		t.Fatal(err)
 	}
-	<-store.finishEntered // the deadline won; the terminal write is in progress
+	<-l.entered                                   // Dispatch has started and is blocked
+	p.fire(id, aei.Result{ResultRef: "callback"}) // the terminal signal wins while it is
+	<-store.finishEntered                         // the outcome is decided; the terminal write is in progress
 	entered := time.Now()
 	close(l.proceed) // Dispatch returns now, after the outcome was decided
 	<-l.returned
@@ -212,6 +218,30 @@ func TestStageTimesFreezeWhenOutcomeIsDecided(t *testing.T) {
 	}
 	if o.QueueWait > o.Duration {
 		t.Errorf("queue wait %v exceeds duration %v", o.QueueWait, o.Duration)
+	}
+}
+
+// freeze drops a stage time recorded after the run's end, so the stages never add
+// up to more than the run's duration.
+func TestFreezeDropsTimesAfterCutoff(t *testing.T) {
+	t0 := time.Now()
+	for _, tc := range []struct {
+		name          string
+		slot, created time.Time
+		want          runStages
+	}{
+		{"both before", t0.Add(1), t0.Add(2), runStages{slot: t0.Add(1), created: t0.Add(2)}},
+		{"created after", t0.Add(1), t0.Add(20), runStages{slot: t0.Add(1)}},
+		{"slot after", t0.Add(20), time.Time{}, runStages{}},
+	} {
+		c := &runClock{runStages: runStages{slot: tc.slot, created: tc.created}}
+		if got := c.freeze(t0.Add(10)); got != tc.want {
+			t.Errorf("%s: freeze = %+v, want %+v", tc.name, got, tc.want)
+		}
+		c.set(func(s *runStages) { s.created = t0.Add(5) })
+		if got := c.runStages.created; got.Equal(t0.Add(5)) {
+			t.Errorf("%s: a write after freeze was applied", tc.name)
+		}
 	}
 }
 

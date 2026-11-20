@@ -535,7 +535,8 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 		// write below: freezing the clock here keeps a slow write from stretching
 		// the run or its queue wait, and a Dispatch that returns after the
 		// deadline won from counting as measured.
-		end, stages := time.Now(), clock.freeze()
+		end := time.Now()
+		stages := clock.freeze(end)
 		if h.Provider == "" {
 			h.Provider = o.provider
 		}
@@ -632,15 +633,24 @@ func (c *runClock) set(f func(*runStages)) {
 	}
 }
 
-// freeze stops further writes and returns the stage times recorded so far.
-func (c *runClock) freeze() runStages {
+// freeze stops further writes and returns the stage times recorded by cutoff, the
+// run's end. A time recorded after cutoff (a write that won the lock between the
+// end being sampled and the freeze) is dropped, so the stages never extend past
+// the run's duration.
+func (c *runClock) freeze(cutoff time.Time) runStages {
 	if c == nil {
 		return runStages{}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.frozen = true
-	return c.runStages
+	st := c.runStages
+	if st.slot.After(cutoff) {
+		st = runStages{} // still queued at the end; no create either
+	} else if st.created.After(cutoff) {
+		st.created = time.Time{}
+	}
+	return st
 }
 
 // Status returns the current state of a submitted run, and whether it is known.
