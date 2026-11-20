@@ -5,8 +5,6 @@
 package main
 
 import (
-	"crypto/ed25519"
-	"encoding/base64"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -52,6 +50,26 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 	log := ctrl.Log.WithName("aei")
 
+	// Fail closed: refuse to start without a usable signing key, so no run is ever
+	// dispatched with an empty or forgeable credential. An app with an asymmetric
+	// identity posture (a sole-minter control tier and a verify-only app tier, e.g.
+	// gofer's ADR 0002) gets the Ed25519 key 'make authority' provisions.
+	cfg := control.Config{
+		MaxConcurrentCreates: maxCreates,
+		MaxQueued:            maxQueued,
+		CreateTimeout:        createTimeout,
+		// Every run gets a deadline the controller enforces itself: a dispatch or
+		// AgentRun without a timeout gets the default, and a longer one is capped.
+		DefaultDeadline: runDefaultTimeout,
+		MaxDeadline:     runMaxTimeout,
+	}
+	kind, err := configureSigning(&cfg, os.Getenv)
+	if err != nil {
+		log.Error(err, "refusing to start")
+		os.Exit(1)
+	}
+	log.Info("run-credential authority: " + kind)
+
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(aeiv1.AddToScheme(scheme))
@@ -65,30 +83,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	cfg := control.Config{
-		Secret:               []byte(os.Getenv("AEI_SIGNING_SECRET")),
-		MaxConcurrentCreates: maxCreates,
-		MaxQueued:            maxQueued,
-		CreateTimeout:        createTimeout,
-		// Every run gets a deadline the controller enforces itself: a dispatch or
-		// AgentRun without a timeout gets the default, and a longer one is capped.
-		DefaultDeadline: runDefaultTimeout,
-		MaxDeadline:     runMaxTimeout,
-	}
-	// An app with an asymmetric identity posture (a sole-minter control tier and a
-	// verify-only app tier) provisions the control plane with its Ed25519 private
-	// key. When set, the plane mints run credentials with it and the app verifies
-	// them with only the public half — no shared secret (e.g. gofer's ADR 0002).
-	// Unset keeps the reference-grade HMAC authority.
-	if k := strings.TrimSpace(os.Getenv("AEI_ED25519_PRIVATE_KEY")); k != "" {
-		raw, decErr := base64.StdEncoding.DecodeString(k)
-		if decErr != nil || len(raw) != ed25519.PrivateKeySize {
-			log.Error(decErr, "AEI_ED25519_PRIVATE_KEY must be a base64-encoded Ed25519 private key", "wantBytes", ed25519.PrivateKeySize)
-			os.Exit(1)
-		}
-		cfg.Authority = control.NewEd25519Authority(ed25519.PrivateKey(raw))
-		log.Info("run-credential authority: Ed25519 (asymmetric, sole-minter)")
-	}
 	// Route the control plane's run-outcome logs through the manager's logger, so a
 	// failed dispatch (e.g. a class whose substrate/CRD is not installed) surfaces
 	// in the controller logs instead of only in GET /runs/{id}.

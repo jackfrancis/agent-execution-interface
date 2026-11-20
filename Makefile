@@ -104,6 +104,11 @@ TARGET_ARG    = $(if $(KUBECONFIG_GIVEN),KUBECONFIG=$(KUBECONFIG),KIND_CLUSTER=$
 PLATFORM      ?=
 # Render the full install with the manager image set to IMG, and apply it.
 APPLY_INSTALL = $(KUBECTL) kustomize controller/config/default | sed 's|image: localhost/aei-manager:dev$$|image: $(IMG)|' | $(KUBECTL) apply -f -
+# The signing key's two steps (hack/authority/authority.sh): `provision` creates or
+# reuses the key, before the controller is applied; `activate` rolls the controller
+# onto it and waits, after the new manifest is applied. The namespace must exist first.
+AUTHORITY_NS  = $(KUBECTL) apply -f controller/config/manager/namespace.yaml >/dev/null
+AUTHORITY     = KUBECTL="$(KUBECTL)" hack/authority/authority.sh
 
 # The sample run the smoke test (re)creates.
 SAMPLE_NS     ?= default
@@ -280,22 +285,27 @@ load: require-kind check-cluster ## load the manager image into the kind cluster
 install: check-cluster ## install just the CRDs
 	$(KUBECTL) apply -k controller/config/crd
 
-# deploy brings AEI up on a cluster that already exists: it applies the CRDs, RBAC and
-# the manager (with its image set to IMG), provisions the signing authority, and wires
-# the PROVIDERS classes. It does NOT build, push or load the image: on kind it must
-# already be loaded (make load / make dev-up); on any other cluster IMG must be pullable
-# from a registry (make push). It is the whole install for a non-kind cluster:
+# deploy brings AEI up on a cluster that already exists: it provisions (or reuses) the
+# signing key, applies the CRDs, RBAC and the manager (with its image set to IMG),
+# rolls the controller onto the key and waits for it, and wires the PROVIDERS
+# classes. The key comes first because the controller refuses to start without one;
+# the rollout wait comes after the apply, because a Deployment from an older install
+# may not be able to start on an Ed25519-only secret until the new manifest lands.
+# It does NOT build, push or load the image: on kind it must already be loaded (make
+# load / make dev-up); on any other cluster IMG must be pullable from a registry
+# (make push). It is the whole install for a non-kind cluster:
 #     make deploy KUBECONFIG=<file> IMG=<registry>/aei-manager:<tag> PROVIDERS=k8s-job
 # Use a new tag per build: the pod only re-pulls when the image reference changes.
 .PHONY: deploy
-deploy: check-cluster ## install CRDs + RBAC + the manager at IMG, provision the authority, wire PROVIDERS
+deploy: check-cluster ## provision/reuse the signing key, install CRDs + RBAC + the manager at IMG, roll onto the key, wire PROVIDERS
+	@$(AUTHORITY_NS)
+	@$(AUTHORITY) provision
 	$(APPLY_INSTALL)
-	@$(KUBECTL) -n aei-system rollout status deploy/aei-controller --timeout=180s || { \
+	@$(AUTHORITY) activate || { \
 		echo; echo "controller not ready — check: $(KUBECTL) -n aei-system get pods"; \
 		echo "If its pod is ImagePullBackOff, the image '$(IMG)' is not available to $(TARGET):"; \
 		echo "  kind: make load $(TARGET_ARG)      other clusters: make push IMG=<registry>/aei-manager:<tag>"; \
 		exit 1; }
-	$(MAKE) authority
 	@[ -z "$(PROVIDERS)" ] || $(MAKE) providers PROVIDERS="$(PROVIDERS)"
 	@echo "AEI is up on $(TARGET). App devs: 'make public-key $(TARGET_ARG)', then register + smoke."
 
@@ -314,13 +324,14 @@ undeploy: ## remove the operator (leaves the cluster running)
 # down deletes the whole cluster.
 
 .PHONY: dev-up
-dev-up: require-kind kind-up image load ## create the cluster if needed, build+load+deploy AEI, and provision the signing authority
+dev-up: require-kind kind-up image load ## create the cluster if needed, provision/reuse the signing key, build+load+deploy AEI
+	@$(AUTHORITY_NS)
+	@$(AUTHORITY) provision
 	$(APPLY_INSTALL)
 	@echo "rolling the controller to pick up the freshly loaded image..."
 	@$(KUBECTL) -n aei-system rollout restart deploy/aei-controller
-	@$(KUBECTL) -n aei-system rollout status deploy/aei-controller --timeout=120s || { \
+	@$(AUTHORITY) activate || { \
 		echo; echo "controller not ready — check: $(KUBECTL) -n aei-system get pods"; exit 1; }
-	$(MAKE) authority KIND_CLUSTER="$(KIND_CLUSTER)"
 	@[ -z "$(PROVIDERS)" ] || $(MAKE) providers KIND_CLUSTER="$(KIND_CLUSTER)" PROVIDERS="$(PROVIDERS)"
 	@echo "AEI is up on kind cluster '$(KIND_CLUSTER)'. App devs: 'make public-key', then register + smoke."
 
@@ -337,32 +348,28 @@ down: kind-down ## delete the whole kind cluster
 e2e: up smoke ## full loop: stand AEI up, then drive a run to Succeeded
 
 # Run-credential signing authority (docs/design.md, Contract 3). AEI is the sole
-# minter: `authority` provisions a PLATFORM Ed25519 keypair, stores it, and rolls
-# the controller onto it; apps consume only the public key (`public-key`) and feed
-# the platform nothing secret. Idempotent — it never rotates an existing key. Until
-# provisioned the controller uses the reference HMAC secret (fine for the built-in
-# smoke; asymmetric verify-only apps need this).
+# minter: `authority` provisions a PLATFORM Ed25519 keypair into the aei-signing
+# secret; apps consume only the public key (`public-key`) and feed the platform
+# nothing secret. The controller refuses to start without a key, and the default
+# install ships none, so deploy and dev-up run this BEFORE applying the controller.
+# It never replaces a key: a verify-only app (e.g. gofer's web tier) reads the public
+# key at its own deploy time, so a new key means redeploying that app. `undeploy`
+# deletes the aei-system namespace and the key with it. Run alone, it also rolls a
+# running controller onto the key and waits, so re-running it finishes an
+# interrupted activation. hack/authority/authority.sh has the details (conditional
+# writes, the key stamped on the pod template); its tests use a fake kubectl.
 .PHONY: authority
-authority: check-cluster ## provision the platform Ed25519 signing keypair (idempotent) and roll the controller
-	@if $(KUBECTL) -n aei-system get secret aei-signing -o jsonpath='{.data.AEI_ED25519_PRIVATE_KEY}' 2>/dev/null | grep -q .; then \
-		echo "platform Ed25519 authority already provisioned (make public-key to read it)"; \
-	else \
-		echo "generating a platform Ed25519 keypair..."; \
-		keys=$$(go run ./hack/genkey) || exit 1; \
-		priv=$$(printf '%s\n' "$$keys" | sed -n 's/^AEI_ED25519_PRIVATE_KEY=//p'); \
-		pub=$$(printf '%s\n' "$$keys" | sed -n 's/^AEI_ED25519_PUBLIC_KEY=//p'); \
-		$(KUBECTL) -n aei-system patch secret aei-signing --type=merge \
-			-p '{"stringData":{"AEI_ED25519_PRIVATE_KEY":"'"$$priv"'","AEI_ED25519_PUBLIC_KEY":"'"$$pub"'"}}'; \
-		$(KUBECTL) -n aei-system rollout restart deploy/aei-controller; \
-		$(KUBECTL) -n aei-system rollout status deploy/aei-controller --timeout=120s; \
-		echo "provisioned. app verify key (also at GET /aei/v1alpha1/authority):"; echo "  $$pub"; \
-	fi
+authority: check-cluster ## provision the platform Ed25519 signing key (never replaces one) and roll the controller onto it
+	@$(AUTHORITY_NS)
+	@$(AUTHORITY)
 
+# public-key prints the key that verifies the controller's credentials: derived from
+# the secret's private key and checked against its AEI_ED25519_PUBLIC_KEY (a stale
+# field fails instead of being printed). It is read-only, and works when that field
+# is absent (e.g. an immutable secret holding only the private key).
 .PHONY: public-key
 public-key: check-cluster ## print AEI's run-credential verification (public) key for app developers
-	@pub=$$($(KUBECTL) -n aei-system get secret aei-signing -o jsonpath='{.data.AEI_ED25519_PUBLIC_KEY}' 2>/dev/null | base64 -d 2>/dev/null); \
-		test -n "$$pub" || { echo "no Ed25519 authority provisioned — run: make authority"; exit 1; }; \
-		echo "$$pub"
+	@$(AUTHORITY) public-key
 
 ## ── samples & smoke test (k8s-job: no external substrate) ─────────────────────
 

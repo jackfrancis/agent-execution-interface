@@ -1,5 +1,6 @@
 # The full AEI reference operator install: CRDs + RBAC + the manager
-# Deployment/Service/Secret. Apply with:
+# Deployment/Service. It ships no signing key: provision one first with the repo
+# root's `make authority` (`make deploy` there does both). Apply with:
 #   kubectl apply -k controller/config/default
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization

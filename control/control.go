@@ -242,6 +242,12 @@ type Plane struct {
 	providerPools map[poolKey]*permitPool // per provider: PullsCredential and in-flight Dispatch (guarded by mu)
 	ticketCalls   chan struct{}           // Store.PutTicket (pull credential)
 	tokenCalls    chan struct{}           // TokenAuthority.Mint (pushed credential)
+	// Store calls have three pools, so the run watch's polls, which a slow Store
+	// can strand, never take the capacity a terminal write, or the read of the
+	// outcome that beat it, needs; and a read-back never holds write capacity.
+	storeReads     chan struct{} // Store.Run for the run watch
+	storeWrites    chan struct{} // Store.FinishRun for terminal writes
+	storeReadBacks chan struct{} // Store.Run for the outcome a losing terminal write lost to
 
 	defaultDeadline time.Duration // applied to a run with no Deadline
 	maxDeadline     time.Duration // cap on a run's Deadline
@@ -280,21 +286,24 @@ func New(cfg Config) *Plane {
 	maxDeadline := orDur(cfg.MaxDeadline, defaultMaxDeadline)
 	defaultDeadline := min(orDur(cfg.DefaultDeadline, defaultRunDeadline), maxDeadline)
 	return &Plane{
-		auth:          auth,
-		creds:         cfg.Credentials,
-		tokenTTL:      orDur(cfg.TokenTTL, 15*time.Minute),
-		ticketTTL:     orDur(cfg.TicketTTL, 5*time.Minute),
-		now:           now,
-		log:           log,
-		store:         store,
-		obs:           obs,
-		creates:       make(chan struct{}, creates),
-		admit:         make(chan struct{}, creates+queued),
-		createTimeout: orDur(cfg.CreateTimeout, DefaultCreateTimeout),
-		providerPools: map[poolKey]*permitPool{},
-		ticketCalls:   make(chan struct{}, 2*creates),
-		tokenCalls:    make(chan struct{}, 2*creates),
-		waiters:       map[string]chan aei.Result{},
+		auth:           auth,
+		creds:          cfg.Credentials,
+		tokenTTL:       orDur(cfg.TokenTTL, 15*time.Minute),
+		ticketTTL:      orDur(cfg.TicketTTL, 5*time.Minute),
+		now:            now,
+		log:            log,
+		store:          store,
+		obs:            obs,
+		creates:        make(chan struct{}, creates),
+		admit:          make(chan struct{}, creates+queued),
+		createTimeout:  orDur(cfg.CreateTimeout, DefaultCreateTimeout),
+		providerPools:  map[poolKey]*permitPool{},
+		ticketCalls:    make(chan struct{}, 2*creates),
+		tokenCalls:     make(chan struct{}, 2*creates),
+		storeReads:     make(chan struct{}, 2*creates),
+		storeWrites:    make(chan struct{}, 2*creates),
+		storeReadBacks: make(chan struct{}, 2*creates),
+		waiters:        map[string]chan aei.Result{},
 
 		defaultDeadline: defaultDeadline,
 		maxDeadline:     maxDeadline,
@@ -397,6 +406,7 @@ func (p *Plane) RunWithOptions(ctx context.Context, launcher aei.Launcher, spec 
 	}()
 
 	spec = p.applyDeadline(ownSpec(spec))
+	callerCtx := ctx // bounds the commit below; the run's own deadline does not
 	ctx, cancel := withRunDeadline(ctx, spec)
 	defer cancel()
 	spec = withContextCutoff(ctx, spec) // a caller deadline sooner than the run's wins
@@ -418,6 +428,20 @@ func (p *Plane) RunWithOptions(ctx context.Context, launcher aei.Launcher, spec 
 	// race releases admission when the create gives its slot back, which for a
 	// blocking Launch can be after Run returns.
 	res, _, err = p.race(ctx, launcher, spec, done, release, providerKey(launcher, o.class))
+	// Commit through the Store, first writer wins, and report what it holds, so
+	// Run and GET /runs/{id} agree: an outcome a peer replica recorded first (a
+	// /complete, or a /redeem that failed to mint) is this run's outcome, even
+	// when it landed after the last watch poll or while the provider was
+	// succeeding. When the Store holds this run's own outcome — this commit won,
+	// or this replica's /redeem recorded the same failure first — res keeps its
+	// original error value, so errors.Is still matches (ErrDeadlineExceeded, or
+	// the credential issuer's error).
+	if st, won, ok := p.commitRun(callerCtx, spec, res); ok && !won && st != stateOf(res) {
+		res = resultOf(st)
+		if err != nil {
+			err = res.Err // still "not accepted", but with the recorded cause
+		}
+	}
 	return res, err
 }
 
@@ -554,16 +578,91 @@ func (p *Plane) Status(runID string) (RunState, bool) {
 // than the one that dispatched (the HA seam). It returns the state the store holds
 // afterwards: res when this call won, else the earlier winner.
 func (p *Plane) finishRun(runID string, res aei.Result) RunState {
+	st, _ := p.commit(runID, res)
+	return st
+}
+
+// recordTimeout bounds a terminal write that no caller is waiting on: how long
+// record waits for a Store write permit and then for the write. It sits inside the
+// runtime SDK's 30s request timeout (aeiruntime), so a /redeem that waits for its
+// write still answers the runtime.
+const recordTimeout = 20 * time.Second
+
+// recorded is what the Store holds for a run after record's write: st, and
+// whether this write won. ok is false when the write did not finish within
+// recordTimeout, or when this write lost and the winner could not be read back
+// in time.
+type recorded struct {
+	st      RunState
+	won, ok bool
+}
+
+// record commits res as runID's outcome through the Store (first writer wins) on
+// its own goroutine, bounded by recordTimeout, so no caller's cancellation or
+// impatience can stop the outcome from being recorded. The write holds a Store
+// write permit (a pool the run watch's reads cannot exhaust) for FinishRun alone;
+// when it loses, the winner is read back under a read-back permit, a pool of its
+// own, so a slow read never holds write capacity and the run watch's polls
+// cannot keep Run from learning the outcome that won. The returned channel (buffered) delivers
+// the result once the write finishes or the bound ends; a caller may stop
+// waiting for it at any time.
+func (p *Plane) record(runID string, res aei.Result) <-chan recorded {
+	out := make(chan recorded, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+		defer cancel()
+		// Each worker writes only its own variable, read only once bounded
+		// reports that worker finished: a call that completes after the bound
+		// writes to storage nothing reads.
+		var wrote bool
+		if err := p.bounded(ctx, p.storeWrites, nil, runID, "run status commit", func() { wrote = p.finish(runID, res) }); err != nil {
+			p.log.Warn("run outcome not yet recorded in the store", "run_id", runID, "error", err.Error())
+			out <- recorded{}
+			return
+		}
+		if wrote {
+			out <- recorded{st: stateOf(res), won: true, ok: true}
+			return
+		}
+		var (
+			winner RunState
+			found  bool
+		)
+		if p.bounded(ctx, p.storeReadBacks, nil, runID, "run status read-back", func() { winner, found = p.winner(runID) }) != nil || !found {
+			out <- recorded{} // recorded by its winner; which outcome won is unknown here
+			return
+		}
+		out <- recorded{st: winner, ok: true}
+	}()
+	return out
+}
+
+// stateOf is the RunState the Store records for res.
+func stateOf(res aei.Result) RunState {
 	st := RunState{Phase: phaseSucceeded, ResultRef: res.ResultRef, Timing: res.Timing}
 	if res.Err != nil {
 		st.Phase, st.Err = phaseFailed, res.Err.Error()
 	}
-	if !p.store.FinishRun(runID, st) {
-		// A terminal outcome was already recorded; report that one.
-		if won, ok := p.store.Run(runID); ok && won.Phase != phaseRunning {
-			return won
-		}
-		return st
+	return st
+}
+
+// commit is finishRun that also reports whether this call's outcome won.
+func (p *Plane) commit(runID string, res aei.Result) (RunState, bool) {
+	if p.finish(runID, res) {
+		return stateOf(res), true
+	}
+	// A terminal outcome was already recorded; report that one.
+	if won, ok := p.winner(runID); ok {
+		return won, false
+	}
+	return stateOf(res), false
+}
+
+// finish writes res as runID's terminal outcome (first writer wins) and reports
+// whether it wrote, logging a failure it recorded.
+func (p *Plane) finish(runID string, res aei.Result) bool {
+	if !p.store.FinishRun(runID, stateOf(res)) {
+		return false
 	}
 	if res.Err != nil {
 		// Otherwise only visible via GET /runs/{id} (the data-plane path keeps no
@@ -571,7 +670,13 @@ func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 		// its CRD is missing — reads clearly in the message here.
 		p.log.Warn("run failed", "run_id", runID, "error", res.Err.Error())
 	}
-	return st
+	return true
+}
+
+// winner reads back the terminal outcome recorded for runID, if any.
+func (p *Plane) winner(runID string) (RunState, bool) {
+	won, ok := p.store.Run(runID)
+	return won, ok && won.Phase != phaseRunning
 }
 
 // race dispatches spec and returns the first terminal signal: the runtime's
@@ -739,16 +844,31 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		provider <- outcome{res: aei.Result{Err: err}}
 	}()
 
+	// With replicas > 1 the runtime's call (a /complete, or a /redeem that fails
+	// to mint) can land on another replica, which records the outcome in the
+	// shared Store but can wake only its own waiters. Watch the Store too, so
+	// such an outcome ends the run within its deadline and Run, Submit and
+	// GET /runs/{id} all report the same cause.
+	stored := make(chan aei.Result, 1)
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	go p.watchStored(watchCtx, spec.ID, stored)
+
 	select {
 	case r := <-done:
+		return r, getHandle(), nil
+	case r := <-stored:
 		return r, getHandle(), nil
 	case o := <-provider:
 		r, err := providerOutcome(ctx, done, o.res, o.dispatchErr)
 		return r, getHandle(), err
 	case <-ctx.Done():
-		// A runtime callback that landed together with the deadline still wins.
+		// A runtime callback that landed together with the deadline, or an
+		// outcome the Store watch picked up, still wins.
 		select {
 		case r := <-done:
+			return r, getHandle(), nil
+		case r := <-stored:
 			return r, getHandle(), nil
 		default:
 		}
@@ -802,6 +922,98 @@ func withContextCutoff(ctx context.Context, spec aei.RunSpec) aei.RunSpec {
 	return spec
 }
 
+// Store watch cadence: a tenth of the run's remaining budget, within these bounds.
+// A long run polls about once a second; a short one often enough to finish well
+// inside its deadline. A shared Store sees at most one Run read per interval per
+// run in flight on this replica.
+const (
+	minStorePoll = 5 * time.Millisecond
+	maxStorePoll = time.Second
+)
+
+// storePollInterval returns how often watchStored reads the Store for a run whose
+// context is ctx.
+func storePollInterval(ctx context.Context) time.Duration {
+	d := maxStorePoll
+	if dl, ok := ctx.Deadline(); ok {
+		d = time.Until(dl) / 10
+	}
+	return min(max(d, minStorePoll), maxStorePoll)
+}
+
+// watchStored polls the Store for a terminal outcome recorded for runID — by
+// another replica, which cannot wake this one's waiters — and delivers the first
+// one on out, so such an outcome ends the run promptly. It stops when ctx ends
+// (race cancels it when the run settles). Each read holds one of the plane's
+// Store read permits until it returns, so a Store outage strands at most that
+// many reads, however many runs are in flight, and stranded reads never delay
+// a terminal write, which has permits of its own.
+func (p *Plane) watchStored(ctx context.Context, runID string, out chan<- aei.Result) {
+	t := time.NewTicker(storePollInterval(ctx))
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		var (
+			st RunState
+			ok bool
+		)
+		if p.bounded(ctx, p.storeReads, nil, runID, "run status read", func() { st, ok = p.store.Run(runID) }) != nil {
+			continue // ctx ended, or the read is still outstanding
+		}
+		if ok && st.Phase != phaseRunning {
+			out <- resultOf(st) // buffered (1); delivered at most once
+			return
+		}
+	}
+}
+
+// commitGrace bounds how long Run waits, past the moment its race settled, to
+// commit the outcome through the Store: a tenth of the run's deadline, within
+// these bounds.
+const (
+	minCommitGrace = 50 * time.Millisecond
+	maxCommitGrace = time.Second
+)
+
+// commitRun records Run's outcome in the Store, first writer wins, and returns
+// the outcome the Store holds: res when this commit won, or the outcome another
+// writer recorded first — a peer replica's /complete, or a /redeem that failed to
+// mint. That makes Run's result and GET /runs/{id} the same outcome however the
+// signals interleaved, including one recorded just before the deadline.
+//
+// The write itself is record's, independent of Run's caller: a caller that
+// cancels, or a Store slower than Run waits, still leaves the outcome recorded
+// for Status. Run only waits for it, at most the commit grace past the run's
+// deadline and never past callerCtx (the Run caller's own context, which the
+// grace cannot extend). When the write has not finished by then Run keeps its
+// own result (ok is false), which is all this replica can know while the Store
+// does not answer.
+func (p *Plane) commitRun(callerCtx context.Context, spec aei.RunSpec, res aei.Result) (st RunState, won, ok bool) {
+	written := p.record(spec.ID, res)
+	grace := min(max(spec.Deadline/10, minCommitGrace), maxCommitGrace)
+	wait, cancel := context.WithTimeout(callerCtx, grace)
+	defer cancel()
+	select {
+	case r := <-written:
+		return r.st, r.won, r.ok
+	case <-wait.Done():
+		return RunState{}, false, false
+	}
+}
+
+// resultOf turns a recorded terminal RunState back into the Result it came from.
+func resultOf(st RunState) aei.Result {
+	res := aei.Result{ResultRef: st.ResultRef, Timing: st.Timing}
+	if st.Phase == phaseFailed {
+		res.Err = errors.New(st.Err)
+	}
+	return res
+}
+
 // mintWithin mints the run credential, giving up when ctx ends. Minting takes no
 // context, so each step runs through bounded: a call still blocked when ctx ends
 // is abandoned (its credential, if ever produced, is never handed out and expires
@@ -830,9 +1042,16 @@ func (p *Plane) mintWithin(ctx context.Context, launcher aei.Launcher, spec aei.
 		}
 		return aei.Credential{Value: id, Kind: aei.Ticket}, nil
 	}
-	var tok string
-	if err := p.bounded(ctx, p.tokenCalls, nil, spec.ID, "run token", func() { tok = p.mintToken(p.claims(spec)) }); err != nil {
+	var (
+		tok     string
+		mintErr error
+	)
+	if err := p.bounded(ctx, p.tokenCalls, nil, spec.ID, "run token", func() { tok, mintErr = p.mintToken(p.claims(spec)) }); err != nil {
 		return aei.Credential{}, err
+	}
+	if mintErr != nil {
+		// Fail closed: the run fails and is never handed an empty credential.
+		return aei.Credential{}, mintErr
 	}
 	return aei.Credential{Value: tok, Kind: aei.Token}, nil
 }
@@ -1012,12 +1231,17 @@ type Claims struct {
 
 // mint produces the credential handed to the provider: a pushed token, or (for a
 // PullCredentialLauncher) a single-use ticket the runtime redeems for the token.
-func (p *Plane) mint(launcher aei.Launcher, spec aei.RunSpec) aei.Credential {
+// A mint error is returned, never collapsed into an empty credential.
+func (p *Plane) mint(launcher aei.Launcher, spec aei.RunSpec) (aei.Credential, error) {
 	claims := p.claims(spec)
 	if pl, ok := launcher.(aei.PullCredentialLauncher); ok && pl.PullsCredential() {
-		return aei.Credential{Value: p.issueTicket(claims), Kind: aei.Ticket}
+		return aei.Credential{Value: p.issueTicket(claims), Kind: aei.Ticket}, nil
 	}
-	return aei.Credential{Value: p.mintToken(claims), Kind: aei.Token}
+	tok, err := p.mintToken(claims)
+	if err != nil {
+		return aei.Credential{}, err
+	}
+	return aei.Credential{Value: tok, Kind: aei.Token}, nil
 }
 
 // claims are the run credential's payload for spec.
@@ -1038,22 +1262,50 @@ func (p *Plane) issueTicket(c Claims) string {
 }
 
 // redeem consumes a single-use ticket and mints the run token it was issued for,
-// preserving the run id so completion still correlates.
-func (p *Plane) redeem(id string) (string, int, bool) {
+// preserving the run id so completion still correlates. A mint error fails the
+// run (the ticket is already spent, so the runtime cannot retry) and is returned.
+// ctx is the runtime's request: redeem stops waiting for the failure's Store
+// write when it ends.
+func (p *Plane) redeem(ctx context.Context, id string) (string, int, bool, error) {
 	c, ok := p.store.RedeemTicket(id, p.now())
 	if !ok {
-		return "", 0, false
+		return "", 0, false, nil
+	}
+	tok, err := p.mintToken(c)
+	if err != nil {
+		res := aei.Result{Err: err}
+		// Deliver the known failure first: a run waiting on this replica ends
+		// with it at once, whatever the Store is doing.
+		p.fire(c.RunID, res)
+		// Then record it for GET /runs/{id} and peer replicas, and answer the
+		// runtime only once the write has landed: the provider learns of the
+		// failure from that answer, so its report ("redeem status 500") then
+		// reaches the Store second and the signing cause stays the run's
+		// outcome on every replica, for any write that lands within
+		// recordTimeout. The wait ends with the runtime's request or that
+		// bound; the write itself continues either way.
+		select {
+		case <-p.record(c.RunID, res):
+		case <-ctx.Done():
+		}
+		return "", 0, true, err
 	}
 	ttl := int(time.Unix(c.Exp, 0).Sub(p.now()).Seconds())
-	return p.mintToken(c), ttl, true
+	return tok, ttl, true, nil
 }
 
-// mintToken produces a run credential via the configured TokenAuthority. It keeps
-// a single-value signature (a mint error collapses to an empty token) so the
-// internal mint/redeem paths stay unchanged.
-func (p *Plane) mintToken(c Claims) string {
-	tok, _ := p.auth.Mint(c)
-	return tok
+// mintToken produces a run credential via the configured TokenAuthority. It fails
+// closed: an authority error, or an authority that returns an empty token, is an
+// error — never an empty credential handed to a run.
+func (p *Plane) mintToken(c Claims) (string, error) {
+	tok, err := p.auth.Mint(c)
+	if err == nil && tok == "" {
+		err = errors.New("authority returned an empty token")
+	}
+	if err != nil {
+		return "", fmt.Errorf("control: mint run credential: %w", err)
+	}
+	return tok, nil
 }
 
 // verifyToken authenticates a run credential via the configured TokenAuthority.
@@ -1070,6 +1322,10 @@ type hmacAuthority struct {
 }
 
 func (a hmacAuthority) Mint(c Claims) (string, error) {
+	if len(a.secret) == 0 {
+		// Fail closed: an unkeyed HMAC is a forgeable credential.
+		return "", errors.New("no HMAC signing secret configured")
+	}
 	payload, err := json.Marshal(c)
 	if err != nil {
 		return "", err
@@ -1079,6 +1335,9 @@ func (a hmacAuthority) Mint(c Claims) (string, error) {
 }
 
 func (a hmacAuthority) Verify(tok string) (Claims, bool) {
+	if len(a.secret) == 0 {
+		return Claims{}, false // fail closed, as Mint does
+	}
 	b, sig, ok := strings.Cut(tok, ".")
 	if !ok || !hmac.Equal([]byte(sig), []byte(a.sign(b))) {
 		return Claims{}, false
@@ -1282,9 +1541,13 @@ func (p *Plane) handleRedeem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	tok, ttl, ok := p.redeem(body.Ticket)
+	tok, ttl, ok, err := p.redeem(r.Context(), body.Ticket)
 	if !ok {
 		http.Error(w, "invalid ticket", http.StatusUnauthorized) // coarse: unknown/spent/expired alike
+		return
+	}
+	if err != nil {
+		http.Error(w, "credential unavailable", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, map[string]any{"credential": tok, "expires_in": ttl})

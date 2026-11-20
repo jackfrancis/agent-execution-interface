@@ -41,22 +41,29 @@ spec:
             - name: http
               containerPort: 8080
           env:
-            # Reference-grade symmetric authority (HMAC). Used unless an Ed25519
-            # key is provided below.
-            - name: AEI_SIGNING_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: aei-signing
-                  key: AEI_SIGNING_SECRET
-            # Optional asymmetric authority: when set (a base64 Ed25519 private
-            # key), the control plane becomes the sole minter and verify-only apps
-            # hold just the public half. Takes precedence over AEI_SIGNING_SECRET.
-            # Populate the aei-signing secret's AEI_ED25519_PRIVATE_KEY to enable.
+            # The run-credential signing key, from the aei-signing secret. This
+            # install does NOT ship that secret: `make authority` (run by `make
+            # deploy` and `make dev-up` before this Deployment is applied) creates
+            # it with an Ed25519 keypair, or reuses the one already there. The
+            # controller refuses to start when neither key below is usable.
+            #
+            # Asymmetric authority (the default): a base64 Ed25519 private key.
+            # The control plane is the sole minter and verify-only apps hold just
+            # the public half. Takes precedence over AEI_SIGNING_SECRET.
             - name: AEI_ED25519_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
                   name: aei-signing
                   key: AEI_ED25519_PRIVATE_KEY
+                  optional: true
+            # Reference-grade symmetric authority (HMAC), used only when no
+            # Ed25519 key is set. Must be at least 32 random bytes; an empty or
+            # placeholder value is refused.
+            - name: AEI_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: aei-signing
+                  key: AEI_SIGNING_SECRET
                   optional: true
             # Optional: AEI_REGISTRY_REWRITE redirects where the durable agent-substrate
             # provider READS an app image's config to resolve its entrypoint for the
