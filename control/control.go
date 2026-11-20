@@ -242,10 +242,12 @@ type Plane struct {
 	providerPools map[poolKey]*permitPool // per provider: PullsCredential and in-flight Dispatch (guarded by mu)
 	ticketCalls   chan struct{}           // Store.PutTicket (pull credential)
 	tokenCalls    chan struct{}           // TokenAuthority.Mint (pushed credential)
-	// Store calls have two pools, so the run watch's polls, which a slow Store
-	// can strand, never take the capacity a terminal write needs.
-	storeReads  chan struct{} // Store.Run for the run watch
-	storeWrites chan struct{} // Store.FinishRun (and its read-back) for terminal writes
+	// Store calls have three pools, so the run watch's polls, which a slow Store
+	// can strand, never take the capacity a terminal write, or the read of the
+	// outcome that beat it, needs; and a read-back never holds write capacity.
+	storeReads     chan struct{} // Store.Run for the run watch
+	storeWrites    chan struct{} // Store.FinishRun for terminal writes
+	storeReadBacks chan struct{} // Store.Run for the outcome a losing terminal write lost to
 
 	defaultDeadline time.Duration // applied to a run with no Deadline
 	maxDeadline     time.Duration // cap on a run's Deadline
@@ -284,23 +286,24 @@ func New(cfg Config) *Plane {
 	maxDeadline := orDur(cfg.MaxDeadline, defaultMaxDeadline)
 	defaultDeadline := min(orDur(cfg.DefaultDeadline, defaultRunDeadline), maxDeadline)
 	return &Plane{
-		auth:          auth,
-		creds:         cfg.Credentials,
-		tokenTTL:      orDur(cfg.TokenTTL, 15*time.Minute),
-		ticketTTL:     orDur(cfg.TicketTTL, 5*time.Minute),
-		now:           now,
-		log:           log,
-		store:         store,
-		obs:           obs,
-		creates:       make(chan struct{}, creates),
-		admit:         make(chan struct{}, creates+queued),
-		createTimeout: orDur(cfg.CreateTimeout, DefaultCreateTimeout),
-		providerPools: map[poolKey]*permitPool{},
-		ticketCalls:   make(chan struct{}, 2*creates),
-		tokenCalls:    make(chan struct{}, 2*creates),
-		storeReads:    make(chan struct{}, 2*creates),
-		storeWrites:   make(chan struct{}, 2*creates),
-		waiters:       map[string]chan aei.Result{},
+		auth:           auth,
+		creds:          cfg.Credentials,
+		tokenTTL:       orDur(cfg.TokenTTL, 15*time.Minute),
+		ticketTTL:      orDur(cfg.TicketTTL, 5*time.Minute),
+		now:            now,
+		log:            log,
+		store:          store,
+		obs:            obs,
+		creates:        make(chan struct{}, creates),
+		admit:          make(chan struct{}, creates+queued),
+		createTimeout:  orDur(cfg.CreateTimeout, DefaultCreateTimeout),
+		providerPools:  map[poolKey]*permitPool{},
+		ticketCalls:    make(chan struct{}, 2*creates),
+		tokenCalls:     make(chan struct{}, 2*creates),
+		storeReads:     make(chan struct{}, 2*creates),
+		storeWrites:    make(chan struct{}, 2*creates),
+		storeReadBacks: make(chan struct{}, 2*creates),
+		waiters:        map[string]chan aei.Result{},
 
 		defaultDeadline: defaultDeadline,
 		maxDeadline:     maxDeadline,
@@ -598,8 +601,9 @@ type recorded struct {
 // its own goroutine, bounded by recordTimeout, so no caller's cancellation or
 // impatience can stop the outcome from being recorded. The write holds a Store
 // write permit (a pool the run watch's reads cannot exhaust) for FinishRun alone;
-// when it loses, the winner is read back under a read permit, so a slow read
-// never holds write capacity either. The returned channel (buffered) delivers
+// when it loses, the winner is read back under a read-back permit, a pool of its
+// own, so a slow read never holds write capacity and the run watch's polls
+// cannot keep Run from learning the outcome that won. The returned channel (buffered) delivers
 // the result once the write finishes or the bound ends; a caller may stop
 // waiting for it at any time.
 func (p *Plane) record(runID string, res aei.Result) <-chan recorded {
@@ -624,7 +628,7 @@ func (p *Plane) record(runID string, res aei.Result) <-chan recorded {
 			winner RunState
 			found  bool
 		)
-		if p.bounded(ctx, p.storeReads, nil, runID, "run status read", func() { winner, found = p.winner(runID) }) != nil || !found {
+		if p.bounded(ctx, p.storeReadBacks, nil, runID, "run status read-back", func() { winner, found = p.winner(runID) }) != nil || !found {
 			out <- recorded{} // recorded by its winner; which outcome won is unknown here
 			return
 		}

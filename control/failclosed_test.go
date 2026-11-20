@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -409,7 +410,7 @@ func TestStoreOutageBoundsOutstandingCalls(t *testing.T) {
 	st := &hungStore{memStore: newMemStore(), release: make(chan struct{})}
 	defer close(st.release)
 	p := New(Config{Secret: []byte("k"), Store: st, Logger: quietLog, MaxConcurrentCreates: 1})
-	const limit = 2 + 2 // the Store read and write permits, each 2*MaxConcurrentCreates
+	const limit = 2 + 2 + 2 // the Store read, write and read-back permits, each 2*MaxConcurrentCreates
 
 	const deadline = 60 * time.Millisecond
 	for i := range 8 {
@@ -423,7 +424,7 @@ func TestStoreOutageBoundsOutstandingCalls(t *testing.T) {
 		}
 	}
 	if n := st.peak(); n > limit {
-		t.Fatalf("%d Store calls outstanding at once; want at most the %d Store read and write permits", n, limit)
+		t.Fatalf("%d Store calls outstanding at once; want at most the %d Store permits", n, limit)
 	}
 }
 
@@ -748,5 +749,72 @@ func TestLosingWriteReleasesWritePermitBeforeReadBack(t *testing.T) {
 			t.Fatal("outcome not recorded: losing writes held the write permits while reading back")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// pollStallStore hangs Store.Run reads of runs whose id starts with "poll-"
+// until release closes (other runs' status polls stuck on a slow shard), and
+// counts how many are hung.
+type pollStallStore struct {
+	*memStore
+	release chan struct{}
+	hung    atomic.Int32
+}
+
+func (s *pollStallStore) Run(id string) (RunState, bool) {
+	if strings.HasPrefix(id, "poll-") {
+		s.hung.Add(1)
+		<-s.release
+	}
+	return s.memStore.Run(id)
+}
+
+// failingCompleter is a plain provider whose runtime reports a failure to a peer
+// replica's /complete before Launch itself returns success.
+type failingCompleter struct {
+	t       *testing.T
+	peerURL string
+}
+
+func (l failingCompleter) Launch(_ context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
+	resp := post(l.t, l.peerURL+"/aei/v1alpha1/complete", cred.Value, map[string]any{"run_id": spec.ID, "error": "runtime failed"})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		l.t.Errorf("peer /complete status = %d, want 202", resp.StatusCode)
+	}
+	return aei.Handle{Ref: spec.ID}, nil
+}
+
+// Run reads back the outcome its commit lost to with permits the run watch's
+// polls cannot take: with other runs' polls holding every watch read permit, a
+// failure a peer recorded before the provider returned success is still Run's
+// result, as it is Status's.
+func TestReadBackNotStarvedByPolls(t *testing.T) {
+	st := &pollStallStore{memStore: newMemStore(), release: make(chan struct{})}
+	defer close(st.release)
+	secret := []byte("shared-secret")
+	dispatcher := New(Config{Secret: secret, Store: st, Logger: quietLog, MaxConcurrentCreates: 1}) // 2 read permits
+	receiver := New(Config{Secret: secret, Store: st, Logger: quietLog})
+	srv := httptest.NewServer(receiver.Handler())
+	defer srv.Close()
+
+	// Unrelated runs whose polls strand both watch read permits. They are async,
+	// so they give back the one create slot once dispatched.
+	polling := &fakeAsync{dispatched: make(chan aei.Credential, 2)}
+	for i := range 2 {
+		go dispatcher.Run(context.Background(), polling, aei.RunSpec{ID: fmt.Sprintf("poll-%d", i), Deadline: time.Second})
+	}
+	for deadline := time.Now().Add(3 * time.Second); st.hung.Load() < 2; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("polls never held both read permits")
+		}
+	}
+
+	res, err := dispatcher.Run(context.Background(), failingCompleter{t: t, peerURL: srv.URL}, aei.RunSpec{ID: "peer-failed", Deadline: 500 * time.Millisecond})
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "runtime failed") {
+		t.Fatalf("Run = (%+v, %v); want the peer's recorded failure", res, err)
+	}
+	if got, _ := st.memStore.Run("peer-failed"); got.Err != res.Err.Error() {
+		t.Errorf("Status err = %q, Run err = %q; they disagree", got.Err, res.Err)
 	}
 }
