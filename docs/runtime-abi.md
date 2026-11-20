@@ -366,13 +366,17 @@ The same numbers appear under different names depending on where they are read:
 | Where | Fields | A measured zero |
 | --- | --- | --- |
 | `/complete` request body (this ABI) | `model_seconds`, `model_calls`, `tool_calls` | `model_seconds: 0` sent; zero counts omitted |
-| controller metrics | `aei_run_duration_seconds{stage="model"}`, `aei_run_model_calls_total`, `aei_run_tool_calls_total` | counts as a `model` histogram sample; a zero count adds nothing |
+| controller metrics (aggregate; dispatch API runs only) | `aei_run_duration_seconds{stage="model"}`, `aei_run_model_calls_total`, `aei_run_tool_calls_total` | counts as a `model` histogram sample in its task/phase/provider series; a zero count adds nothing |
 | `AgentRun.status.timing` | `modelSeconds`, `modelCalls`, `toolCalls` | **omitted** (the fields are `omitempty`), indistinguishable from unmeasured |
 | dispatch API `GET /runs/{id}` → `timing` | `modelSeconds`, `modelCalls`, `toolCalls` | always present, `0` whether measured or not |
 
-So only the `/complete` body and the metrics tell a measured zero from an
-unmeasured stage; a consumer of `AgentRun` or the dispatch API that needs that
-distinction should read the `stage="model"` histogram instead.
+So for a **particular run**, only its `/complete` payload tells a measured zero
+from an unmeasured stage; neither `AgentRun` nor the dispatch API keeps that
+distinction. The metrics keep it only in aggregate: the histogram is labeled by
+`task_ref`, `phase`, `provider` and `stage`, with no run id, so a measured zero
+adds a `model` sample to its series without saying which run sent it. The
+metrics also cover only runs dispatched through the dispatch API; runs the
+`AgentRun` reconciler launches do not reach the metrics observer.
 
 Calling `Complete` from `fn` remains possible — it is the way to publish a
 `result_ref` — but the platform records only the **first** report (R4), so the
