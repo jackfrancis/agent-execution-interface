@@ -587,36 +587,48 @@ const recordTimeout = 20 * time.Second
 
 // recorded is what the Store holds for a run after record's write: st, and
 // whether this write won. ok is false when the write did not finish within
-// recordTimeout.
+// recordTimeout, or when this write lost and the winner could not be read back
+// in time.
 type recorded struct {
 	st      RunState
 	won, ok bool
 }
 
 // record commits res as runID's outcome through the Store (first writer wins) on
-// its own goroutine, bounded by recordTimeout and holding a Store write permit
-// (a pool the run watch's reads cannot exhaust), so no
-// caller's cancellation or impatience can stop the outcome from being recorded.
-// The returned channel (buffered) delivers the result once the write finishes or
-// the bound ends; a caller may stop waiting for it at any time.
+// its own goroutine, bounded by recordTimeout, so no caller's cancellation or
+// impatience can stop the outcome from being recorded. The write holds a Store
+// write permit (a pool the run watch's reads cannot exhaust) for FinishRun alone;
+// when it loses, the winner is read back under a read permit, so a slow read
+// never holds write capacity either. The returned channel (buffered) delivers
+// the result once the write finishes or the bound ends; a caller may stop
+// waiting for it at any time.
 func (p *Plane) record(runID string, res aei.Result) <-chan recorded {
 	out := make(chan recorded, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
 		defer cancel()
-		// The worker writes only these, and they are read only once bounded
-		// reports the worker finished: a write that completes after the bound
+		// Each worker writes only its own variable, read only once bounded
+		// reports that worker finished: a call that completes after the bound
 		// writes to storage nothing reads.
-		var (
-			st  RunState
-			won bool
-		)
-		if err := p.bounded(ctx, p.storeWrites, nil, runID, "run status commit", func() { st, won = p.commit(runID, res) }); err != nil {
+		var wrote bool
+		if err := p.bounded(ctx, p.storeWrites, nil, runID, "run status commit", func() { wrote = p.finish(runID, res) }); err != nil {
 			p.log.Warn("run outcome not yet recorded in the store", "run_id", runID, "error", err.Error())
 			out <- recorded{}
 			return
 		}
-		out <- recorded{st: st, won: won, ok: true}
+		if wrote {
+			out <- recorded{st: stateOf(res), won: true, ok: true}
+			return
+		}
+		var (
+			winner RunState
+			found  bool
+		)
+		if p.bounded(ctx, p.storeReads, nil, runID, "run status read", func() { winner, found = p.winner(runID) }) != nil || !found {
+			out <- recorded{} // recorded by its winner; which outcome won is unknown here
+			return
+		}
+		out <- recorded{st: winner, ok: true}
 	}()
 	return out
 }
@@ -632,13 +644,21 @@ func stateOf(res aei.Result) RunState {
 
 // commit is finishRun that also reports whether this call's outcome won.
 func (p *Plane) commit(runID string, res aei.Result) (RunState, bool) {
-	st := stateOf(res)
-	if !p.store.FinishRun(runID, st) {
-		// A terminal outcome was already recorded; report that one.
-		if won, ok := p.store.Run(runID); ok && won.Phase != phaseRunning {
-			return won, false
-		}
-		return st, false
+	if p.finish(runID, res) {
+		return stateOf(res), true
+	}
+	// A terminal outcome was already recorded; report that one.
+	if won, ok := p.winner(runID); ok {
+		return won, false
+	}
+	return stateOf(res), false
+}
+
+// finish writes res as runID's terminal outcome (first writer wins) and reports
+// whether it wrote, logging a failure it recorded.
+func (p *Plane) finish(runID string, res aei.Result) bool {
+	if !p.store.FinishRun(runID, stateOf(res)) {
+		return false
 	}
 	if res.Err != nil {
 		// Otherwise only visible via GET /runs/{id} (the data-plane path keeps no
@@ -646,7 +666,13 @@ func (p *Plane) commit(runID string, res aei.Result) (RunState, bool) {
 		// its CRD is missing — reads clearly in the message here.
 		p.log.Warn("run failed", "run_id", runID, "error", res.Err.Error())
 	}
-	return st, true
+	return true
+}
+
+// winner reads back the terminal outcome recorded for runID, if any.
+func (p *Plane) winner(runID string) (RunState, bool) {
+	won, ok := p.store.Run(runID)
+	return won, ok && won.Phase != phaseRunning
 }
 
 // race dispatches spec and returns the first terminal signal: the runtime's

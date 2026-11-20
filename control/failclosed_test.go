@@ -718,3 +718,35 @@ func TestStrandedReadsDoNotBlockTerminalWrites(t *testing.T) {
 		t.Fatal("canceled run's outcome not recorded while Store reads were stranded")
 	}
 }
+
+// A write that loses to a peer's outcome reads that outcome back under a read
+// permit, not while holding its write permit: with Store reads hung but writes
+// working, runs whose peer already recorded them cannot use up the write
+// permits, and a later run's outcome — a canceled caller's too — is still
+// recorded at once.
+func TestLosingWriteReleasesWritePermitBeforeReadBack(t *testing.T) {
+	st := stallingStore{memStore: newMemStore(), release: make(chan struct{})}
+	defer close(st.release)
+	p := New(Config{Secret: []byte("k"), Store: st, Logger: quietLog, MaxConcurrentCreates: 1}) // 2 write permits
+
+	for i := range 3 { // a peer recorded these first, so this replica's writes lose
+		id := fmt.Sprintf("peer-won-%d", i)
+		st.memStore.FinishRun(id, RunState{Phase: phaseFailed, Err: "peer outcome"})
+		p.Run(context.Background(), blockUntilDone{}, aei.RunSpec{ID: id, Deadline: 50 * time.Millisecond})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	entered := make(chan struct{})
+	go func() { <-entered; cancel() }()
+	p.Run(ctx, enteringLauncher{entered}, aei.RunSpec{ID: "after-peer-wins", Deadline: time.Minute})
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		if got, ok := st.memStore.Run("after-peer-wins"); ok && got.Phase == phaseFailed { // bypass the hung read
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("outcome not recorded: losing writes held the write permits while reading back")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
