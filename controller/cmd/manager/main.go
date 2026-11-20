@@ -104,18 +104,20 @@ func main() {
 	disp := dispatch.NewHandler(plane, buildAuthenticator(clientset, log), mgr.GetClient())
 
 	// One server carries both the runtime ABI (/complete, /redeem, /vend) and the
-	// data-plane dispatch API (/dispatch, /runs/{id}).
-	go func() {
-		mux := http.NewServeMux()
-		plane.RegisterRoutes(mux)
-		disp.RegisterRoutes(mux)
-		// Per-run timing and process health for Prometheus to scrape.
-		mux.Handle("GET /metrics", runMetrics.Handler())
-		srv := &http.Server{Addr: abiAddr, Handler: mux}
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error(err, "AEI HTTP server failed")
-		}
-	}()
+	// data-plane dispatch API (/dispatch, /runs/{id}). The manager runs it, so it
+	// stops with the controllers on SIGTERM and drains in-flight requests first.
+	mux := http.NewServeMux()
+	plane.RegisterRoutes(mux)
+	disp.RegisterRoutes(mux)
+	// Per-run timing and process health for Prometheus to scrape.
+	mux.Handle("GET /metrics", runMetrics.Handler())
+	if err := mgr.Add(&httpServer{
+		name: "abi", addr: abiAddr, handler: mux,
+		timeouts: defaultServerTimeouts, log: log,
+	}); err != nil {
+		log.Error(err, "unable to add AEI HTTP server")
+		os.Exit(1)
+	}
 
 	r := &ctrlpkg.AgentRunReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Plane: plane}
 	if err := r.SetupWithManager(mgr); err != nil {

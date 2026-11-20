@@ -1,10 +1,13 @@
 package dispatch
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +16,9 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/jackfrancis/agent-execution-interface/aei"
 	"github.com/jackfrancis/agent-execution-interface/control"
@@ -292,4 +297,133 @@ func TestLauncherCacheKeepsItsDriver(t *testing.T) {
 	if again != first || driver != "test-dispatch" {
 		t.Errorf("cached launcher driver = %q (same launcher %v), want the cached test-dispatch", driver, again == first)
 	}
+}
+
+// deadlineMux serves the dispatch routes with auth and a fake client whose calls
+// pass through funcs, for the request-deadline tests.
+func deadlineMux(t *testing.T, auth Authenticator, funcs interceptor.Funcs) *http.ServeMux {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := aeiv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	app := &aeiv1.AgentApp{
+		ObjectMeta: metav1.ObjectMeta{Name: "pyfer", Namespace: "team"},
+		Spec:       aeiv1.AgentAppSpec{ProviderClassName: "standard", Dispatchers: []string{"pyfer"}},
+	}
+	class := &aeiv1.AgentProviderClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "standard"},
+		Spec:       aeiv1.AgentProviderClassSpec{Provider: "test-dispatch"},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(app, class).WithInterceptorFuncs(funcs).Build()
+	h := NewHandler(control.New(control.Config{Secret: []byte("k")}), auth, c)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	return mux
+}
+
+// dispatchWithDeadline posts a valid dispatch whose request context ends after d.
+func dispatchWithDeadline(mux *http.ServeMux, d time.Duration) *httptest.ResponseRecorder {
+	b, _ := json.Marshal(dispatchRequest{App: "pyfer", TaskRef: "item://late", TimeoutSeconds: 30})
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/aei/v1alpha1/dispatch", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer pyfer")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+// assertNothingLaunched fails if a run reached the provider.
+func assertNothingLaunched(t *testing.T) {
+	t.Helper()
+	select {
+	case <-testLauncher.dispatched:
+		t.Fatal("a run was launched after the request deadline")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// slowAuth authenticates like echoAuth but only after delay, ignoring its context.
+type slowAuth struct {
+	echoAuth
+	delay time.Duration
+}
+
+func (s slowAuth) Authenticate(ctx context.Context, bearer string) (Caller, error) {
+	time.Sleep(s.delay)
+	return s.echoAuth.Authenticate(ctx, bearer)
+}
+
+// ctxAuth is a TokenReview that honors its context: it fails with the context's
+// error once the deadline passes.
+type ctxAuth struct{}
+
+func (ctxAuth) Authenticate(ctx context.Context, _ string) (Caller, error) {
+	<-ctx.Done()
+	return Caller{}, ctx.Err()
+}
+
+// waitGet makes every Get wait out the request's deadline and fail with it, as an
+// apiserver call interrupted by the deadline does.
+var waitGet = interceptor.Funcs{Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+	<-ctx.Done()
+	return ctx.Err()
+}}
+
+// TestDispatchRefusesAfterRequestDeadline: lookups that outlast the request's
+// deadline get a retryable 503 and launch nothing, whether the lookup ignored the
+// deadline and succeeded late, or honored it and failed. Without this, a caller
+// would see a final 401 or 404 for a valid dispatch, or get a run whose 202 never
+// arrives and launch a second on retry.
+func TestDispatchRefusesAfterRequestDeadline(t *testing.T) {
+	cases := map[string]*http.ServeMux{
+		"slow lookup succeeds after the deadline": deadlineMux(t, slowAuth{echoAuth{namespace: "team"}, 100 * time.Millisecond}, interceptor.Funcs{}),
+		"authentication interrupted":              deadlineMux(t, ctxAuth{}, interceptor.Funcs{}),
+		"app lookup interrupted":                  deadlineMux(t, echoAuth{namespace: "team"}, waitGet),
+	}
+	for name, mux := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := dispatchWithDeadline(mux, 20*time.Millisecond)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("dispatch = %d %q, want 503", rec.Code, rec.Body.String())
+			}
+			assertNothingLaunched(t)
+		})
+	}
+}
+
+// TestDispatchBodyReadTimeoutIs408: authentication that uses up the listener's
+// read timeout before the body is read turns a valid dispatch into a 408, which
+// the caller can retry, not a 400 for a malformed request.
+func TestDispatchBodyReadTimeoutIs408(t *testing.T) {
+	mux := deadlineMux(t, slowAuth{echoAuth{namespace: "team"}, 300 * time.Millisecond}, interceptor.Funcs{})
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Config.ReadTimeout = 200 * time.Millisecond
+	srv.Start()
+	defer srv.Close()
+
+	body, _ := json.Marshal(dispatchRequest{App: "pyfer", TaskRef: "item://late-body", TimeoutSeconds: 30})
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Headers now; the valid body only after the read deadline has passed, while
+	// authentication is still running.
+	fmt.Fprintf(conn, "POST /aei/v1alpha1/dispatch HTTP/1.1\r\nHost: aei\r\nAuthorization: Bearer pyfer\r\n"+
+		"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n", len(body))
+	time.Sleep(250 * time.Millisecond)
+	_, _ = conn.Write(body)
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("dispatch = %d, want 408", resp.StatusCode)
+	}
+	assertNothingLaunched(t)
 }

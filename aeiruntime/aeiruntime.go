@@ -18,9 +18,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -153,6 +156,10 @@ type Runtime struct {
 	brokerURL  string
 	cred       string // the run credential; in memory only, never logged (R2)
 	http       *http.Client
+	// oneShot marks a run on a workload substrate, where the process must exit
+	// for the provider's watch to see the outcome; Complete then bounds its
+	// retries by the run deadline (oneShotReportPlan).
+	oneShot bool
 }
 
 // Load runs the one decoder (metadata-first, env-fallback), then resolves the run
@@ -183,6 +190,13 @@ func Load(ctx context.Context, getenv func(string) string, metadata map[string]s
 	if brokerURL == "" {
 		brokerURL = controlURL // B-with-default: broker collapses onto control
 	}
+	// Reject an endpoint no request can be sent to now, rather than letting
+	// Complete retry a failure that can never clear.
+	for key, u := range map[string]string{EnvControlURL: controlURL, EnvBrokerURL: brokerURL} {
+		if err := checkEndpoint(u); err != nil {
+			return nil, fmt.Errorf("aeiruntime: %s: %w", key, err)
+		}
+	}
 
 	params, err := decodeParams(get(EnvParams))
 	if err != nil {
@@ -200,7 +214,10 @@ func Load(ctx context.Context, getenv func(string) string, metadata map[string]s
 		},
 		controlURL: controlURL,
 		brokerURL:  brokerURL,
-		http:       http.DefaultClient,
+		http:       &http.Client{Timeout: requestTimeout},
+		// No message metadata means the env transport of a workload substrate
+		// (see Load's doc); the durable serve loop clears this for its runs.
+		oneShot: metadata == nil,
 	}
 
 	// Exactly one of credential/ticket is present (docs/runtime-abi.md §1.1). A
@@ -214,6 +231,11 @@ func Load(ctx context.Context, getenv func(string) string, metadata map[string]s
 			return nil, fmt.Errorf("aeiruntime: redeem ticket: %w", err)
 		}
 		rt.cred = c.Value
+	}
+	// The credential rides an Authorization header on every later call; one the
+	// client cannot send would make Complete retry a permanent failure.
+	if err := checkHeaderValue(rt.cred); err != nil {
+		return nil, fmt.Errorf("aeiruntime: run credential: %w", err)
 	}
 	return rt, nil
 }
@@ -252,14 +274,148 @@ type completeRequest struct {
 
 // Complete reports the terminal outcome at {control}/complete. runErr nil is
 // success; resultRef is an optional opaque pointer the platform stores but never
-// parses. Safe to call once — the platform dedupes it against the substrate watch
-// and the deadline backstop (rule R4).
+// parses. The platform records the first outcome for a run and ignores the rest
+// (rule R4), so Complete retries a failed delivery until ctx ends: on a substrate
+// with no watch (a durable actor) this call is the only success signal, and one
+// dropped request would otherwise turn a finished run into a timeout. Network
+// errors and 408/429/5xx responses are retried with jittered exponential backoff;
+// any other 4xx (an expired or foreign credential) is final, and so is a request
+// that cannot be built (an unencodable Timing such as NaN). Bound the total time
+// with ctx. On a workload substrate Complete also stops in time for the process to
+// exit before the run deadline (oneShotReportPlan), whether the SDK or the app
+// calls it.
 func (r *Runtime) Complete(ctx context.Context, runErr error, t Timing, resultRef string) error {
-	body := completeRequest{RunID: r.spec.RunID, ResultRef: resultRef, Timing: t}
+	req := completeRequest{RunID: r.spec.RunID, ResultRef: resultRef, Timing: t}
 	if runErr != nil {
-		body.Error = runErr.Error()
+		req.Error = runErr.Error()
 	}
-	return r.post(ctx, r.controlURL+"/complete", r.cred, body, nil)
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("aeiruntime: encode completion: %w", err)
+	}
+	retry := true
+	if r.oneShot {
+		budget, ok := oneShotReportPlan(r.spec.Deadline, time.Now())
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+		retry = ok
+	}
+	backoff := completeBackoffMin
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, completeAttemptTimeout)
+		err := r.send(attemptCtx, r.controlURL+"/complete", r.cred, body, nil)
+		cancel()
+		if err == nil || !retry || !retryable(err) {
+			return err
+		}
+		// Full jitter in [backoff/2, backoff) keeps many runtimes finishing at once
+		// (a controller restart) from retrying in lockstep.
+		wait := backoff/2 + rand.N(backoff/2)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w (gave up: %w)", err, context.Cause(ctx))
+		case <-time.After(wait):
+		}
+		backoff = min(2*backoff, completeBackoffMax)
+	}
+}
+
+// Completion delivery bounds. Each attempt gets completeAttemptTimeout so a hung
+// controller connection cannot consume the caller's whole budget; between attempts
+// the delay doubles from completeBackoffMin to completeBackoffMax.
+const (
+	completeAttemptTimeout = 10 * time.Second
+	completeBackoffMin     = 200 * time.Millisecond
+	completeBackoffMax     = 5 * time.Second
+	// requestTimeout caps any single runtime ABI request (redeem, vend, complete).
+	requestTimeout = 30 * time.Second
+	// completionBudget is how long a durable actor keeps retrying a run's
+	// completion report. Nothing else can report the run's success there, and the
+	// actor keeps serving other tasks while it retries.
+	completionBudget = 2 * time.Minute
+	// A one-shot workload must exit for its provider's watch to see the outcome,
+	// so it retries for at most oneShotCompletionBudget, and stops
+	// oneShotExitMargin before the run deadline: time for the process to exit, the
+	// pod status to update, and the provider's watch (a 2s poll) to observe it
+	// before the controller's own deadline. When less than oneShotFinalAttempt of
+	// retry window is left (or none), it makes one attempt of oneShotFinalAttempt
+	// and no retries, so a healthy controller always has time to answer.
+	oneShotCompletionBudget = 30 * time.Second
+	oneShotExitMargin       = 10 * time.Second
+	oneShotFinalAttempt     = 500 * time.Millisecond
+)
+
+// oneShotReportPlan is how long a one-shot workload that finishes reporting at
+// now may spend on it, and whether it may retry. AEI_DEADLINE is the controller's
+// own cutoff (RunSpec.DeadlineAt, stamped when the plane starts the run's timer),
+// so the exit margin is measured against the deadline the controller enforces.
+func oneShotReportPlan(deadline, now time.Time) (budget time.Duration, retry bool) {
+	if deadline.IsZero() {
+		return oneShotCompletionBudget, true
+	}
+	if left := deadline.Sub(now) - oneShotExitMargin; left >= oneShotFinalAttempt {
+		return min(oneShotCompletionBudget, left), true
+	}
+	return oneShotFinalAttempt, false
+}
+
+// checkEndpoint reports whether raw is an absolute http(s) URL with a host and,
+// if it names one, a valid port. The HTTP client refuses anything else before
+// sending, and Complete must not retry a failure that can never clear.
+func checkEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return fmt.Errorf("want an http:// or https:// URL with a host, got %q", raw)
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid port %q in %q", p, raw)
+		}
+	}
+	return nil
+}
+
+// checkHeaderValue reports whether v can be sent as an HTTP header value: no
+// control characters other than tab (net/http rejects them before sending). A
+// credential read from a file with a trailing newline is the usual offender.
+func checkHeaderValue(v string) error {
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; (c < 0x20 && c != '\t') || c == 0x7f {
+			return fmt.Errorf("contains control character %#02x at byte %d", c, i)
+		}
+	}
+	return nil
+}
+
+// statusError is a non-2xx response from the control plane or broker.
+type statusError struct {
+	url  string
+	code int
+}
+
+func (e *statusError) Error() string { return fmt.Sprintf("POST %s: status %d", e.url, e.code) }
+
+// transportError is a request that was sent, or attempted, but got no response:
+// refused, reset, or timed out.
+type transportError struct{ err error }
+
+func (e *transportError) Error() string { return e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
+
+// retryable reports whether a failed completion attempt may succeed if repeated:
+// a transport failure or a 408/429/5xx response. Anything else, such as a request
+// that could not be built, fails the same way every time.
+func retryable(err error) bool {
+	var se *statusError
+	if errors.As(err, &se) {
+		return se.code == http.StatusRequestTimeout || se.code == http.StatusTooManyRequests || se.code >= 500
+	}
+	var te *transportError
+	return errors.As(err, &te)
 }
 
 // redeem exchanges a single-use ticket for the run credential at {broker}/redeem.
@@ -283,7 +439,13 @@ func (r *Runtime) post(ctx context.Context, url, bearer string, in, out any) err
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	return r.send(ctx, url, bearer, b, out)
+}
+
+// send posts an encoded JSON body. A failure to get any response is a
+// *transportError and a non-2xx response a *statusError.
+func (r *Runtime) send(ctx context.Context, url, bearer string, body []byte, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -293,12 +455,12 @@ func (r *Runtime) post(ctx context.Context, url, bearer string, in, out any) err
 	}
 	resp, err := r.http.Do(req)
 	if err != nil {
-		return err
+		return &transportError{err: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return fmt.Errorf("POST %s: status %d", url, resp.StatusCode)
+		return &statusError{url: url, code: resp.StatusCode}
 	}
 	if out == nil {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
@@ -334,17 +496,28 @@ func Main(getenv func(string) string, metadata map[string]string, fn func(contex
 	}
 
 	// Workload substrate: one shot.
+	if code := runOneShot(getenv, metadata, fn); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// runOneShot is Main on a workload substrate: Load, run fn under the deadline,
+// report completion, and return the process exit code. Complete bounds the
+// report by oneShotReportPlan, so a callback outage cannot keep the process alive
+// past the point where the provider's watch can still observe a successful exit.
+func runOneShot(getenv func(string) string, metadata map[string]string, fn func(context.Context, *Runtime) error) int {
 	rt, err := Load(context.Background(), getenv, metadata)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "aeiruntime:", err)
-		os.Exit(2)
+		return 2
 	}
 	timing, runErr := runTask(context.Background(), rt, fn)
-	reportCompletion(rt, runErr, timing)
+	reportCompletion(rt, runErr, timing, oneShotCompletionBudget)
 	if runErr != nil {
 		fmt.Fprintln(os.Stderr, "aeiruntime: run failed:", runErr)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // runTask runs fn once under the run's deadline (AEI_DEADLINE) and returns the
@@ -372,10 +545,11 @@ func runTask(ctx context.Context, rt *Runtime, fn func(context.Context, *Runtime
 }
 
 // reportCompletion posts the terminal outcome on a fresh context so it still lands
-// after a deadline cancel (rule R4). A completion error is logged, not fatal: the
-// platform dedupes terminal state against its substrate watch and deadline backstop.
-func reportCompletion(rt *Runtime, runErr error, t Timing) {
-	reportCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// after a deadline cancel (rule R4), retrying for up to budget. A final failure is
+// logged, not fatal: on a workload substrate the provider's watch still reports
+// the outcome, and on a durable one the deadline backstop ends the run.
+func reportCompletion(rt *Runtime, runErr error, t Timing, budget time.Duration) {
+	reportCtx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	if cerr := rt.Complete(reportCtx, runErr, t, ""); cerr != nil {
 		fmt.Fprintln(os.Stderr, "aeiruntime: completion report failed:", cerr)

@@ -16,7 +16,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -105,7 +107,18 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req dispatchRequest
-	if json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req) != nil || req.App == "" {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		// The listener's read timeout runs from the start of the request, so a slow
+		// authentication can leave too little of it for the body. That is a
+		// retryable 408, not a malformed request.
+		if isReadTimeout(err) {
+			http.Error(w, "request body timed out", http.StatusRequestTimeout)
+			return
+		}
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.App == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -113,6 +126,9 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	// The app registration lives in the caller's own namespace.
 	var app aeiv1.AgentApp
 	if err := h.client.Get(r.Context(), types.NamespacedName{Namespace: caller.Namespace, Name: req.App}, &app); err != nil {
+		if timedOut(w, r) {
+			return
+		}
 		http.Error(w, "unknown app", http.StatusNotFound)
 		return
 	}
@@ -130,6 +146,9 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 
 	class, err := h.resolveClass(r.Context(), app.Spec.ProviderClassName)
 	if err != nil {
+		if timedOut(w, r) {
+			return
+		}
 		http.Error(w, "provider class unavailable", http.StatusBadGateway)
 		return
 	}
@@ -162,6 +181,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		},
 		Deadline: control.DeadlineFromSeconds(req.TimeoutSeconds),
 	}
+	// The 202 and its run id must reach the caller, or the caller's retry launches
+	// a second run. If the lookups above used up the request's deadline (the
+	// listener sets one shorter than its write timeout), refuse before launching.
+	if timedOut(w, r) {
+		return
+	}
 	runID, err := h.plane.Submit(r.Context(), launcher, spec, control.WithProvider(driver))
 	if err != nil {
 		http.Error(w, "dispatch failed", http.StatusInternalServerError)
@@ -184,8 +209,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	}
 	// Authorize: only a dispatcher of the owning app may read its runs.
 	var app aeiv1.AgentApp
-	if err := h.client.Get(r.Context(), types.NamespacedName{Namespace: o.Namespace, Name: o.App}, &app); err != nil ||
-		caller.Namespace != o.Namespace || !contains(app.Spec.Dispatchers, caller.ServiceAccount) {
+	err := h.client.Get(r.Context(), types.NamespacedName{Namespace: o.Namespace, Name: o.App}, &app)
+	if err != nil && timedOut(w, r) {
+		return
+	}
+	if err != nil || caller.Namespace != o.Namespace || !contains(app.Spec.Dispatchers, caller.ServiceAccount) {
 		http.Error(w, "caller not authorized for run", http.StatusForbidden)
 		return
 	}
@@ -216,10 +244,32 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (Caller, 
 	}
 	caller, err := h.auth.Authenticate(r.Context(), bearer)
 	if err != nil {
+		if timedOut(w, r) {
+			return Caller{}, false
+		}
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return Caller{}, false
 	}
 	return caller, true
+}
+
+// isReadTimeout reports whether err is the connection's read deadline expiring.
+func isReadTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
+}
+
+// timedOut answers 503 when the request's deadline has passed. The listener sets
+// that deadline shorter than its write timeout, so a lookup it cuts short is
+// reported as retryable, not as the lookup's own verdict (401, 403, 404), and a
+// dispatch stops before launching a run whose response could not be delivered.
+// Nothing has changed when it answers, so the caller can safely retry.
+func timedOut(w http.ResponseWriter, r *http.Request) bool {
+	if r.Context().Err() == nil {
+		return false
+	}
+	http.Error(w, "request deadline exceeded; nothing was started, retry", http.StatusServiceUnavailable)
+	return true
 }
 
 // launcherForClass builds (and caches) the launcher bound to a resolved provider
