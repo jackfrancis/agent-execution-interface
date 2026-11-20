@@ -14,53 +14,41 @@ import (
 	"github.com/jackfrancis/agent-execution-interface/controller/internal/dispatch"
 )
 
-// dispatchOnABIListener keeps the dispatch API on the ABI listener too, where apps
-// called it before it had a listener of its own. It is transitional: once apps
-// call the dispatch listener, it goes, and a NetworkPolicy can then keep runtime
-// pods away from dispatch.
-const dispatchOnABIListener = true
-
 // defaultDispatchPort is the dispatch listener's port when -dispatch-addr is not set.
 const defaultDispatchPort = "8081"
 
-// resolveDispatchAddr picks the dispatch listener's address and reports whether it
-// gets a listener of its own. An explicit -dispatch-addr is used as given, and must
-// differ from -abi-addr. Without one, dispatch listens on the ABI listener's host
-// at defaultDispatchPort, so an installation that binds the ABI to one interface
-// (say loopback) does not start serving dispatch on every interface after an
-// upgrade. An installation whose ABI already uses that port keeps dispatch on the
-// ABI listener alone, as before, rather than failing to bind it twice.
-func resolveDispatchAddr(abiAddr, dispatchAddr string) (addr string, separate bool, err error) {
+// resolveDispatchAddr picks the dispatch listener's address. An explicit
+// -dispatch-addr is used as given, and must differ from -abi-addr. Without one,
+// dispatch listens on the ABI listener's host at defaultDispatchPort, so an
+// installation that binds the ABI to one interface (say loopback) keeps dispatch
+// on that interface. An ABI already on that port needs -dispatch-addr: dispatch is
+// never served on the ABI listener, which runtime pods can reach.
+func resolveDispatchAddr(abiAddr, dispatchAddr string) (string, error) {
 	if dispatchAddr != "" {
 		if dispatchAddr == abiAddr {
-			return "", false, fmt.Errorf("-dispatch-addr %q must differ from -abi-addr", dispatchAddr)
+			return "", fmt.Errorf("-dispatch-addr %q must differ from -abi-addr", dispatchAddr)
 		}
-		return dispatchAddr, true, nil
+		return dispatchAddr, nil
 	}
 	host, port, err := net.SplitHostPort(abiAddr)
 	if err != nil {
-		return "", false, fmt.Errorf("-abi-addr %q: %w", abiAddr, err)
+		return "", fmt.Errorf("-abi-addr %q: %w", abiAddr, err)
 	}
 	if port == defaultDispatchPort {
-		if !dispatchOnABIListener {
-			return "", false, fmt.Errorf("-abi-addr %q uses the default dispatch port; set -dispatch-addr", abiAddr)
-		}
-		return abiAddr, false, nil
+		return "", fmt.Errorf("-abi-addr %q uses the default dispatch port %s; set -dispatch-addr to another address", abiAddr, defaultDispatchPort)
 	}
-	return net.JoinHostPort(host, defaultDispatchPort), true, nil
+	return net.JoinHostPort(host, defaultDispatchPort), nil
 }
 
 // newMuxes builds the handlers for the two listeners. The ABI listener carries the
 // routes runtime pods call (/complete, /redeem, /vend, /authority) and /metrics for
 // Prometheus; the dispatch listener carries only /dispatch and /runs/{id}, which
-// apps call. withDispatch also mounts the dispatch routes on the ABI listener.
-func newMuxes(plane *control.Plane, disp *dispatch.Handler, metrics http.Handler, withDispatch bool) (abi, dispatchMux *http.ServeMux) {
+// apps call. Neither serves the other's routes, so a NetworkPolicy on the dispatch
+// port keeps runtime pods away from dispatch.
+func newMuxes(plane *control.Plane, disp *dispatch.Handler, metrics http.Handler) (abi, dispatchMux *http.ServeMux) {
 	abi = http.NewServeMux()
 	plane.RegisterRoutes(abi)
 	abi.Handle("GET /metrics", metrics)
-	if withDispatch {
-		disp.RegisterRoutes(abi)
-	}
 	dispatchMux = http.NewServeMux()
 	disp.RegisterRoutes(dispatchMux)
 	return abi, dispatchMux

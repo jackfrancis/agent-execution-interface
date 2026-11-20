@@ -37,14 +37,13 @@ spec:
           image: localhost/aei-manager:dev
           imagePullPolicy: IfNotPresent
           # Dispatch callers present a ServiceAccount token projected for the
-          # -dispatch-audience (default aei-dispatch). -accept-legacy-dispatch-tokens
-          # (default true for now) also admits a default ServiceAccount token while
-          # apps switch over.
+          # -dispatch-audience (default aei-dispatch); no other token can dispatch.
           #
           # Dispatch listens on -dispatch-addr, which is left unset on purpose: it
           # then takes the -abi-addr host on port 8081, so an overlay that rebinds
           # the ABI (to loopback, say) moves dispatch with it rather than leaving it
-          # on every interface. Set it only to put dispatch somewhere else.
+          # on every interface. Set it only to put dispatch somewhere else, and keep
+          # networkpolicy.yaml's ports in step with these.
           args: ["-abi-addr=:8080"]
           ports:
             - name: http

@@ -82,28 +82,34 @@ which the controller serves on its own port (8081), apart from the runtime ABI o
 
 The bearer is a ServiceAccount token minted for the dispatch audience,
 `aei-dispatch`. Project one into the app's pod and point the SDK at it with
-`AEI_DISPATCH_TOKEN_PATH` (or `token_path=` / `aeiapp.WithTokenPath`); without
-it the SDKs send the pod's default ServiceAccount token.
+`AEI_DISPATCH_TOKEN_PATH` (or `token_path=` / `aeiapp.WithTokenPath`). Without
+it the SDKs send the pod's default ServiceAccount token, which dispatch refuses.
+Label the pod `agents.x-k8s.io/dispatch-client: "true"` as well: AEI's
+NetworkPolicy admits only pods with that label to the dispatch port.
 
 ```yaml
-# in the app's Deployment pod spec
-containers:
-  - name: app
-    env:
-      - name: AEI_DISPATCH_TOKEN_PATH
-        value: /var/run/secrets/aei/token
-    volumeMounts:
-      - name: aei-dispatch-token
-        mountPath: /var/run/secrets/aei
-        readOnly: true
-volumes:
-  - name: aei-dispatch-token
-    projected:
-      sources:
-        - serviceAccountToken:
-            path: token
-            audience: aei-dispatch
-            expirationSeconds: 3600
+# in the app's Deployment pod template
+metadata:
+  labels:
+    agents.x-k8s.io/dispatch-client: "true"
+spec:
+  containers:
+    - name: app
+      env:
+        - name: AEI_DISPATCH_TOKEN_PATH
+          value: /var/run/secrets/aei/token
+      volumeMounts:
+        - name: aei-dispatch-token
+          mountPath: /var/run/secrets/aei
+          readOnly: true
+  volumes:
+    - name: aei-dispatch-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: aei-dispatch
+              expirationSeconds: 3600
 ```
 
 The kubelet rotates the token in place, and the SDKs re-read it on every request.

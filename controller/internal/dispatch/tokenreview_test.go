@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr/funcr"
 	authnv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
@@ -82,17 +81,11 @@ func (f *fakeAPIServer) clientset() *k8sfake.Clientset {
 	return cs
 }
 
-func (f *fakeAPIServer) reviewCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.reviews)
-}
-
 // TestTokenReviewRequestsDispatchAudience: the first review always names the
 // dispatch audience, so the apiserver checks the token against it.
 func TestTokenReviewRequestsDispatchAudience(t *testing.T) {
 	f := newFakeAPIServer()
-	auth := NewTokenReviewer(f.clientset(), TokenReviewOptions{})
+	auth := NewTokenReviewer(f.clientset(), "")
 	if _, err := auth.Authenticate(context.Background(), "dispatch-token"); err != nil {
 		t.Fatalf("dispatch-audience token: %v", err)
 	}
@@ -101,33 +94,24 @@ func TestTokenReviewRequestsDispatchAudience(t *testing.T) {
 	}
 }
 
-// TestTokenReviewAudiences covers each kind of token against both modes: while
-// legacy tokens are accepted (step 1 of the switch) and once the dispatch audience
-// is required.
+// TestTokenReviewAudiences covers each kind of token: only one minted for the
+// dispatch audience and naming a ServiceAccount authenticates, in one review. A
+// pod's default token (the apiserver's audience) is not retried another way.
 func TestTokenReviewAudiences(t *testing.T) {
 	cases := []struct {
-		token        string
-		acceptLegacy bool
-		wantOK       bool
-		wantReviews  int
+		token  string
+		wantOK bool
 	}{
-		{"dispatch-token", true, true, 1},
-		{"dispatch-token", false, true, 1},
-		{"legacy-token", true, true, 2},
-		{"legacy-token", false, false, 1},
-		{"other-token", true, false, 2},
-		{"other-token", false, false, 1},
-		{"unknown-token", true, false, 2},
-		{"user-token", false, false, 1}, // authenticated, but not a ServiceAccount
+		{"dispatch-token", true},
+		{"legacy-token", false},
+		{"other-token", false},
+		{"unknown-token", false},
+		{"user-token", false}, // authenticated, but not a ServiceAccount
 	}
 	for _, tc := range cases {
-		mode := "require"
-		if tc.acceptLegacy {
-			mode = "accept-legacy"
-		}
-		t.Run(tc.token+"/"+mode, func(t *testing.T) {
+		t.Run(tc.token, func(t *testing.T) {
 			f := newFakeAPIServer()
-			auth := NewTokenReviewer(f.clientset(), TokenReviewOptions{AcceptLegacy: tc.acceptLegacy})
+			auth := NewTokenReviewer(f.clientset(), "")
 			c, err := auth.Authenticate(context.Background(), tc.token)
 			if tc.wantOK != (err == nil) {
 				t.Fatalf("Authenticate(%s) err = %v, want ok=%v", tc.token, err, tc.wantOK)
@@ -135,8 +119,8 @@ func TestTokenReviewAudiences(t *testing.T) {
 			if tc.wantOK && c != (Caller{Namespace: "team", ServiceAccount: "pyfer"}) {
 				t.Errorf("caller = %+v", c)
 			}
-			if n := f.reviewCount(); n != tc.wantReviews {
-				t.Errorf("TokenReviews = %d, want %d", n, tc.wantReviews)
+			if got := f.reviews; len(got) != 1 || !slices.Equal(got[0], []string{DefaultAudience}) {
+				t.Errorf("reviews = %v, want one for [%s]", got, DefaultAudience)
 			}
 		})
 	}
@@ -153,7 +137,7 @@ func TestTokenReviewChecksStatusAudiences(t *testing.T) {
 			User: authnv1.UserInfo{Username: "system:serviceaccount:team:pyfer"}}
 		return true, tr, nil
 	})
-	auth := NewTokenReviewer(cs, TokenReviewOptions{})
+	auth := NewTokenReviewer(cs, "")
 	if _, err := auth.Authenticate(context.Background(), "any"); err == nil {
 		t.Fatal("authenticated without the dispatch audience in status.audiences")
 	}
@@ -164,7 +148,7 @@ func TestTokenReviewChecksStatusAudiences(t *testing.T) {
 func TestTokenReviewCustomAudience(t *testing.T) {
 	f := newFakeAPIServer()
 	f.tokens["custom-token"] = fakeToken{[]string{"my-dispatch"}, "system:serviceaccount:team:pyfer"}
-	auth := NewTokenReviewer(f.clientset(), TokenReviewOptions{Audience: "my-dispatch"})
+	auth := NewTokenReviewer(f.clientset(), "my-dispatch")
 	if _, err := auth.Authenticate(context.Background(), "custom-token"); err != nil {
 		t.Fatalf("custom-audience token: %v", err)
 	}
@@ -173,75 +157,49 @@ func TestTokenReviewCustomAudience(t *testing.T) {
 	}
 }
 
-// TestTokenReviewErrorIsNotRetriedAsLegacy: when the apiserver call itself fails,
-// the error comes back as is (so the handler can answer 503 at its deadline)
-// rather than being retried as a legacy token.
-func TestTokenReviewErrorIsNotRetriedAsLegacy(t *testing.T) {
+// TestTokenReviewError: when the apiserver call itself fails, the error comes back
+// as is, so the handler can answer 503 at its deadline.
+func TestTokenReviewError(t *testing.T) {
 	f := newFakeAPIServer()
 	f.err = errors.New("apiserver unavailable")
-	auth := NewTokenReviewer(f.clientset(), TokenReviewOptions{AcceptLegacy: true})
-	if _, err := auth.Authenticate(context.Background(), "legacy-token"); err == nil || !strings.Contains(err.Error(), "unavailable") {
+	auth := NewTokenReviewer(f.clientset(), "")
+	if _, err := auth.Authenticate(context.Background(), "dispatch-token"); err == nil || !strings.Contains(err.Error(), "unavailable") {
 		t.Fatalf("err = %v, want the apiserver error", err)
-	}
-	if n := f.reviewCount(); n != 1 {
-		t.Errorf("TokenReviews = %d, want 1", n)
-	}
-}
-
-// TestTokenReviewLogsLegacyCallerOnce: an operator sees each ServiceAccount that
-// still dispatches without the dispatch audience, once, not once per dispatch.
-func TestTokenReviewLogsLegacyCallerOnce(t *testing.T) {
-	var mu sync.Mutex
-	var lines []string
-	log := funcr.New(func(_, args string) { mu.Lock(); lines = append(lines, args); mu.Unlock() }, funcr.Options{})
-	f := newFakeAPIServer()
-	auth := NewTokenReviewer(f.clientset(), TokenReviewOptions{AcceptLegacy: true, Log: log})
-	for range 3 {
-		if _, err := auth.Authenticate(context.Background(), "legacy-token"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := auth.Authenticate(context.Background(), "dispatch-token"); err != nil {
-		t.Fatal(err)
-	}
-	if len(lines) != 1 || !strings.Contains(lines[0], `"serviceAccount"="pyfer"`) {
-		t.Fatalf("log lines = %q, want one naming pyfer", lines)
 	}
 }
 
 // TestDispatchAudienceOverHTTP drives /dispatch with the TokenReview authenticator:
-// a dispatch-audience token dispatches, and a token for another audience is
-// refused with 401 before any run starts.
+// a dispatch-audience token dispatches, and a token for another audience, or a
+// pod's default token, is refused with 401 before any run starts.
 func TestDispatchAudienceOverHTTP(t *testing.T) {
-	for _, acceptLegacy := range []bool{true, false} {
-		f := newFakeAPIServer()
-		auth := NewTokenReviewer(f.clientset(), TokenReviewOptions{AcceptLegacy: acceptLegacy})
-		srv := newTestServerAuth(t, nil, control.Config{Secret: []byte("k")}, auth)
-		url := srv.URL + "/aei/v1alpha1/dispatch"
-		body := dispatchRequest{App: "pyfer", TaskRef: "item://hello", TimeoutSeconds: 1}
+	f := newFakeAPIServer()
+	srv := newTestServerAuth(t, nil, control.Config{Secret: []byte("k")}, NewTokenReviewer(f.clientset(), ""))
+	url := srv.URL + "/aei/v1alpha1/dispatch"
+	body := dispatchRequest{App: "pyfer", TaskRef: "item://hello", TimeoutSeconds: 1}
 
-		want := map[string]int{
-			"dispatch-token": http.StatusAccepted,
-			"other-token":    http.StatusUnauthorized,
-			"legacy-token":   http.StatusUnauthorized,
+	for _, tc := range []struct {
+		token string
+		code  int
+	}{
+		{"other-token", http.StatusUnauthorized},
+		{"legacy-token", http.StatusUnauthorized},
+		{"dispatch-token", http.StatusAccepted},
+	} {
+		resp := do(t, http.MethodPost, url, tc.token, body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != tc.code {
+			t.Fatalf("%s: status = %d, want %d", tc.token, resp.StatusCode, tc.code)
 		}
-		if acceptLegacy {
-			want["legacy-token"] = http.StatusAccepted
-		}
-		for tok, code := range want {
-			resp := do(t, http.MethodPost, url, tok, body)
-			_ = resp.Body.Close()
-			if resp.StatusCode != code {
-				t.Fatalf("acceptLegacy=%v %s: status = %d, want %d", acceptLegacy, tok, resp.StatusCode, code)
-			}
-			if code == http.StatusAccepted {
-				// The run reached the provider; drain its credential.
-				select {
-				case <-testLauncher.dispatched:
-				case <-time.After(5 * time.Second):
-					t.Fatalf("acceptLegacy=%v %s: accepted, but no run reached the provider", acceptLegacy, tok)
-				}
-			}
-		}
+	}
+	// Only the accepted dispatch reached the provider.
+	select {
+	case <-testLauncher.dispatched:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatch-token: accepted, but no run reached the provider")
+	}
+	select {
+	case <-testLauncher.dispatched:
+		t.Fatal("a refused dispatch reached the provider")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
