@@ -35,7 +35,7 @@ Kubernetes object is created; a run is an HTTP call that returns an id.
 ```python
 from aei import AeiClient, AgentRunSpec, Identity
 
-client = AeiClient(endpoint="http://aei-controller.aei-system.svc:8080", app="hello")
+client = AeiClient(endpoint="http://aei-controller.aei-system.svc:8081", app="hello")
 run_id = client.dispatch(AgentRunSpec(
     task_ref="prompt://hello",
     parameters={"prompt": "Say hello"},
@@ -61,7 +61,7 @@ import (
 )
 
 func main() {
-	c := aeiapp.New("http://aei-controller.aei-system.svc:8080", "hello")
+	c := aeiapp.New("http://aei-controller.aei-system.svc:8081", "hello")
 	runID, err := c.Dispatch(context.Background(), aeiapp.Spec{
 		TaskRef:        "prompt://hello",
 		Parameters:     map[string]string{"prompt": "Say hello"},
@@ -76,8 +76,37 @@ func main() {
 }
 ```
 
-That is the **entire** app-developer surface. Both target the same dispatch API;
-the bearer defaults to the pod's projected ServiceAccount token.
+That is the **entire** app-developer surface. Both target the same dispatch API,
+which the controller serves on its own port (8081), apart from the runtime ABI on
+8080.
+
+The bearer is a ServiceAccount token minted for the dispatch audience,
+`aei-dispatch`. Project one into the app's pod and point the SDK at it with
+`AEI_DISPATCH_TOKEN_PATH` (or `token_path=` / `aeiapp.WithTokenPath`); without
+it the SDKs send the pod's default ServiceAccount token.
+
+```yaml
+# in the app's Deployment pod spec
+containers:
+  - name: app
+    env:
+      - name: AEI_DISPATCH_TOKEN_PATH
+        value: /var/run/secrets/aei/token
+    volumeMounts:
+      - name: aei-dispatch-token
+        mountPath: /var/run/secrets/aei
+        readOnly: true
+volumes:
+  - name: aei-dispatch-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            path: token
+            audience: aei-dispatch
+            expirationSeconds: 3600
+```
+
+The kubelet rotates the token in place, and the SDKs re-read it on every request.
 
 ---
 

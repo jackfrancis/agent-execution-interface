@@ -92,6 +92,12 @@ func newTestServer(t *testing.T) *httptest.Server {
 // registered test-dispatch provider.
 func newTestServerWith(t *testing.T, launcher aei.Launcher, cfg control.Config) *httptest.Server {
 	t.Helper()
+	return newTestServerAuth(t, launcher, cfg, echoAuth{namespace: "team"})
+}
+
+// newTestServerAuth is newTestServerWith with the caller authenticator chosen.
+func newTestServerAuth(t *testing.T, launcher aei.Launcher, cfg control.Config, auth Authenticator) *httptest.Server {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := aeiv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -110,7 +116,7 @@ func newTestServerWith(t *testing.T, launcher aei.Launcher, cfg control.Config) 
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(app, class).Build()
 	plane := control.New(cfg)
-	h := NewHandler(plane, echoAuth{namespace: "team"}, c)
+	h := NewHandler(plane, auth, c)
 	if launcher != nil {
 		h.launchers[class.Name] = cachedLauncher{launcher: launcher, driver: class.Spec.Provider}
 	}

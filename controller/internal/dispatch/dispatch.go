@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/go-logr/logr"
 	authnv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -41,7 +42,8 @@ type Caller struct{ Namespace, ServiceAccount string }
 
 // Authenticator validates a bearer token and returns the caller's workload
 // identity. The reference implementation (NewTokenReviewer) calls the Kubernetes
-// TokenReview API, so the dispatch endpoint trusts no shared secret.
+// TokenReview API for the dispatch audience, so the dispatch endpoint trusts no
+// shared secret and no token minted for another service.
 type Authenticator interface {
 	Authenticate(ctx context.Context, bearer string) (Caller, error)
 }
@@ -337,21 +339,83 @@ func (h *Handler) ownerOf(runID string) (owner, bool) {
 
 // --- TokenReview authenticator (the no-shared-secret caller identity) ---
 
-type tokenReviewer struct{ client kubernetes.Interface }
+// DefaultAudience is the token audience the dispatch API requires. An app projects
+// a ServiceAccount token for it, so a token minted for another service (or the
+// pod's default token, which the apiserver accepts) cannot dispatch.
+const DefaultAudience = "aei-dispatch"
+
+// TokenReviewOptions configures NewTokenReviewer.
+type TokenReviewOptions struct {
+	// Audience is the audience every TokenReview requests; the token must carry it.
+	// Empty means DefaultAudience.
+	Audience string
+	// AcceptLegacy also admits a token valid for the apiserver's own audiences (the
+	// pod's default ServiceAccount token), which is what apps sent before the
+	// dispatch audience existed. It costs a second TokenReview for such a token.
+	// It exists only while apps move to the dispatch audience.
+	AcceptLegacy bool
+	// Log, when set, records each ServiceAccount admitted by the legacy path once,
+	// so an operator can see which apps still have to switch.
+	Log logr.Logger
+}
+
+type tokenReviewer struct {
+	client       kubernetes.Interface
+	audience     string
+	acceptLegacy bool
+	log          logr.Logger
+	legacySeen   sync.Map // Caller -> struct{}
+}
 
 // NewTokenReviewer authenticates callers by submitting their token to the
-// Kubernetes TokenReview API and extracting the ServiceAccount identity.
-func NewTokenReviewer(c kubernetes.Interface) Authenticator { return &tokenReviewer{client: c} }
+// Kubernetes TokenReview API for the dispatch audience and extracting the
+// ServiceAccount identity.
+func NewTokenReviewer(c kubernetes.Interface, o TokenReviewOptions) Authenticator {
+	aud := o.Audience
+	if aud == "" {
+		aud = DefaultAudience
+	}
+	return &tokenReviewer{client: c, audience: aud, acceptLegacy: o.AcceptLegacy, log: o.Log}
+}
 
 func (t *tokenReviewer) Authenticate(ctx context.Context, token string) (Caller, error) {
-	tr, err := t.client.AuthenticationV1().TokenReviews().Create(ctx,
-		&authnv1.TokenReview{Spec: authnv1.TokenReviewSpec{Token: token}}, metav1.CreateOptions{})
+	tr, err := t.review(ctx, token, []string{t.audience})
+	if err != nil {
+		return Caller{}, err
+	}
+	// The apiserver answers with the requested audiences the token is valid for;
+	// TokenReview's contract leaves it to the client to check that list.
+	if tr.Status.Authenticated && contains(tr.Status.Audiences, t.audience) {
+		return callerOf(tr)
+	}
+	if !t.acceptLegacy {
+		return Caller{}, errors.New("dispatch: token not authenticated for audience " + t.audience)
+	}
+	// A review with no audiences checks the token against the apiserver's own,
+	// which is how dispatch authenticated before it had an audience of its own.
+	tr, err = t.review(ctx, token, nil)
 	if err != nil {
 		return Caller{}, err
 	}
 	if !tr.Status.Authenticated {
 		return Caller{}, errors.New("dispatch: token not authenticated")
 	}
+	c, err := callerOf(tr)
+	if err == nil {
+		if _, seen := t.legacySeen.LoadOrStore(c, struct{}{}); !seen && t.log.GetSink() != nil {
+			t.log.Info("dispatch caller authenticated without the dispatch audience; project a token for it",
+				"namespace", c.Namespace, "serviceAccount", c.ServiceAccount, "audience", t.audience)
+		}
+	}
+	return c, err
+}
+
+func (t *tokenReviewer) review(ctx context.Context, token string, audiences []string) (*authnv1.TokenReview, error) {
+	return t.client.AuthenticationV1().TokenReviews().Create(ctx,
+		&authnv1.TokenReview{Spec: authnv1.TokenReviewSpec{Token: token, Audiences: audiences}}, metav1.CreateOptions{})
+}
+
+func callerOf(tr *authnv1.TokenReview) (Caller, error) {
 	ns, name, ok := parseServiceAccount(tr.Status.User.Username)
 	if !ok {
 		return Caller{}, errors.New("dispatch: caller is not a service account")

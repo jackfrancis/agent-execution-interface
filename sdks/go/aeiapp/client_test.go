@@ -6,6 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,5 +79,55 @@ func TestDispatchOverloaded(t *testing.T) {
 	c := New(srv.URL, "app", WithToken("t"))
 	if _, err := c.Dispatch(context.Background(), Spec{TaskRef: "x"}); !errors.Is(err, ErrOverloaded) {
 		t.Fatalf("Dispatch err = %v, want ErrOverloaded", err)
+	}
+}
+
+// TestTokenPath: the bearer comes from WithToken, else the WithTokenPath file, else
+// the file AEI_DISPATCH_TOKEN_PATH names, else the default ServiceAccount token, and
+// the file is re-read per request so a rotated token is used.
+func TestTokenPath(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, tok string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(tok+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	optPath := write("opt", "from-option")
+	envPath := write("env", "from-env")
+
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(Result{Phase: "Running"})
+	}))
+	defer srv.Close()
+	bearer := func(c *Client) string {
+		t.Helper()
+		if _, err := c.Get(context.Background(), "r"); err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimPrefix(got, "Bearer ")
+	}
+
+	t.Setenv(TokenPathEnv, envPath)
+	if b := bearer(New(srv.URL, "a", WithTokenPath(optPath))); b != "from-option" {
+		t.Errorf("WithTokenPath: bearer = %q", b)
+	}
+	if b := bearer(New(srv.URL, "a", WithTokenPath(optPath), WithToken("explicit"))); b != "explicit" {
+		t.Errorf("WithToken over WithTokenPath: bearer = %q", b)
+	}
+	c := New(srv.URL, "a")
+	if b := bearer(c); b != "from-env" {
+		t.Errorf("%s: bearer = %q", TokenPathEnv, b)
+	}
+	write("env", "rotated")
+	if b := bearer(c); b != "rotated" {
+		t.Errorf("after rotation: bearer = %q", b)
+	}
+	t.Setenv(TokenPathEnv, "")
+	if c := New(srv.URL, "a"); c.tokenPath != DefaultTokenPath {
+		t.Errorf("default token path = %q, want %q", c.tokenPath, DefaultTokenPath)
 	}
 }

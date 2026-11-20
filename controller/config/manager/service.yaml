@@ -1,7 +1,9 @@
-# The cluster-internal endpoint that carries BOTH planes on one port:
-#   * the runtime ABI  — AEI_CONTROL_URL / AEI_BROKER_URL (/complete, /redeem, /vend)
-#   * the data plane   — AEI_DISPATCH_URL (/dispatch, /runs/{id})
-# Reachable at http://aei-controller.aei-system.svc:8080
+# The cluster-internal endpoint, one port per caller:
+#   * http (8080)     — the runtime ABI, AEI_CONTROL_URL / AEI_BROKER_URL
+#                       (/complete, /redeem, /vend, /authority), and /metrics
+#   * dispatch (8081) — the data plane, AEI_DISPATCH_URL (/dispatch, /runs/{id})
+# Separate ports let a NetworkPolicy admit runtime pods to the ABI while keeping
+# them away from dispatch. Until apps move to 8081, 8080 also serves dispatch.
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,4 +15,7 @@ spec:
   ports:
     - name: http
       port: 8080
-      targetPort: 8080
+      targetPort: http
+    - name: dispatch
+      port: 8081
+      targetPort: dispatch

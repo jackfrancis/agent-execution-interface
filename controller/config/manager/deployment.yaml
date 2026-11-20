@@ -36,10 +36,16 @@ spec:
           # registry; without the image loaded the pod ImagePullBackOffs.
           image: localhost/aei-manager:dev
           imagePullPolicy: IfNotPresent
-          args: ["-abi-addr=:8080"]
+          # Dispatch callers present a ServiceAccount token projected for the
+          # -dispatch-audience (default aei-dispatch). -accept-legacy-dispatch-tokens
+          # (default true for now) also admits a default ServiceAccount token while
+          # apps switch over.
+          args: ["-abi-addr=:8080", "-dispatch-addr=:8081"]
           ports:
             - name: http
               containerPort: 8080
+            - name: dispatch
+              containerPort: 8081
           env:
             # Reference-grade symmetric authority (HMAC). Used unless an Ed25519
             # key is provided below.

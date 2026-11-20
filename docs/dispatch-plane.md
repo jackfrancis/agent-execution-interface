@@ -150,10 +150,25 @@ cares that work landed in its store can ignore this route entirely.
 
 ## Identity: no shared secret
 
-The caller authenticates with its **projected ServiceAccount token**; the endpoint
-validates it via the Kubernetes **TokenReview** API and extracts the SA identity
-(`system:serviceaccount:<ns>:<name>`). There is no shared bearer. Authorization is
-then the `AgentApp` policy:
+The caller authenticates with a **projected ServiceAccount token** minted for the
+dispatch audience (`aei-dispatch`, set by the controller's `-dispatch-audience`).
+The endpoint validates it via the Kubernetes **TokenReview** API, requesting that
+audience and checking that the review reports it, and extracts the SA identity
+(`system:serviceaccount:<ns>:<name>`). A token minted for any other service is
+refused. There is no shared bearer.
+
+While apps move to the dispatch audience, the controller also accepts a caller's
+default ServiceAccount token (`-accept-legacy-dispatch-tokens`, on by default for
+now). Such a token costs a second TokenReview, and the controller logs each
+ServiceAccount that still sends one, once. Both SDKs read the token from
+`AEI_DISPATCH_TOKEN_PATH` when it is set.
+
+The dispatch API has its own listener (`-dispatch-addr`, port 8081), separate from
+the runtime ABI and `/metrics` on 8080, because a NetworkPolicy matches ports, not
+paths. For now the 8080 listener also serves the dispatch routes, where apps
+called them before.
+
+Authorization is then the `AgentApp` policy:
 
 1. the caller SA MUST be in `spec.dispatchers`;
 2. the requested `scopes` MUST be a subset of `spec.identity.maxScopes` (least

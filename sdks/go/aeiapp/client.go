@@ -19,8 +19,14 @@ import (
 )
 
 const (
-	base    = "/aei/v1alpha1"
-	saToken = "/var/run/secrets/kubernetes.io/serviceaccount/token" // #nosec G101 -- path, not a secret
+	base = "/aei/v1alpha1"
+	// DefaultTokenPath is the pod's default ServiceAccount token, used when no
+	// token path is configured.
+	DefaultTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token" // #nosec G101 -- path, not a secret
+	// TokenPathEnv names the environment variable that points the client at a
+	// projected ServiceAccount token, such as one minted for the dispatch API's
+	// audience ("aei-dispatch").
+	TokenPathEnv = "AEI_DISPATCH_TOKEN_PATH" // #nosec G101 -- variable name, not a secret
 )
 
 // ErrOverloaded is returned (wrapped) by Dispatch when AEI refuses the run because
@@ -71,27 +77,40 @@ func (r Result) Done() bool { return r.Phase == "Succeeded" || r.Phase == "Faile
 
 // Client dispatches runs for one app to the AEI dispatch API.
 type Client struct {
-	endpoint string
-	app      string
-	token    string
-	http     *http.Client
+	endpoint  string
+	app       string
+	token     string
+	tokenPath string
+	http      *http.Client
 }
 
 // Option configures a Client.
 type Option func(*Client)
 
-// WithToken sets the bearer explicitly (default: the pod's projected ServiceAccount token).
+// WithToken sets the bearer explicitly. It takes precedence over any token path.
 func WithToken(t string) Option { return func(c *Client) { c.token = t } }
+
+// WithTokenPath reads the bearer from the file at path, such as a ServiceAccount
+// token projected for the dispatch API's audience. The client re-reads the file on
+// every request, so a token the kubelet rotates is picked up. Without it the path
+// comes from AEI_DISPATCH_TOKEN_PATH, else DefaultTokenPath.
+func WithTokenPath(path string) Option { return func(c *Client) { c.tokenPath = path } }
 
 // WithHTTPClient injects an HTTP client (tests, custom transport/TLS).
 func WithHTTPClient(hc *http.Client) Option { return func(c *Client) { c.http = hc } }
 
 // New builds a Client for app at the dispatch endpoint, e.g.
-// "http://aei-controller.aei-system.svc:8080".
+// "http://aei-controller.aei-system.svc:8081".
 func New(endpoint, app string, opts ...Option) *Client {
 	c := &Client{endpoint: strings.TrimRight(endpoint, "/"), app: app, http: http.DefaultClient}
 	for _, o := range opts {
 		o(c)
+	}
+	if c.tokenPath == "" {
+		c.tokenPath = strings.TrimSpace(os.Getenv(TokenPathEnv))
+	}
+	if c.tokenPath == "" {
+		c.tokenPath = DefaultTokenPath
 	}
 	return c
 }
@@ -180,7 +199,7 @@ func (c *Client) bearer() string {
 	if c.token != "" {
 		return c.token
 	}
-	if b, err := os.ReadFile(saToken); err == nil {
+	if b, err := os.ReadFile(c.tokenPath); err == nil {
 		return strings.TrimSpace(string(b))
 	}
 	return ""

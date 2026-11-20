@@ -19,18 +19,34 @@ import time
 from .models import AgentRunSpec, Result
 
 _BASE = "/aei/v1alpha1"
-_SA_TOKEN = "/var/run/secrets/kubernetes.io/serviceaccount/token"  # nosec B105: path, not a secret
+DEFAULT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"  # nosec B105: path, not a secret
+# Names the file holding a projected ServiceAccount token, such as one minted for
+# the dispatch API's audience ("aei-dispatch").
+TOKEN_PATH_ENV = "AEI_DISPATCH_TOKEN_PATH"  # nosec B105: variable name, not a secret
 
 
 class AeiClient:
     """Submits runs to the AEI dispatch API and reads their status. Requires the
     endpoint URL and the app's ``AgentApp`` name; both default from the environment
-    (``AEI_DISPATCH_URL`` / ``AEI_APP``) so an in-cluster app needs no wiring."""
+    (``AEI_DISPATCH_URL`` / ``AEI_APP``) so an in-cluster app needs no wiring.
 
-    def __init__(self, endpoint: str | None = None, app: str | None = None, *, token: str | None = None, session=None):
+    The bearer is ``token`` when given; otherwise it is read, on every request so a
+    rotated token is picked up, from ``token_path``, else the file
+    ``AEI_DISPATCH_TOKEN_PATH`` names, else the pod's default ServiceAccount token."""
+
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        app: str | None = None,
+        *,
+        token: str | None = None,
+        token_path: str | None = None,
+        session=None,
+    ):
         self._endpoint = (endpoint or os.environ.get("AEI_DISPATCH_URL", "")).rstrip("/")
         self._app = app or os.environ.get("AEI_APP", "")
         self._token = token
+        self._token_path = token_path or os.environ.get(TOKEN_PATH_ENV, "").strip() or DEFAULT_TOKEN_PATH
         self._session = session  # an injectable requests-like session (tests); else lazy requests
 
     def dispatch(self, spec: AgentRunSpec, *, app: str | None = None) -> str:
@@ -81,7 +97,7 @@ class AeiClient:
         if self._token:
             return self._token
         try:
-            with open(_SA_TOKEN, encoding="utf-8") as f:
+            with open(self._token_path, encoding="utf-8") as f:
                 return f.read().strip()
         except OSError:
             return ""
