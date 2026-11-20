@@ -46,6 +46,26 @@ func (c *captureLauncher) Await(ctx context.Context, _ aei.Handle) (aei.Result, 
 
 var testLauncher = &captureLauncher{dispatched: make(chan aei.Credential, 8)}
 
+// blockLauncher is an AsyncLauncher whose Dispatch blocks until gate closes, so a
+// test can hold the control plane's create slot and fill its queue. Each test
+// builds its own, so repeated runs (-count) start with the gate shut.
+type blockLauncher struct {
+	gate    chan struct{}
+	entered chan struct{}
+}
+
+func (b *blockLauncher) Launch(context.Context, aei.RunSpec, aei.Credential) (aei.Handle, error) {
+	return aei.Handle{}, nil
+}
+func (b *blockLauncher) Dispatch(_ context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	b.entered <- struct{}{}
+	<-b.gate
+	return aei.Handle{Provider: "test-block", Ref: spec.ID}, nil
+}
+func (b *blockLauncher) Await(context.Context, aei.Handle) (aei.Result, error) {
+	return aei.Result{ResultRef: "ok"}, nil
+}
+
 func init() {
 	aei.Register("test-dispatch", func(aei.Config) (aei.Launcher, error) { return testLauncher, nil })
 }
@@ -64,11 +84,13 @@ func (e echoAuth) Authenticate(_ context.Context, bearer string) (Caller, error)
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	return newTestServerWith(t, control.Config{Secret: []byte("k")})
+	return newTestServerWith(t, nil, control.Config{Secret: []byte("k")})
 }
 
-// newTestServerWith is newTestServer with a caller-supplied plane config.
-func newTestServerWith(t *testing.T, cfg control.Config) *httptest.Server {
+// newTestServerWith serves the dispatch API for app "pyfer", with the control
+// plane built from cfg. A non-nil launcher backs the app's class in place of the
+// registered test-dispatch provider.
+func newTestServerWith(t *testing.T, launcher aei.Launcher, cfg control.Config) *httptest.Server {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := aeiv1.AddToScheme(scheme); err != nil {
@@ -89,6 +111,9 @@ func newTestServerWith(t *testing.T, cfg control.Config) *httptest.Server {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(app, class).Build()
 	plane := control.New(cfg)
 	h := NewHandler(plane, echoAuth{namespace: "team"}, c)
+	if launcher != nil {
+		h.launchers[class.Name] = cachedLauncher{launcher: launcher, driver: class.Spec.Provider}
+	}
 	mux := http.NewServeMux()
 	plane.RegisterRoutes(mux)
 	h.RegisterRoutes(mux)
@@ -176,7 +201,7 @@ func TestDispatchCompleteStatus(t *testing.T) {
 // error once the default passes.
 func TestDispatchWithoutTimeoutEndsAtDefault(t *testing.T) {
 	const def = 100 * time.Millisecond
-	srv := newTestServerWith(t, control.Config{Secret: []byte("k"), DefaultDeadline: def})
+	srv := newTestServerWith(t, nil, control.Config{Secret: []byte("k"), DefaultDeadline: def})
 
 	start := time.Now()
 	resp := do(t, http.MethodPost, srv.URL+"/aei/v1alpha1/dispatch", "pyfer", map[string]any{
@@ -272,6 +297,49 @@ func TestDispatchAuthorization(t *testing.T) {
 				t.Errorf("status = %d, want %d", resp.StatusCode, tc.want)
 			}
 		})
+	}
+}
+
+// TestDispatchBurstGetsOverloaded: once the control plane's create slots and queue
+// are full, /dispatch answers 429 with Retry-After at once instead of queueing
+// without bound, and accepts work again when the queue drains.
+func TestDispatchBurstGetsOverloaded(t *testing.T) {
+	blocking := &blockLauncher{gate: make(chan struct{}), entered: make(chan struct{}, 8)}
+	srv := newTestServerWith(t, blocking, control.Config{Secret: []byte("k"), MaxConcurrentCreates: 1, MaxQueued: 2})
+	req := dispatchRequest{App: "pyfer", TaskRef: "item://1", TimeoutSeconds: 30}
+	req.Identity.Subject = "github:1"
+
+	var codes []int
+	for range 5 {
+		resp := do(t, http.MethodPost, srv.URL+"/aei/v1alpha1/dispatch", "pyfer", req)
+		codes = append(codes, resp.StatusCode)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if ra := resp.Header.Get("Retry-After"); ra == "" {
+				t.Error("429 without a Retry-After header")
+			}
+		}
+		_ = resp.Body.Close()
+	}
+	want := []int{202, 202, 202, 429, 429} // 1 creating + 2 queued, then refused
+	for i := range want {
+		if codes[i] != want[i] {
+			t.Fatalf("burst status codes = %v, want %v", codes, want)
+		}
+	}
+
+	<-blocking.entered
+	close(blocking.gate) // let the creates finish and the queue drain
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp := do(t, http.MethodPost, srv.URL+"/aei/v1alpha1/dispatch", "pyfer", req)
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusAccepted {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dispatch after drain = %d, want 202", resp.StatusCode)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
