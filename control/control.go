@@ -124,16 +124,18 @@ type RunObservation struct {
 	Timing aei.Timing
 
 	// QueueWait is how long the run waited in the plane's queue for a create slot
-	// (MaxConcurrentCreates), from admission to the slot. A run that ended while
-	// still queued (its deadline passed first) waited its whole Duration.
-	// QueueMeasured is false only when the run ended before the plane could tell.
+	// (MaxConcurrentCreates), from admission to the slot. Every submitted run is
+	// queued from admission, so QueueMeasured is always true on the Submit path; a
+	// run that ended while still queued (its deadline passed first) waited its
+	// whole Duration.
 	QueueWait     time.Duration
 	QueueMeasured bool
 	// DispatchLatency is how long an async provider's create took, from getting the
 	// create slot until Dispatch returned: minting the run credential plus the
 	// provider's Dispatch, successful or not. DispatchMeasured is false when the
-	// run never reached Dispatch or Dispatch had not returned when the run ended,
-	// and always for a plain provider, whose blocking Launch is the whole run.
+	// run never reached Dispatch or Dispatch had not returned when the run ended
+	// (the stage times are frozen when the run's outcome is decided), and always
+	// for a plain provider, whose blocking Launch is the whole run.
 	DispatchLatency  time.Duration
 	DispatchMeasured bool
 }
@@ -505,6 +507,10 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 	// The measured duration starts no later than the deadline's clock, so a run
 	// the deadline ends is never recorded as shorter than its deadline.
 	start := time.Now()
+	// The run is queued from admission, so its clock starts here, before anything
+	// (the store write, scheduling the run's goroutine) that could outlast a
+	// short deadline.
+	clock := &runClock{}
 	spec = p.applyDeadline(ownSpec(spec))
 	p.store.SetRunning(spec.ID)
 	done := p.arm(spec.ID)
@@ -524,15 +530,19 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 		// bounded only by the run deadline (the universal backstop).
 		ctx, cancel := withRunDeadline(context.Background(), spec)
 		defer cancel()
-		clock := &runClock{}
 		res, h, _ := p.race(ctx, launcher, spec, done, release, providerKey(launcher, o.class), clock)
+		// The run's times end where its outcome was decided, not after the store
+		// write below: freezing the clock here keeps a slow write from stretching
+		// the run or its queue wait, and a Dispatch that returns after the
+		// deadline won from counting as measured.
+		end, stages := time.Now(), clock.freeze()
 		if h.Provider == "" {
 			h.Provider = o.provider
 		}
 		// Commit first, then observe what the store holds: a callback that wrote
 		// before this run's own outcome is the outcome, and metrics must agree
 		// with GET /runs/{id}.
-		p.observe(spec, h, p.finishRun(spec.ID, res), start, time.Now(), clock)
+		p.observe(spec, h, p.finishRun(spec.ID, res), start, end, stages)
 	}()
 	return spec.ID, nil
 }
@@ -569,57 +579,68 @@ func WithProviderClass(name string) SubmitOption {
 // seam). It fires once per Submit — the data-plane app path — with the run's
 // taskRef, the terminal state the store recorded (whichever signal won the first
 // write, so metrics never disagree with Status), the provider from its handle, and
-// the times the controller measured: the run from admission (start) to its end,
-// and from clock, its wait in the queue and its provider create. The default
-// Observer is a no-op, so an unconfigured plane records nothing.
-func (p *Plane) observe(spec aei.RunSpec, h aei.Handle, st RunState, start, end time.Time, clock *runClock) {
+// the times the controller measured: the run from admission (start) to the moment
+// its outcome was decided (end), and the stage times frozen then: its wait in the
+// queue and its provider create. The default Observer is a no-op, so an
+// unconfigured plane records nothing.
+func (p *Plane) observe(spec aei.RunSpec, h aei.Handle, st RunState, start, end time.Time, stages runStages) {
 	o := RunObservation{
-		TaskRef:  spec.TaskRef,
-		Phase:    st.Phase,
-		Provider: h.Provider,
-		Duration: end.Sub(start),
-		Timing:   st.Timing,
+		TaskRef:       spec.TaskRef,
+		Phase:         st.Phase,
+		Provider:      h.Provider,
+		Duration:      end.Sub(start),
+		Timing:        st.Timing,
+		QueueMeasured: true, // queued from admission
 	}
-	slot, created, queued := clock.read()
-	switch {
-	case !slot.IsZero():
-		o.QueueWait, o.QueueMeasured = slot.Sub(start), true
-	case queued:
-		o.QueueWait, o.QueueMeasured = o.Duration, true // ended while still queued
-	}
-	if !slot.IsZero() && !created.IsZero() {
-		o.DispatchLatency, o.DispatchMeasured = created.Sub(slot), true
+	if stages.slot.IsZero() {
+		o.QueueWait = o.Duration // ended while still queued
+	} else {
+		o.QueueWait = stages.slot.Sub(start)
+		if !stages.created.IsZero() {
+			o.DispatchLatency, o.DispatchMeasured = stages.created.Sub(stages.slot), true
+		}
 	}
 	p.obs.ObserveRun(o)
 }
 
-// runClock records when a run left the plane's queue and when its async provider
-// create returned. race writes it from its provider goroutine, possibly after race
-// has returned (a Dispatch that outlives the run), so it is guarded; a nil clock
-// records nothing (Run, which reports no metrics).
+// runClock records when a submitted run left the plane's queue and when its async
+// provider create returned. race writes it from its provider goroutine, possibly
+// after race has returned (a Dispatch that outlives the run), so it is guarded,
+// and freeze stops it once the run's outcome is decided. A nil clock records
+// nothing (Run, which reports no metrics).
 type runClock struct {
-	mu      sync.Mutex
-	slot    time.Time // the create slot was acquired
-	created time.Time // an async Dispatch returned
-	queued  bool      // the run reached the queue (waited for a create slot)
+	mu     sync.Mutex
+	frozen bool
+	runStages
 }
 
-func (c *runClock) set(f func(*runClock)) {
+// runStages are the stage times a runClock holds.
+type runStages struct {
+	slot    time.Time // the create slot was acquired
+	created time.Time // an async Dispatch returned
+}
+
+// set applies f unless the clock is nil or frozen.
+func (c *runClock) set(f func(*runStages)) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
-	f(c)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	if !c.frozen {
+		f(&c.runStages)
+	}
 }
 
-func (c *runClock) read() (slot, created time.Time, queued bool) {
+// freeze stops further writes and returns the stage times recorded so far.
+func (c *runClock) freeze() runStages {
 	if c == nil {
-		return time.Time{}, time.Time{}, false
+		return runStages{}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.slot, c.created, c.queued
+	c.frozen = true
+	return c.runStages
 }
 
 // Status returns the current state of a submitted run, and whether it is known.
@@ -799,11 +820,10 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 		}()
 		// Wait for a create slot. A run still queued when its deadline passes was
 		// never handed to the provider.
-		clock.set(func(c *runClock) { c.queued = true })
 		select {
 		case p.creates <- struct{}{}:
 			now := time.Now()
-			clock.set(func(c *runClock) { c.slot = now })
+			clock.set(func(c *runStages) { c.slot = now })
 		case <-ctx.Done():
 			created()
 			err := fmt.Errorf("control: no dispatch slot before the deadline: %w", context.Cause(ctx))
@@ -874,7 +894,7 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 			stopLease := context.AfterFunc(createCtx, endCreate)
 			h, err := p.guardCreate(spec.ID, "Dispatch", func() (aei.Handle, error) { return async.Dispatch(createCtx, spec, cred) })
 			now := time.Now()
-			clock.set(func(c *runClock) { c.created = now })
+			clock.set(func(c *runStages) { c.created = now })
 			stopLease()
 			givePermit()
 			setHandle(h)

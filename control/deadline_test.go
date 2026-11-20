@@ -295,7 +295,7 @@ func TestCallbackBeforeCommitIsWhatObserversSee(t *testing.T) {
 	p := New(Config{Secret: []byte("k"), Observer: obs})
 	p.store.SetRunning("r")
 	p.store.FinishRun("r", RunState{Phase: phaseSucceeded, ResultRef: "cb"})
-	p.observe(aei.RunSpec{TaskRef: "t"}, aei.Handle{}, p.finishRun("r", aei.Result{Err: ErrDeadlineExceeded}), time.Time{}, time.Time{}, nil)
+	p.observe(aei.RunSpec{TaskRef: "t"}, aei.Handle{}, p.finishRun("r", aei.Result{Err: ErrDeadlineExceeded}), time.Time{}, time.Time{}, runStages{})
 	if got := obs.snapshot(); len(got) != 1 || got[0].Phase != phaseSucceeded {
 		t.Errorf("observed %+v, want one Succeeded", got)
 	}

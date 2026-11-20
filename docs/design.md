@@ -470,8 +470,13 @@ The runtime's stages are recorded only when the run reported them. Time waiting
 on the platform and the provider is `queue`, then `dispatch`, then
 `provisioning`; time in the model is `model`. The stages run in that order but
 are not strictly additive: providers stamp `AEI_DISPATCHED_AT` inside `Dispatch`,
-just before creating the workload, so `provisioning` starts before `dispatch`
-ends and overlaps it by the provider's create call.
+so `provisioning` starts before `dispatch` ends and the two overlap. How much
+depends on the provider. The pod-shaped providers (k8s-job, agent-sandbox) stamp
+it just before creating the workload, so the overlap is that create call.
+agent-substrate stamps it after ensuring the actor and before sending the run,
+and retries the router's "actor unavailable" response with backoff until the
+actor resumes; every retry reuses the stamp, so a durable cold start's whole
+warm-up appears in both `dispatch` and `provisioning`.
 
 ---
 
