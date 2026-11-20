@@ -242,7 +242,10 @@ type Plane struct {
 	providerPools map[poolKey]*permitPool // per provider: PullsCredential and in-flight Dispatch (guarded by mu)
 	ticketCalls   chan struct{}           // Store.PutTicket (pull credential)
 	tokenCalls    chan struct{}           // TokenAuthority.Mint (pushed credential)
-	storeCalls    chan struct{}           // Store.Run / FinishRun for the run watch and Run's commit
+	// Store calls have two pools, so the run watch's polls, which a slow Store
+	// can strand, never take the capacity a terminal write needs.
+	storeReads  chan struct{} // Store.Run for the run watch
+	storeWrites chan struct{} // Store.FinishRun (and its read-back) for terminal writes
 
 	defaultDeadline time.Duration // applied to a run with no Deadline
 	maxDeadline     time.Duration // cap on a run's Deadline
@@ -295,7 +298,8 @@ func New(cfg Config) *Plane {
 		providerPools: map[poolKey]*permitPool{},
 		ticketCalls:   make(chan struct{}, 2*creates),
 		tokenCalls:    make(chan struct{}, 2*creates),
-		storeCalls:    make(chan struct{}, 2*creates),
+		storeReads:    make(chan struct{}, 2*creates),
+		storeWrites:   make(chan struct{}, 2*creates),
 		waiters:       map[string]chan aei.Result{},
 
 		defaultDeadline: defaultDeadline,
@@ -576,7 +580,7 @@ func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 }
 
 // recordTimeout bounds a terminal write that no caller is waiting on: how long
-// record waits for a Store permit and then for the write. It sits inside the
+// record waits for a Store write permit and then for the write. It sits inside the
 // runtime SDK's 30s request timeout (aeiruntime), so a /redeem that waits for its
 // write still answers the runtime.
 const recordTimeout = 20 * time.Second
@@ -590,7 +594,8 @@ type recorded struct {
 }
 
 // record commits res as runID's outcome through the Store (first writer wins) on
-// its own goroutine, bounded by recordTimeout and holding a Store permit, so no
+// its own goroutine, bounded by recordTimeout and holding a Store write permit
+// (a pool the run watch's reads cannot exhaust), so no
 // caller's cancellation or impatience can stop the outcome from being recorded.
 // The returned channel (buffered) delivers the result once the write finishes or
 // the bound ends; a caller may stop waiting for it at any time.
@@ -606,7 +611,7 @@ func (p *Plane) record(runID string, res aei.Result) <-chan recorded {
 			st  RunState
 			won bool
 		)
-		if err := p.bounded(ctx, p.storeCalls, nil, runID, "run status commit", func() { st, won = p.commit(runID, res) }); err != nil {
+		if err := p.bounded(ctx, p.storeWrites, nil, runID, "run status commit", func() { st, won = p.commit(runID, res) }); err != nil {
 			p.log.Warn("run outcome not yet recorded in the store", "run_id", runID, "error", err.Error())
 			out <- recorded{}
 			return
@@ -910,8 +915,9 @@ func storePollInterval(ctx context.Context) time.Duration {
 // another replica, which cannot wake this one's waiters — and delivers the first
 // one on out, so such an outcome ends the run promptly. It stops when ctx ends
 // (race cancels it when the run settles). Each read holds one of the plane's
-// Store permits until it returns, so a Store outage strands at most that many
-// reads, however many runs are in flight.
+// Store read permits until it returns, so a Store outage strands at most that
+// many reads, however many runs are in flight, and stranded reads never delay
+// a terminal write, which has permits of its own.
 func (p *Plane) watchStored(ctx context.Context, runID string, out chan<- aei.Result) {
 	t := time.NewTicker(storePollInterval(ctx))
 	defer t.Stop()
@@ -925,7 +931,7 @@ func (p *Plane) watchStored(ctx context.Context, runID string, out chan<- aei.Re
 			st RunState
 			ok bool
 		)
-		if p.bounded(ctx, p.storeCalls, nil, runID, "run status read", func() { st, ok = p.store.Run(runID) }) != nil {
+		if p.bounded(ctx, p.storeReads, nil, runID, "run status read", func() { st, ok = p.store.Run(runID) }) != nil {
 			continue // ctx ended, or the read is still outstanding
 		}
 		if ok && st.Phase != phaseRunning {

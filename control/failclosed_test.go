@@ -409,7 +409,7 @@ func TestStoreOutageBoundsOutstandingCalls(t *testing.T) {
 	st := &hungStore{memStore: newMemStore(), release: make(chan struct{})}
 	defer close(st.release)
 	p := New(Config{Secret: []byte("k"), Store: st, Logger: quietLog, MaxConcurrentCreates: 1})
-	const limit = 2 // the Store permits: 2*MaxConcurrentCreates
+	const limit = 2 + 2 // the Store read and write permits, each 2*MaxConcurrentCreates
 
 	const deadline = 60 * time.Millisecond
 	for i := range 8 {
@@ -423,7 +423,7 @@ func TestStoreOutageBoundsOutstandingCalls(t *testing.T) {
 		}
 	}
 	if n := st.peak(); n > limit {
-		t.Fatalf("%d Store calls outstanding at once; want at most the %d Store permits", n, limit)
+		t.Fatalf("%d Store calls outstanding at once; want at most the %d Store read and write permits", n, limit)
 	}
 }
 
@@ -682,5 +682,39 @@ func TestSlowPeerWriteKeepsSigningCause(t *testing.T) {
 	id, _ := dispatcher.Submit(context.Background(), &httpRedeemer{peerURL: srv.URL}, aei.RunSpec{ID: "slow-peer-submit", Deadline: 10 * time.Second})
 	if st := waitFailedWithin(t, dispatcher, id, 5*time.Second); !strings.Contains(st.Err, "signing key unavailable") {
 		t.Errorf("Submit Status err = %q; want the signing failure", st.Err)
+	}
+}
+
+// Terminal writes have Store permits the run watch cannot exhaust: with Store
+// reads hung (stranding the watch's polls) but writes working, every run's
+// outcome is still recorded at once, and a canceled caller's too.
+func TestStrandedReadsDoNotBlockTerminalWrites(t *testing.T) {
+	st := stallingStore{memStore: newMemStore(), release: make(chan struct{})}
+	defer close(st.release)
+	p := New(Config{Secret: []byte("k"), Store: st, Logger: quietLog, MaxConcurrentCreates: 1}) // 2 read permits
+
+	recorded := func(id string) bool {
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if got, ok := st.memStore.Run(id); ok && got.Phase == phaseFailed { // bypass the hung read
+				return true
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return false
+	}
+	for i := range 4 { // the first runs' polls strand both read permits
+		id := fmt.Sprintf("stranded-%d", i)
+		p.Run(context.Background(), blockUntilDone{}, aei.RunSpec{ID: id, Deadline: 100 * time.Millisecond})
+		if !recorded(id) {
+			t.Fatalf("run %s: outcome not recorded while Store reads were stranded", id)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	entered := make(chan struct{})
+	go func() { <-entered; cancel() }()
+	p.Run(ctx, enteringLauncher{entered}, aei.RunSpec{ID: "stranded-canceled", Deadline: time.Minute})
+	if !recorded("stranded-canceled") {
+		t.Fatal("canceled run's outcome not recorded while Store reads were stranded")
 	}
 }
