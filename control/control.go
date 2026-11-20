@@ -399,6 +399,7 @@ func (p *Plane) RunWithOptions(ctx context.Context, launcher aei.Launcher, spec 
 	}()
 
 	spec = p.applyDeadline(ownSpec(spec))
+	callerCtx := ctx // bounds the commit below; the run's own deadline does not
 	ctx, cancel := withRunDeadline(ctx, spec)
 	defer cancel()
 	spec = withContextCutoff(ctx, spec) // a caller deadline sooner than the run's wins
@@ -424,9 +425,11 @@ func (p *Plane) RunWithOptions(ctx context.Context, launcher aei.Launcher, spec 
 	// Run and GET /runs/{id} agree: an outcome a peer replica recorded first (a
 	// /complete, or a /redeem that failed to mint) is this run's outcome, even
 	// when it landed after the last watch poll or while the provider was
-	// succeeding. An outcome this run won keeps its own error value (errors.Is
-	// still matches ErrDeadlineExceeded).
-	if st, won, ok := p.commitRun(ctx, spec, res); ok && !won {
+	// succeeding. When the Store holds this run's own outcome — this commit won,
+	// or this replica's /redeem recorded the same failure first — res keeps its
+	// original error value, so errors.Is still matches (ErrDeadlineExceeded, or
+	// the credential issuer's error).
+	if st, won, ok := p.commitRun(callerCtx, spec, res); ok && !won && st != stateOf(res) {
 		res = resultOf(st)
 		if err != nil {
 			err = res.Err // still "not accepted", but with the recorded cause
@@ -572,12 +575,29 @@ func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 	return st
 }
 
-// commit is finishRun that also reports whether this call's outcome won.
-func (p *Plane) commit(runID string, res aei.Result) (RunState, bool) {
+// persistBounded records res as runID's outcome (first writer wins), holding a
+// Store permit and waiting at most maxCommitGrace. A write still outstanding then
+// completes in the background.
+func (p *Plane) persistBounded(runID string, res aei.Result) {
+	ctx, cancel := context.WithTimeout(context.Background(), maxCommitGrace)
+	defer cancel()
+	if err := p.bounded(ctx, p.storeCalls, nil, runID, "run status commit", func() { p.finishRun(runID, res) }); err != nil {
+		p.log.Warn("run outcome not yet recorded in the store", "run_id", runID, "error", err.Error())
+	}
+}
+
+// stateOf is the RunState the Store records for res.
+func stateOf(res aei.Result) RunState {
 	st := RunState{Phase: phaseSucceeded, ResultRef: res.ResultRef, Timing: res.Timing}
 	if res.Err != nil {
 		st.Phase, st.Err = phaseFailed, res.Err.Error()
 	}
+	return st
+}
+
+// commit is finishRun that also reports whether this call's outcome won.
+func (p *Plane) commit(runID string, res aei.Result) (RunState, bool) {
+	st := stateOf(res)
 	if !p.store.FinishRun(runID, st) {
 		// A terminal outcome was already recorded; report that one.
 		if won, ok := p.store.Run(runID); ok && won.Phase != phaseRunning {
@@ -897,19 +917,31 @@ const (
 // the outcome the Store holds: res when this commit won, or the outcome another
 // writer recorded first — a peer replica's /complete, or a /redeem that failed to
 // mint. That makes Run's result and GET /runs/{id} the same outcome however the
-// signals interleaved, including one recorded just before the deadline. The
-// commit holds a Store permit and waits at most the commit grace, so a Store
-// outage cannot hold Run; then Run keeps its own result (ok is false), which is
-// all this replica can know while the Store does not answer.
-func (p *Plane) commitRun(ctx context.Context, spec aei.RunSpec, res aei.Result) (st RunState, won, ok bool) {
+// signals interleaved, including one recorded just before the deadline.
+//
+// Run waits for the commit at most the commit grace past the run's deadline,
+// and never past callerCtx (the Run caller's own context, which the grace cannot
+// extend). The commit holds a Store permit, so a Store outage cannot hold Run or
+// pile up calls; when it does not finish in time Run keeps its own result (ok is
+// false), which is all this replica can know while the Store does not answer.
+func (p *Plane) commitRun(callerCtx context.Context, spec aei.RunSpec, res aei.Result) (st RunState, won, ok bool) {
 	grace := min(max(spec.Deadline/10, minCommitGrace), maxCommitGrace)
-	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), grace)
+	cctx, cancel := context.WithTimeout(callerCtx, grace)
 	defer cancel()
-	if err := p.bounded(cctx, p.storeCalls, nil, spec.ID, "run status commit", func() { st, won = p.commit(spec.ID, res) }); err != nil {
-		p.log.Warn("run outcome not committed to the store; reporting this replica's", "run_id", spec.ID, "error", err.Error())
+	// The worker writes only got, and got is read only once bounded reports the
+	// worker finished: a commit that completes after the wait gave up writes to
+	// storage nothing reads.
+	var got struct {
+		st  RunState
+		won bool
+	}
+	if err := p.bounded(cctx, p.storeCalls, nil, spec.ID, "run status commit", func() { got.st, got.won = p.commit(spec.ID, res) }); err != nil {
+		if callerCtx.Err() == nil {
+			p.log.Warn("run outcome not committed to the store; reporting this replica's", "run_id", spec.ID, "error", err.Error())
+		}
 		return RunState{}, false, false
 	}
-	return st, won, true
+	return got.st, got.won, true
 }
 
 // resultOf turns a recorded terminal RunState back into the Result it came from.
@@ -1179,8 +1211,14 @@ func (p *Plane) redeem(id string) (string, int, bool, error) {
 	tok, err := p.mintToken(c)
 	if err != nil {
 		res := aei.Result{Err: err}
-		p.finishRun(c.RunID, res)
+		// Deliver the known failure first: a run waiting on this replica ends
+		// with it at once, whatever the Store is doing.
 		p.fire(c.RunID, res)
+		// Then record it for GET /runs/{id} and peer replicas before answering
+		// the runtime, so the provider's report of the 500 ("redeem status 500")
+		// cannot reach the Store first. The write is bounded like Run's commit:
+		// a stalled Store delays this answer by at most the commit grace.
+		p.persistBounded(c.RunID, res)
 		return "", 0, true, err
 	}
 	ttl := int(time.Unix(c.Exp, 0).Sub(p.now()).Seconds())

@@ -36,11 +36,15 @@ func mustMint(t *testing.T, p *Plane, l aei.Launcher, spec aei.RunSpec) aei.Cred
 // failingAuthority cannot mint (e.g. a broken or unreachable signing key).
 type failingAuthority struct{ empty bool }
 
+// errSigningKey is failingAuthority's error, so tests can check it survives with
+// errors.Is.
+var errSigningKey = errors.New("signing key unavailable")
+
 func (a failingAuthority) Mint(Claims) (string, error) {
 	if a.empty {
 		return "", nil // a buggy authority: no error, but no token either
 	}
-	return "", errors.New("signing key unavailable")
+	return "", errSigningKey
 }
 func (failingAuthority) Verify(string) (Claims, bool) { return Claims{}, false }
 
@@ -475,5 +479,110 @@ func TestPeerCompletionWinsOverProviderSuccess(t *testing.T) {
 	}
 	if st, _ := dispatcher.Status("run-peer-done"); st.ResultRef != res.ResultRef || st.Timing.ToolCalls != res.Timing.ToolCalls {
 		t.Errorf("Status = %+v; Run and Status disagree", st)
+	}
+}
+
+// slowFinishStore completes FinishRun only after a delay longer than the commit
+// grace.
+type slowFinishStore struct {
+	*memStore
+	delay time.Duration
+}
+
+func (s slowFinishStore) FinishRun(id string, st RunState) bool {
+	time.Sleep(s.delay)
+	return s.memStore.FinishRun(id, st)
+}
+
+// A commit that completes after Run stopped waiting writes to storage Run never
+// reads (run with -race: the late write must not touch what Run returned).
+func TestLateCommitDoesNotRaceRunsResult(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Store: slowFinishStore{newMemStore(), 3 * minCommitGrace}, Logger: quietLog})
+	const deadline = 50 * time.Millisecond
+	start := time.Now()
+	res, _ := p.Run(context.Background(), blockUntilDone{}, aei.RunSpec{ID: "late-commit", Deadline: deadline})
+	if elapsed := time.Since(start); elapsed > deadline+minCommitGrace+300*time.Millisecond {
+		t.Errorf("Run took %v; want its deadline plus the commit grace", elapsed)
+	}
+	if !errors.Is(res.Err, ErrDeadlineExceeded) {
+		t.Errorf("Run err = %v; want its own deadline outcome", res.Err)
+	}
+	time.Sleep(4 * minCommitGrace) // let the late commit land while res is in use
+	_ = res.ResultRef
+}
+
+// The commit never outlives the Run caller's own context: with a stalled Store
+// and a 10ms caller deadline, Run returns promptly rather than waiting the
+// commit grace a long configured run deadline would allow.
+func TestCommitHonorsCallerDeadline(t *testing.T) {
+	st := &hungStore{memStore: newMemStore(), release: make(chan struct{})}
+	defer close(st.release)
+	p := New(Config{Secret: []byte("k"), Store: st, Logger: quietLog}) // default run deadline: 15m, so a 1s grace
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	res, _ := p.Run(ctx, blockUntilDone{}, aei.RunSpec{ID: "caller-cut"})
+	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
+		t.Fatalf("Run took %v with a 10ms caller deadline; the commit outlived the caller", elapsed)
+	}
+	if res.Err == nil {
+		t.Fatal("Run succeeded; want the caller's deadline")
+	}
+}
+
+// hungFinishStore hangs FinishRun until release closes; reads work.
+type hungFinishStore struct {
+	*memStore
+	release chan struct{}
+}
+
+func (s hungFinishStore) FinishRun(id string, st RunState) bool {
+	<-s.release
+	return s.memStore.FinishRun(id, st)
+}
+
+// A failed /redeem delivers the failure to this replica's waiting run at once,
+// even when the Store write hangs, and still answers the runtime (500) within the
+// bound.
+func TestRedeemFailureWakesLocalRunDespiteStalledStore(t *testing.T) {
+	st := hungFinishStore{newMemStore(), make(chan struct{})}
+	defer close(st.release)
+	p := New(Config{Authority: failingAuthority{}, Store: st, Logger: quietLog})
+
+	const deadline = 2 * time.Second
+	start := time.Now()
+	res, _ := p.Run(context.Background(), &redeemingDispatcher{p: p}, aei.RunSpec{ID: "redeem-stall", Deadline: deadline})
+	if elapsed := time.Since(start); elapsed > deadline/2 {
+		t.Errorf("Run took %v; want the known signing failure well before the %v deadline", elapsed, deadline)
+	}
+	if !errors.Is(res.Err, errSigningKey) || errors.Is(res.Err, ErrDeadlineExceeded) {
+		t.Fatalf("Run err = %v; want the signing failure, not the deadline", res.Err)
+	}
+
+	// The runtime's /redeem itself is answered within the commit bound.
+	cred := mustMint(t, p, &fakePull{}, aei.RunSpec{ID: "redeem-stall-http"})
+	srv := httptest.NewServer(p.Handler())
+	defer srv.Close()
+	start = time.Now()
+	resp := post(t, srv.URL+"/aei/v1alpha1/redeem", "", map[string]string{"ticket": cred.Value})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("redeem status = %d; want 500", resp.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed > maxCommitGrace+500*time.Millisecond {
+		t.Errorf("redeem answered after %v; want within the commit bound", elapsed)
+	}
+}
+
+// When this replica's /redeem already stored the failure, Run's result keeps the
+// credential issuer's original error, so errors.Is still matches it.
+func TestLocalRedeemFailureKeepsIssuerError(t *testing.T) {
+	p := New(Config{Authority: failingAuthority{}, Logger: quietLog})
+	for i := range 20 { // either writer may reach the Store first
+		res, _ := p.Run(context.Background(), &redeemingDispatcher{p: p}, aei.RunSpec{ID: fmt.Sprintf("local-redeem-%d", i), Deadline: time.Second})
+		if !errors.Is(res.Err, errSigningKey) {
+			t.Fatalf("run %d: errors.Is(%v, errSigningKey) = false; the issuer's error was lost", i, res.Err)
+		}
 	}
 }
