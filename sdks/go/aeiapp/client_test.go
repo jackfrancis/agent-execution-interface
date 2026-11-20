@@ -3,6 +3,7 @@ package aeiapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -61,5 +62,19 @@ func TestDispatchAndWait(t *testing.T) {
 	}
 	if !res.Succeeded() || res.ResultRef != "store://hello" {
 		t.Fatalf("result = %+v, want Succeeded store://hello", res)
+	}
+}
+
+// TestDispatchOverloaded: a 429 from the dispatch API surfaces as ErrOverloaded, so
+// a caller can back off and retry instead of treating it as a hard failure.
+func TestDispatchOverloaded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "dispatch queue full", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "app", WithToken("t"))
+	if _, err := c.Dispatch(context.Background(), Spec{TaskRef: "x"}); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("Dispatch err = %v, want ErrOverloaded", err)
 	}
 }

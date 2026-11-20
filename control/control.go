@@ -39,6 +39,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -162,6 +164,24 @@ type Config struct {
 	// MaxDeadline caps a run's Deadline: a longer one is reduced to it. Optional:
 	// zero uses 1h. A DefaultDeadline above MaxDeadline is reduced to MaxDeadline.
 	MaxDeadline time.Duration
+	// MaxConcurrentCreates bounds how many provider creates (an async provider's
+	// Dispatch, or a plain provider's blocking Launch) run at once, across every
+	// provider the plane fronts. Awaiting completion does not hold a slot, so it
+	// bounds the create burst, not the number of runs in flight. Optional: <= 0
+	// uses DefaultMaxConcurrentCreates.
+	MaxConcurrentCreates int
+	// MaxQueued bounds how many submitted runs may wait for a create slot. A Submit
+	// beyond it is refused at once with ErrOverloaded, so a burst gets a predictable
+	// answer instead of an unbounded queue. Optional: <= 0 uses DefaultMaxQueued.
+	MaxQueued int
+	// CreateTimeout bounds how long one provider create may hold a create slot, so
+	// a provider that hangs (e.g. retrying an unavailable substrate) cannot stall
+	// dispatch for every other provider. It covers minting the run credential and
+	// an async provider's Dispatch, which is cancelled at the timeout; the run then
+	// fails. A plain provider's blocking Launch is the whole run, so it holds its
+	// slot until it returns, bounded by the run deadline. Optional: <= 0 uses
+	// DefaultCreateTimeout.
+	CreateTimeout time.Duration
 }
 
 // Deadline defaults (Config.DefaultDeadline, Config.MaxDeadline).
@@ -174,6 +194,19 @@ const (
 // at its deadline because neither the runtime's callback nor the provider
 // reported a terminal outcome in time (errors.Is matches the recorded error).
 var ErrDeadlineExceeded = errors.New("control: run deadline exceeded")
+
+// Dispatch bounds, matching ZZ's orchestrator (two dispatch workers, a 128-deep
+// enqueue buffer).
+const (
+	DefaultMaxConcurrentCreates = 2
+	DefaultMaxQueued            = 128
+	DefaultCreateTimeout        = 2 * time.Minute
+)
+
+// ErrOverloaded is returned by Submit when MaxQueued runs are already waiting for a
+// create slot (on either path). Nothing about the run is recorded; the caller may
+// retry later. The dispatch API maps it to 429 Too Many Requests with Retry-After.
+var ErrOverloaded = errors.New("control: dispatch queue full")
 
 // Run phases: a submitted run is phaseRunning until a terminal signal — the runtime
 // callback, the provider watch, or the deadline — resolves it.
@@ -194,6 +227,21 @@ type Plane struct {
 	log       *slog.Logger
 	store     Store    // persistable state (tickets + run status); the HA seam
 	obs       Observer // run-outcome metrics sink; the observability seam
+
+	// creates holds one token per provider create in progress (cap
+	// MaxConcurrentCreates); admit holds one per run, on either path, that has not
+	// finished its create (cap MaxConcurrentCreates+MaxQueued), so it bounds the
+	// queue. createTimeout bounds how long one create holds its slot.
+	creates       chan struct{}
+	admit         chan struct{}
+	createTimeout time.Duration
+	// Permits for credential calls in flight, one pool per backend, each counting
+	// calls a run abandoned at its create timeout until they return (cap
+	// 2*MaxConcurrentCreates, leaving room for the next creates beside calls stuck
+	// in a slow backend).
+	providerPools map[poolKey]*permitPool // per provider: PullsCredential and in-flight Dispatch (guarded by mu)
+	ticketCalls   chan struct{}           // Store.PutTicket (pull credential)
+	tokenCalls    chan struct{}           // TokenAuthority.Mint (pushed credential)
 
 	defaultDeadline time.Duration // applied to a run with no Deadline
 	maxDeadline     time.Duration // cap on a run's Deadline
@@ -222,18 +270,31 @@ func New(cfg Config) *Plane {
 	if obs == nil {
 		obs = nopObserver{} // reference-grade: record nothing
 	}
+	creates, queued := cfg.MaxConcurrentCreates, cfg.MaxQueued
+	if creates <= 0 {
+		creates = DefaultMaxConcurrentCreates
+	}
+	if queued <= 0 {
+		queued = DefaultMaxQueued
+	}
 	maxDeadline := orDur(cfg.MaxDeadline, defaultMaxDeadline)
 	defaultDeadline := min(orDur(cfg.DefaultDeadline, defaultRunDeadline), maxDeadline)
 	return &Plane{
-		auth:      auth,
-		creds:     cfg.Credentials,
-		tokenTTL:  orDur(cfg.TokenTTL, 15*time.Minute),
-		ticketTTL: orDur(cfg.TicketTTL, 5*time.Minute),
-		now:       now,
-		log:       log,
-		store:     store,
-		obs:       obs,
-		waiters:   map[string]chan aei.Result{},
+		auth:          auth,
+		creds:         cfg.Credentials,
+		tokenTTL:      orDur(cfg.TokenTTL, 15*time.Minute),
+		ticketTTL:     orDur(cfg.TicketTTL, 5*time.Minute),
+		now:           now,
+		log:           log,
+		store:         store,
+		obs:           obs,
+		creates:       make(chan struct{}, creates),
+		admit:         make(chan struct{}, creates+queued),
+		createTimeout: orDur(cfg.CreateTimeout, DefaultCreateTimeout),
+		providerPools: map[poolKey]*permitPool{},
+		ticketCalls:   make(chan struct{}, 2*creates),
+		tokenCalls:    make(chan struct{}, 2*creates),
+		waiters:       map[string]chan aei.Result{},
 
 		defaultDeadline: defaultDeadline,
 		maxDeadline:     maxDeadline,
@@ -300,22 +361,64 @@ func (p *Plane) effectiveDeadline(spec aei.RunSpec) time.Duration {
 // launcher per call (rather than binding one) lets a single plane — one broker,
 // one completion registry, one ABI server — front many providers, which is what
 // the CRD controller needs (a provider per AgentProviderClass).
+//
+// Run shares the plane's create bound and queue with Submit, but where Submit is
+// refused at the queue limit Run waits for room, bounded by ctx and the deadline.
+// A provider panic or watch error comes back as a failed Result; the error is
+// non-nil only when the run could not be dispatched.
 func (p *Plane) Run(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec) (aei.Result, error) {
+	return p.RunWithOptions(ctx, launcher, spec)
+}
+
+// RunWithOptions is Run with the options Submit takes; WithProviderClass gives
+// the provider's per-provider bounds a stable identity. The AgentRun reconciler
+// uses it.
+func (p *Plane) RunWithOptions(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, opts ...SubmitOption) (res aei.Result, err error) {
 	if launcher == nil {
 		return aei.Result{}, errors.New("control: no launcher")
 	}
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
+	var o submitOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	// The caller (the AgentRun reconciler) runs this on its own goroutine, so a
+	// panic that escapes here would end the controller. Provider calls are guarded
+	// individually in race; this is the backstop for anything else.
+	release := func() {}
+	defer func() {
+		if rec := recover(); rec != nil {
+			release()
+			res = aei.Result{Err: p.panicked(spec.ID, "run", rec)}
+			err = res.Err
+		}
+	}()
+
 	spec = p.applyDeadline(ownSpec(spec))
 	ctx, cancel := withRunDeadline(ctx, spec)
 	defer cancel()
 	spec = withContextCutoff(ctx, spec) // a caller deadline sooner than the run's wins
 
+	// Run takes an admission slot like Submit, so a run here waiting for or holding
+	// a create slot counts against the queue Submit enforces. It waits for the slot
+	// rather than being refused: the CRD path has no caller to answer 429 to.
+	select {
+	case p.admit <- struct{}{}:
+	case <-ctx.Done():
+		err := fmt.Errorf("control: no dispatch slot before the deadline: %w", context.Cause(ctx))
+		return aei.Result{Err: err}, err
+	}
+	release = sync.OnceFunc(func() { <-p.admit })
+
 	done := p.arm(spec.ID)
 	defer p.disarm(spec.ID)
-	r, _, err := p.race(ctx, launcher, spec, done)
-	return r, err
+
+	// race releases admission when the create gives its slot back, which for a
+	// blocking Launch can be after Run returns.
+	res, _, err = p.race(ctx, launcher, spec, done, release, providerKey(launcher, o.class))
+	return res, err
 }
 
 // RunState is the observable state of a submitted run, held in the Store so the
@@ -334,6 +437,10 @@ type RunState struct {
 // callback raced against the provider's Await and the deadline) is recorded into
 // the in-memory run store and read back with Status. This is the scalable app
 // path — one call per run, no per-run object (docs/dispatch-plane.md).
+//
+// Submit never blocks on the provider: when MaxQueued runs are already waiting for
+// a create slot it returns ErrOverloaded and records nothing. A provider panic or
+// watch error is recorded as a Failed run.
 func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpec, opts ...SubmitOption) (string, error) {
 	if launcher == nil {
 		return "", errors.New("control: no launcher")
@@ -342,6 +449,18 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 	for _, opt := range opts {
 		opt(&o)
 	}
+	// Admission: a run holds an admission slot from here until its provider create
+	// returns, so at most MaxConcurrentCreates runs are creating and at most
+	// MaxQueued are waiting to, across Submit and Run. Beyond that the submission
+	// is refused at once with ErrOverloaded rather than queued without bound (ZZ's
+	// non-blocking enqueue).
+	select {
+	case p.admit <- struct{}{}:
+	default:
+		return "", ErrOverloaded
+	}
+	release := sync.OnceFunc(func() { <-p.admit })
+
 	if spec.ID == "" {
 		spec.ID = randID()
 	}
@@ -354,11 +473,20 @@ func (p *Plane) Submit(_ context.Context, launcher aei.Launcher, spec aei.RunSpe
 
 	go func() {
 		defer p.disarm(spec.ID)
+		// Provider calls are guarded in race, which also owns releasing admission;
+		// this is the backstop for anything else on this goroutine, which no HTTP
+		// server recovers.
+		defer func() {
+			if rec := recover(); rec != nil {
+				release()
+				p.finishRun(spec.ID, aei.Result{Err: p.panicked(spec.ID, "run", rec)})
+			}
+		}()
 		// The run outlives the submit request, so it runs on its own context
 		// bounded only by the run deadline (the universal backstop).
 		ctx, cancel := withRunDeadline(context.Background(), spec)
 		defer cancel()
-		res, h, _ := p.race(ctx, launcher, spec, done)
+		res, h, _ := p.race(ctx, launcher, spec, done, release, providerKey(launcher, o.class))
 		if h.Provider == "" {
 			h.Provider = o.provider
 		}
@@ -375,6 +503,7 @@ type SubmitOption func(*submitOptions)
 
 type submitOptions struct {
 	provider string
+	class    string
 }
 
 // WithProvider names the provider the caller resolved for the run (e.g. the
@@ -383,6 +512,18 @@ type submitOptions struct {
 // returned yet because the runtime's /complete callback won the race.
 func WithProvider(name string) SubmitOption {
 	return func(o *submitOptions) { o.provider = name }
+}
+
+// WithProviderClass names the provider class (or other stable identity) of the
+// configured launcher the run uses. The plane keeps a provider's PullsCredential
+// calls in their own bounded pool per class, so a provider stuck there cannot stop
+// another's runs. Without it the pool is keyed by the launcher value when that is
+// comparable (a pointer, as every in-tree provider is), and otherwise by its Go
+// type, which separately configured launchers of that type then share. The same
+// per-class bound applies to a provider's Dispatch calls that outlive the create
+// timeout.
+func WithProviderClass(name string) SubmitOption {
+	return func(o *submitOptions) { o.class = name }
 }
 
 // observe reports a run's terminal outcome to the metrics Observer (the metrics
@@ -447,7 +588,17 @@ func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 // deadline), whether or not the provider honors cancellation. A provider call
 // that ignores cancellation is left to return on its own; its result goes to a
 // buffered channel nobody reads, so it cannot block or overwrite the outcome.
-func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, done chan aei.Result) (aei.Result, aei.Handle, error) {
+//
+// The provider create (Dispatch, or a plain provider's blocking Launch) waits for
+// one of the plane's MaxConcurrentCreates slots, bounded by ctx. Once it has a
+// slot, race owns the run's admission too: created is called, exactly once, when
+// the create gives its slot back, even if the run's outcome arrived first.
+// Minting (only after the slot is held, so no credential is spent in the queue)
+// and an async Dispatch together get CreateTimeout; provKey selects the provider's
+// PullsCredential permits. Every provider call is guarded: a panic becomes a
+// failed Result instead of ending the process, and an error from Await fails the
+// run instead of being dropped.
+func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, done chan aei.Result, created func(), provKey any) (aei.Result, aei.Handle, error) {
 	type outcome struct {
 		res         aei.Result
 		dispatchErr error
@@ -461,51 +612,130 @@ func (p *Plane) race(ctx context.Context, launcher aei.Launcher, spec aei.RunSpe
 	)
 	setHandle := func(h aei.Handle) { hmu.Lock(); handle = h; hmu.Unlock() }
 	getHandle := func() aei.Handle { hmu.Lock(); defer hmu.Unlock(); return handle }
-	// accepted closes once an async provider's Dispatch returns without error, so
-	// a deadline or cancellation that lands first is still reported as a failed
-	// dispatch rather than as an accepted run that ended.
+	// accepted closes once the provider has the run: an async provider's Dispatch
+	// returned without error, or a plain provider's Launch was entered. A deadline
+	// or cancellation that lands first (in the queue, or while the credential is
+	// prepared) is reported as a failed dispatch rather than as a run that ended.
 	accepted := make(chan struct{})
 	async, isAsync := launcher.(aei.AsyncLauncher)
-	if !isAsync {
-		close(accepted) // a plain provider has no separate dispatch step
-	}
 	go func() {
-		// Minting runs under the deadline too: a slow credential issuer cannot
-		// hold the run open, and a run whose deadline passed while its credential
-		// was minted is never handed to the provider.
-		cred, err := p.mint(launcher, spec)
-		if err != nil {
-			// Fail closed: a run whose credential cannot be minted fails and is
-			// never handed to the provider with an empty credential. It was not
-			// dispatched, so it reports as a dispatch error.
+		// Provider calls are guarded where they are made; this is the backstop for
+		// anything else on this goroutine (the plane's own credential bookkeeping),
+		// which nothing above would recover: the run fails and gives back what it
+		// holds instead of ending the controller.
+		release := created
+		defer func() {
+			if rec := recover(); rec != nil {
+				release()
+				err := p.panicked(spec.ID, "run", rec)
+				select {
+				case provider <- outcome{res: aei.Result{Err: err}, dispatchErr: err}:
+				default:
+				}
+			}
+		}()
+		// Wait for a create slot. A run still queued when its deadline passes was
+		// never handed to the provider.
+		select {
+		case p.creates <- struct{}{}:
+		case <-ctx.Done():
+			created()
+			err := fmt.Errorf("control: no dispatch slot before the deadline: %w", context.Cause(ctx))
 			provider <- outcome{res: aei.Result{Err: err}, dispatchErr: err}
 			return
 		}
-		if ctx.Err() != nil {
-			cause := context.Cause(ctx)
-			o := outcome{res: aei.Result{Err: cause}}
-			if isAsync {
-				o.dispatchErr = cause
+		endCreate := sync.OnceFunc(func() { <-p.creates; created() })
+		release = endCreate
+		notDispatched := func(err error) {
+			provider <- outcome{res: aei.Result{Err: err}, dispatchErr: err}
+		}
+
+		// An async provider's in-flight Dispatch calls are bounded per provider,
+		// including calls that ignored cancellation and outlived the create
+		// timeout (the global slot is given back then, below). Taking a permit
+		// does not wait: the global slot is already held, so this run and at most
+		// MaxConcurrentCreates-1 others are creating; a pool with no room left
+		// means this provider has calls stuck past the timeout, and waiting would
+		// let it stall everyone else.
+		givePermit := func() {}
+		if isAsync {
+			permits, donePermits := p.providerPermits("Dispatch", provKey)
+			select {
+			case permits <- struct{}{}:
+				givePermit = sync.OnceFunc(func() { <-permits; donePermits() })
+			default:
+				donePermits()
+				endCreate()
+				notDispatched(fmt.Errorf("control: provider has %d creates still in flight past the create timeout; not dispatching more until they return", cap(permits)))
+				return
 			}
-			provider <- o
+		}
+		defer givePermit()
+
+		// One create budget, started now that the slot is held, covers preparing
+		// the credential and the provider's Dispatch, so neither a stuck
+		// credential backend nor a stuck provider can hold the slot past
+		// CreateTimeout.
+		createCtx, cancelCreate := context.WithTimeout(ctx, p.createTimeout)
+		defer cancelCreate()
+		createErr := func(err error) error {
+			if errors.Is(createCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				return fmt.Errorf("control: provider create did not finish within %s: %w", p.createTimeout, err)
+			}
+			return err
+		}
+		// Minting runs under the deadline too: a slow credential issuer cannot
+		// hold the run open, and a run whose deadline passed while its credential
+		// was minted is never handed to the provider.
+		cred, err := p.mintWithin(createCtx, launcher, spec, provKey)
+		if ctx.Err() != nil {
+			err = context.Cause(ctx)
+		} else if err != nil {
+			err = createErr(err)
+		}
+		if err != nil {
+			endCreate()
+			notDispatched(err)
 			return
 		}
 		// The async capability lets us dispatch without blocking a worker and
 		// observe completion by watch; a plain provider blocks in Launch.
 		if isAsync {
-			h, err := async.Dispatch(ctx, spec, cred)
+			// The global slot is held until the create budget ends, not until
+			// Dispatch returns: a provider that ignores cancellation keeps only its
+			// own permit. The run itself still waits for Dispatch (until its
+			// deadline), so a workload accepted late is watched, not orphaned.
+			stopLease := context.AfterFunc(createCtx, endCreate)
+			h, err := p.guardCreate(spec.ID, "Dispatch", func() (aei.Handle, error) { return async.Dispatch(createCtx, spec, cred) })
+			stopLease()
+			givePermit()
 			setHandle(h)
+			cancelCreate()
+			endCreate()
 			if err != nil {
+				// Only a failed Dispatch is attributed to the timeout. A provider
+				// that accepted the workload as the timer fired returns a handle
+				// and no error; that run goes on to be watched, since a retry
+				// would start a second workload beside it.
+				err = createErr(err)
 				provider <- outcome{res: aei.Result{Err: err}, dispatchErr: err}
 				return
 			}
 			close(accepted)
-			r, _ := async.Await(ctx, h)
-			provider <- outcome{res: r}
+			provider <- outcome{res: p.await(ctx, async, spec.ID, h)}
 			return
 		}
-		h, err := launcher.Launch(ctx, spec, cred)
+		// A plain provider's Launch is the whole run: it cannot be cut off at the
+		// create timeout without killing the run, and there is no signal for when
+		// its workload exists. So it holds its create slot (and admission) until
+		// it returns, bounded by the run deadline, even if race returned first. A
+		// plain Launch that ignores cancellation therefore holds a global slot
+		// until it returns (aei.Launcher requires honoring ctx).
+		cancelCreate()
+		close(accepted)
+		h, err := p.guardCreate(spec.ID, "Launch", func() (aei.Handle, error) { return launcher.Launch(ctx, spec, cred) })
 		setHandle(h)
+		endCreate()
 		provider <- outcome{res: aei.Result{Err: err}}
 	}()
 
@@ -693,6 +923,178 @@ func resultOf(st RunState) aei.Result {
 	return res
 }
 
+// mintWithin mints the run credential, giving up when ctx ends. Minting takes no
+// context, so each step runs through bounded: a call still blocked when ctx ends
+// is abandoned (its credential, if ever produced, is never handed out and expires
+// unused) but keeps its permit until it returns. Each credential backend has its
+// own permits (2*MaxConcurrentCreates), so outstanding calls stay bounded and an
+// outage in one cannot stall the others: a stalled ticket store does not block
+// runs whose token the authority signs, and vice versa. A provider's
+// PullsCredential, which decides between them, has permits of its own per
+// provider (provKey, from providerKey), so one provider stuck there does not
+// stall another.
+//
+// The claims, including their expiry, are computed inside each step once it holds
+// its permit, so waiting for capacity does not shorten the credential's life.
+func (p *Plane) mintWithin(ctx context.Context, launcher aei.Launcher, spec aei.RunSpec, provKey any) (aei.Credential, error) {
+	pulls := false
+	if pl, ok := launcher.(aei.PullCredentialLauncher); ok {
+		permits, done := p.providerPermits("PullsCredential", provKey)
+		if err := p.bounded(ctx, permits, done, spec.ID, "PullsCredential", func() { pulls = pl.PullsCredential() }); err != nil {
+			return aei.Credential{}, err
+		}
+	}
+	if pulls {
+		var id string
+		if err := p.bounded(ctx, p.ticketCalls, nil, spec.ID, "redemption ticket", func() { id = p.issueTicket(p.claims(spec)) }); err != nil {
+			return aei.Credential{}, err
+		}
+		return aei.Credential{Value: id, Kind: aei.Ticket}, nil
+	}
+	var (
+		tok     string
+		mintErr error
+	)
+	if err := p.bounded(ctx, p.tokenCalls, nil, spec.ID, "run token", func() { tok, mintErr = p.mintToken(p.claims(spec)) }); err != nil {
+		return aei.Credential{}, err
+	}
+	if mintErr != nil {
+		// Fail closed: the run fails and is never handed an empty credential.
+		return aei.Credential{}, mintErr
+	}
+	return aei.Credential{Value: tok, Kind: aei.Token}, nil
+}
+
+// providerPermits returns one provider's permits of the given kind (its
+// PullsCredential calls, or its in-flight Dispatch calls), cap
+// 2*MaxConcurrentCreates, and a func to call once the caller is finished with
+// them. An entry lives only while some run is waiting for, or holding, one of its
+// permits, so the map stays as small as the set of providers with calls in
+// flight, however many the plane sees over time. key must be hashable, which
+// providerKey guarantees; the lock is released however the lookup ends.
+func (p *Plane) providerPermits(kind string, key any) (chan struct{}, func()) {
+	k := poolKey{kind, key}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.providerPools[k]
+	if !ok {
+		e = &permitPool{permits: make(chan struct{}, cap(p.ticketCalls))}
+		p.providerPools[k] = e
+	}
+	e.users++
+	return e.permits, func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if e.users--; e.users == 0 {
+			delete(p.providerPools, k)
+		}
+	}
+}
+
+// poolKey names one provider's permit pool of one kind.
+type poolKey struct {
+	kind     string
+	provider any
+}
+
+// permitPool is one provider's permits of one kind and how many runs are waiting
+// for or holding them.
+type permitPool struct {
+	permits chan struct{}
+	users   int
+}
+
+// classKey keys provider permits by a caller-named provider class.
+type classKey string
+
+// providerKey identifies the provider a run's per-provider permits belong to. A
+// provider class named with WithProviderClass is the stable identity of a
+// configured launcher. Without one, a launcher whose value is comparable (checked
+// on the value itself, including what any interface fields hold) and equal to
+// itself (a NaN field is neither, and could never find its own map entry) is its
+// own key; any other is keyed by its Go type, since a value with no usable
+// identity cannot be told apart from another configured the same way.
+func providerKey(l aei.Launcher, class string) any {
+	if class != "" {
+		return classKey(class)
+	}
+	if v := reflect.ValueOf(l); v.Comparable() && v.Equal(v) {
+		return l
+	}
+	return reflect.TypeOf(l)
+}
+
+// bounded runs f, which takes no context, holding one of permits until f returns,
+// and waits for it only until ctx ends. A panic in f is returned as an error.
+// Results f writes are safe to read once bounded returns nil (the channel send
+// orders them); after a timeout the caller must not read them. done, if not nil,
+// is called once the permit is given back, or at once if none was acquired.
+func (p *Plane) bounded(ctx context.Context, permits chan struct{}, done func(), runID, what string, f func()) error {
+	if done == nil {
+		done = func() {}
+	}
+	select {
+	case permits <- struct{}{}:
+	case <-ctx.Done():
+		done()
+		return fmt.Errorf("control: %s not ready (earlier calls still outstanding): %w", what, ctx.Err())
+	}
+	ch := make(chan error, 1)
+	go func() {
+		defer done()
+		defer func() { <-permits }()
+		defer func() {
+			if rec := recover(); rec != nil {
+				ch <- p.panicked(runID, what, rec)
+			}
+		}()
+		f()
+		ch <- nil
+	}()
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("control: %s not ready: %w", what, ctx.Err())
+	}
+}
+
+// guardCreate calls a provider's Dispatch or Launch, converting a panic into an
+// error. Provider code runs off any request goroutine, where nothing else would
+// recover it, so without this one provider bug ends the controller.
+func (p *Plane) guardCreate(runID, op string, f func() (aei.Handle, error)) (h aei.Handle, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = p.panicked(runID, op, rec)
+		}
+	}()
+	return f()
+}
+
+// await calls the provider's Await and folds its outcome into one Result: a panic
+// or a returned error is a failed run. An Await error means the watch itself broke
+// (it lost the workload, or the substrate API failed), so the run's success is
+// unknown and must not be recorded as success.
+func (p *Plane) await(ctx context.Context, async aei.AsyncLauncher, runID string, h aei.Handle) (res aei.Result) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			res = aei.Result{Err: p.panicked(runID, "Await", rec)}
+		}
+	}()
+	r, err := async.Await(ctx, h)
+	if err != nil && r.Err == nil {
+		r.Err = fmt.Errorf("control: provider watch failed: %w", err)
+	}
+	return r
+}
+
+// panicked logs a recovered panic with its stack and returns the error recorded
+// as the run's failure.
+func (p *Plane) panicked(runID, op string, rec any) error {
+	p.log.Error("provider panicked", "run_id", runID, "op", op, "panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+	return fmt.Errorf("control: provider panicked in %s: %v", op, rec)
+}
+
 // --- completion registry (the callback/watch race) ---
 
 func (p *Plane) arm(runID string) chan aei.Result {
@@ -740,13 +1142,7 @@ type Claims struct {
 // PullCredentialLauncher) a single-use ticket the runtime redeems for the token.
 // A mint error is returned, never collapsed into an empty credential.
 func (p *Plane) mint(launcher aei.Launcher, spec aei.RunSpec) (aei.Credential, error) {
-	claims := Claims{
-		RunID:    spec.ID,
-		Subject:  spec.Identity.Subject,
-		Scopes:   spec.Identity.Scopes,
-		Audience: spec.Identity.Audience,
-		Exp:      p.now().Add(p.tokenTTL).Unix(),
-	}
+	claims := p.claims(spec)
 	if pl, ok := launcher.(aei.PullCredentialLauncher); ok && pl.PullsCredential() {
 		return aei.Credential{Value: p.issueTicket(claims), Kind: aei.Ticket}, nil
 	}
@@ -755,6 +1151,17 @@ func (p *Plane) mint(launcher aei.Launcher, spec aei.RunSpec) (aei.Credential, e
 		return aei.Credential{}, err
 	}
 	return aei.Credential{Value: tok, Kind: aei.Token}, nil
+}
+
+// claims are the run credential's payload for spec.
+func (p *Plane) claims(spec aei.RunSpec) Claims {
+	return Claims{
+		RunID:    spec.ID,
+		Subject:  spec.Identity.Subject,
+		Scopes:   spec.Identity.Scopes,
+		Audience: spec.Identity.Audience,
+		Exp:      p.now().Add(p.tokenTTL).Unix(),
+	}
 }
 
 func (p *Plane) issueTicket(c Claims) string {

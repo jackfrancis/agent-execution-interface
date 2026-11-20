@@ -95,6 +95,41 @@ not change it. `providerClassName` is ignored: the `AgentApp` fixes
 the class. Dispatch is **non-blocking** — the run outlives the request; its
 outcome lands off-API (below).
 
+Dispatch is also **bounded**. The control plane runs at most
+`--max-concurrent-creates` provider creates at once (default 2), across every
+provider and both ingresses, and lets at most `--max-queued-runs` dispatched runs
+wait for one (default 128) — the limits ZZ's orchestrator applied. A run stops
+counting against either limit once its create returns; awaiting completion holds
+no slot. Minting the run credential and the provider's `Dispatch` together get at
+most `--create-timeout` (default 2m); past it the create is abandoned and the run
+fails, so one unavailable substrate or credential backend cannot stall the others.
+A `Dispatch` that ignores cancellation gives up its global slot at the timeout
+anyway; the run keeps waiting for it until its deadline (a workload accepted late
+is watched, not orphaned), and it counts against its own provider class's limit
+of twice `--max-concurrent-creates` in-flight `Dispatch` calls, beyond which that
+provider's next runs are refused at once. A provider without the async capability
+blocks in `Launch` for the whole run, so it holds its slot until `Launch` returns,
+bounded by the run's deadline; such a `Launch` must honor cancellation.
+
+The credential is minted only once the create starts, so time in the queue does
+not spend a pull ticket, and its expiry is set once its call has capacity. Each
+credential backend — the ticket store, the signing authority, and each provider
+class's `PullsCredential` — has at most twice `--max-concurrent-creates` calls
+outstanding, including ones abandoned at the timeout, so an outage in one does not
+stop runs that need only another. Time in the queue does count against the run's
+deadline, which is fixed when the run is submitted. An AgentRun waits in the same
+queue rather than being refused. Beyond the queue limit the request is refused at
+once, with nothing recorded:
+
+```http
+429 Too Many Requests
+Retry-After: 1
+```
+
+The Go SDK returns this as `aeiapp.ErrOverloaded`; back off and retry. The limits
+are global, so one app can still fill the queue for others; per-app limits are
+tracked separately.
+
 ### `GET /aei/v1alpha1/runs/{id}` — read lifecycle
 
 ```http
@@ -137,6 +172,11 @@ the runtime's `/complete` callback against the provider's `Await` and the deadli
 (the same race as `Plane.Run`), and records the first terminal signal into the
 in-memory run store. `GET /runs/{id}` reads that store. Idempotent finish (R4)
 holds: callback and watch may both fire; the first wins.
+
+A provider failure is contained to its run. A panic in `Dispatch`, `Await`, or a
+blocking `Launch` is recovered, logged with its stack, and recorded as a `Failed`
+run (`provider panicked in …`); the controller keeps serving. An error returned by
+`Await` means the watch itself broke, so the run is `Failed`, never `Succeeded`.
 
 ## Tradeoffs (stated, not hidden)
 

@@ -68,6 +68,11 @@ type cachedLauncher struct {
 	driver   string
 }
 
+// overloadRetryAfter is the Retry-After (seconds) sent with a 429 when the control
+// plane's dispatch queue is full. Creates take well under a second each, so a
+// short back-off is enough for the queue to drain.
+const overloadRetryAfter = "1"
+
 // NewHandler builds a dispatch handler over the shared plane, an authenticator,
 // and a Kubernetes client (used to read AgentApp / AgentProviderClass).
 func NewHandler(plane *control.Plane, auth Authenticator, c client.Client) *Handler {
@@ -187,7 +192,14 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	if timedOut(w, r) {
 		return
 	}
-	runID, err := h.plane.Submit(r.Context(), launcher, spec, control.WithProvider(driver))
+	runID, err := h.plane.Submit(r.Context(), launcher, spec, control.WithProvider(driver), control.WithProviderClass(class.Name))
+	if errors.Is(err, control.ErrOverloaded) {
+		// At the dispatch bound: refuse at once so the caller can back off and
+		// retry, rather than queueing without limit. Nothing was recorded.
+		w.Header().Set("Retry-After", overloadRetryAfter)
+		http.Error(w, "dispatch queue full", http.StatusTooManyRequests)
+		return
+	}
 	if err != nil {
 		http.Error(w, "dispatch failed", http.StatusInternalServerError)
 		return

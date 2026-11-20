@@ -513,7 +513,7 @@ func TestQueuedCallbackBeatsProviderCancellation(t *testing.T) {
 		ctx, cancel := withRunDeadline(context.Background(), spec)
 		done := make(chan aei.Result, 1)
 		done <- aei.Result{ResultRef: "cb"}
-		r, _, err := p.race(ctx, &cancelledLaunch{}, spec, done)
+		r, _, err := p.race(ctx, &cancelledLaunch{}, spec, done, func() {}, nil)
 		cancel()
 		if err != nil || r.Err != nil || r.ResultRef != "cb" {
 			t.Fatalf("iteration %d: got (%+v, %v), want the queued callback", i, r, err)

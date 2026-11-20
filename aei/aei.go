@@ -188,6 +188,11 @@ type Credential struct {
 // Launcher is the one required method a provider must satisfy: dispatch a run and
 // report where it landed. This is the whole mandatory contract; async completion
 // and pull-credential identity are optional capabilities below.
+//
+// Launch must return promptly once ctx is done. A plain (non-async) Launch is the
+// whole run, so the control plane holds one of its global create slots until
+// Launch returns; one that ignores cancellation keeps that slot from every other
+// provider.
 type Launcher interface {
 	Launch(ctx context.Context, spec RunSpec, cred Credential) (Handle, error)
 }
@@ -198,6 +203,10 @@ type Launcher interface {
 // substrate (docs/design.md, Completion). An orchestrator prefers it when present:
 // Dispatch runs on the bounded worker pool, Await on its own goroutine. Await must
 // derive everything it needs from the Handle, so it can run with no shared state.
+// Dispatch should return promptly once its ctx is done: the reference control
+// plane cancels it at its create timeout and gives the global create slot to
+// others, but a call that keeps running still counts against its own provider's
+// in-flight limit until it returns.
 type AsyncLauncher interface {
 	Launcher
 	Dispatch(ctx context.Context, spec RunSpec, cred Credential) (Handle, error)

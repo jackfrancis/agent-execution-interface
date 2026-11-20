@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -21,6 +22,11 @@ const (
 	base    = "/aei/v1alpha1"
 	saToken = "/var/run/secrets/kubernetes.io/serviceaccount/token" // #nosec G101 -- path, not a secret
 )
+
+// ErrOverloaded is returned (wrapped) by Dispatch when AEI refuses the run because
+// its dispatch queue is full (HTTP 429). Nothing was dispatched; retry after a
+// back-off. Test for it with errors.Is.
+var ErrOverloaded = errors.New("aeiapp: dispatch overloaded")
 
 // Identity is the delegated authorization a run requests: the acting subject and
 // the scopes. The dispatch endpoint bounds these by the app's AgentApp policy.
@@ -109,6 +115,9 @@ func (c *Client) Dispatch(ctx context.Context, spec Spec) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return "", fmt.Errorf("%w (retry after %qs)", ErrOverloaded, resp.Header.Get("Retry-After"))
+	}
 	if resp.StatusCode != http.StatusAccepted {
 		return "", fmt.Errorf("aeiapp: dispatch: status %d", resp.StatusCode)
 	}
