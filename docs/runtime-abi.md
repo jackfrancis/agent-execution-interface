@@ -340,9 +340,9 @@ func Main(getenv func(string) string, metadata map[string]string,
 
 `Main` sends **one** completion report per run, on either lifecycle (one-shot or
 the durable serve loop), carrying the provisioning and runtime timing it measures
-itself plus whatever `fn` recorded with `SetModelTiming`. So an app that wants
-`model_seconds`, `model_calls` and `tool_calls` on `AgentRun.status.timing` calls
-`rt.SetModelTiming` before `fn` returns and never calls `Complete` itself:
+itself plus whatever `fn` recorded with `SetModelTiming`. So an app that wants its
+model seconds, model calls and tool calls reported calls `rt.SetModelTiming`
+before `fn` returns and never calls `Complete` itself:
 
 ```go
 func myWork(ctx context.Context, rt *aeiruntime.Runtime) error {
@@ -353,12 +353,26 @@ func myWork(ctx context.Context, rt *aeiruntime.Runtime) error {
 ```
 
 A call marks the model stage measured (§3), so a run that made no model calls
-reports `model_seconds: 0` instead of omitting it; a run that never calls it
-omits `model_seconds`. Seconds that are negative, NaN or infinite are not a
-measurement and leave `model_seconds` omitted (the counts are still sent, a
-negative count as `0`), so a bad value cannot make the report unencodable. The
-wire format of `/complete` is unchanged — this only fills fields of the timing
-object (§3) the SDK already sends.
+sends `model_seconds: 0` instead of omitting it; a run that never calls it omits
+`model_seconds`. Seconds that are negative, NaN or infinite are not a measurement
+and leave `model_seconds` omitted, so a bad value cannot make the report
+unencodable. The counts are clamped at `0`, and a zero count is omitted on the
+wire (`model_calls` / `tool_calls` are sent only when positive). The wire format
+of `/complete` is unchanged — this only fills fields of the timing object (§3)
+the SDK already sends.
+
+The same numbers appear under different names depending on where they are read:
+
+| Where | Fields | A measured zero |
+| --- | --- | --- |
+| `/complete` request body (this ABI) | `model_seconds`, `model_calls`, `tool_calls` | `model_seconds: 0` sent; zero counts omitted |
+| controller metrics | `aei_run_duration_seconds{stage="model"}`, `aei_run_model_calls_total`, `aei_run_tool_calls_total` | counts as a `model` histogram sample; a zero count adds nothing |
+| `AgentRun.status.timing` | `modelSeconds`, `modelCalls`, `toolCalls` | **omitted** (the fields are `omitempty`), indistinguishable from unmeasured |
+| dispatch API `GET /runs/{id}` → `timing` | `modelSeconds`, `modelCalls`, `toolCalls` | always present, `0` whether measured or not |
+
+So only the `/complete` body and the metrics tell a measured zero from an
+unmeasured stage; a consumer of `AgentRun` or the dispatch API that needs that
+distinction should read the `stage="model"` histogram instead.
 
 Calling `Complete` from `fn` remains possible — it is the way to publish a
 `result_ref` — but the platform records only the **first** report (R4), so the

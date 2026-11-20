@@ -288,8 +288,9 @@ func (r *Runtime) Vend(ctx context.Context, provider string) (Credential, error)
 // later call may not be reported. A call marks the model stage measured, so a run that made no model
 // calls reports model_seconds 0 rather than omitting it. Seconds that are negative,
 // NaN, or infinite are not a measurement and leave model_seconds omitted (the
-// counts are still sent); a negative count is sent as 0. It affects only the SDK's
-// own report, not a Timing the app passes to Complete.
+// counts are still reported). A negative count is clamped to 0, and a zero count
+// is omitted on the wire like any zero model_calls/tool_calls. It affects only the
+// SDK's own report, not a Timing the app passes to Complete.
 func (r *Runtime) SetModelTiming(seconds float64, modelCalls, toolCalls int) {
 	m := &modelTiming{
 		seconds:    seconds,

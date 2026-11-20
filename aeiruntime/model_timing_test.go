@@ -90,8 +90,10 @@ func wantNumber(t *testing.T, timing map[string]json.RawMessage, key string, wan
 		t.Errorf("timing.%s omitted, want %v (timing %s)", key, want, rawTiming(timing))
 		return
 	}
-	var got float64
-	if err := json.Unmarshal(raw, &got); err != nil || got != want {
+	// A *float64 so a JSON null, which the controller treats as unmeasured, is
+	// not mistaken for a measured zero.
+	var got *float64
+	if err := json.Unmarshal(raw, &got); err != nil || got == nil || *got != want {
 		t.Errorf("timing.%s = %s, want %v", key, raw, want)
 	}
 }
@@ -276,6 +278,11 @@ func postTask(t *testing.T, url, runID, controlURL string) (int, string) {
 func TestServeReportsModelTimingOnceAndFreesSlot(t *testing.T) {
 	cp := newReportControl(t)
 	ack := make(chan struct{})
+	// Acknowledge run-1's report exactly once: at the acknowledgment point below,
+	// or at cleanup if an assertion fails first, so its held handler never blocks
+	// the control server's Close.
+	acknowledge := sync.OnceFunc(func() { close(ack) })
+	t.Cleanup(acknowledge)
 	cp.mu.Lock()
 	cp.hold["run-1"] = ack
 	cp.mu.Unlock()
@@ -304,7 +311,7 @@ func TestServeReportsModelTimingOnceAndFreesSlot(t *testing.T) {
 		t.Fatalf("run-2 before run-1's report was acknowledged: status %d, want 503", code)
 	}
 
-	close(ack)
+	acknowledge()
 	acked := time.Now()
 	for {
 		code, state := postTask(t, actor.URL, "run-2", cp.srv.URL)
