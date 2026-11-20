@@ -206,7 +206,9 @@ func TestCompleteReturnsEncodeErrorImmediately(t *testing.T) {
 	rt := &Runtime{spec: RunSpec{RunID: "run-nan"}, controlURL: srv.URL, cred: "tok", http: srv.Client()}
 
 	done := make(chan error, 1)
-	go func() { done <- rt.Complete(context.Background(), nil, Timing{RuntimeSeconds: math.NaN()}, "") }()
+	// Measured, so the NaN is encoded rather than omitted as an unmeasured stage.
+	nan := Timing{RuntimeSeconds: math.NaN(), Measured: StageRuntime}
+	go func() { done <- rt.Complete(context.Background(), nil, nan, "") }()
 	select {
 	case err := <-done:
 		if err == nil {

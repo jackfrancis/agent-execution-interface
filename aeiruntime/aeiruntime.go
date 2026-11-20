@@ -348,8 +348,8 @@ const (
 
 // oneShotReportPlan is how long a one-shot workload that finishes reporting at
 // now may spend on it, and whether it may retry. AEI_DEADLINE is the controller's
-// own cutoff once the plane stamps it (RunSpec.DeadlineAt); before that it is
-// the provider's dispatch time plus the full budget, slightly later.
+// own cutoff (RunSpec.DeadlineAt, stamped when the plane starts the run's timer),
+// so the exit margin is measured against the deadline the controller enforces.
 func oneShotReportPlan(deadline, now time.Time) (budget time.Duration, retry bool) {
 	if deadline.IsZero() {
 		return oneShotCompletionBudget, true

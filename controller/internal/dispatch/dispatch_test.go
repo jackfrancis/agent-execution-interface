@@ -298,6 +298,7 @@ func TestLauncherCacheKeepsItsDriver(t *testing.T) {
 		t.Errorf("cached launcher driver = %q (same launcher %v), want the cached test-dispatch", driver, again == first)
 	}
 }
+
 // deadlineMux serves the dispatch routes with auth and a fake client whose calls
 // pass through funcs, for the request-deadline tests.
 func deadlineMux(t *testing.T, auth Authenticator, funcs interceptor.Funcs) *http.ServeMux {
