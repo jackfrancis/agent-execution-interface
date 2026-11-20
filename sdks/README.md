@@ -66,7 +66,7 @@ from aei import AeiClient, AgentRunSpec, Identity
 # endpoint + app default from AEI_DISPATCH_URL / AEI_APP. The bearer is read from
 # the file AEI_DISPATCH_TOKEN_PATH names (token_path= overrides it): a ServiceAccount
 # token projected for the "aei-dispatch" audience. Without either, it is the pod's
-# default ServiceAccount token.
+# default ServiceAccount token, which dispatch refuses.
 client = AeiClient(endpoint="http://aei-controller.aei-system.svc:8081", app="pyfer")
 spec = AgentRunSpec(
     parameters={"kind": "converse", "itemId": "org/repo#7", "provider": "github"},

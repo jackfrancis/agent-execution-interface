@@ -1,0 +1,53 @@
+# Keeps everything but registered apps off the dispatch API. Dispatch starts runs
+# and mints their credentials, so a runtime pod (which may run untrusted agent
+# code) must not be able to open a socket to it, even though it cannot pass the
+# TokenReview without a token for the dispatch audience. A NetworkPolicy matches
+# ports, not paths, which is why dispatch has a listener of its own.
+#
+# Selecting the controller pod makes its ingress default-deny; the two rules below
+# are all it admits:
+#   * the http port (8080), the runtime ABI and /metrics, from anywhere: runtime
+#     pods call back from whatever namespace their app runs in, and Prometheus
+#     scrapes it.
+#   * the dispatch port (8081), the dispatch API, only from pods in any namespace labelled
+#     agents.x-k8s.io/dispatch-client: "true". An app labels the pods that
+#     dispatch (its own Deployment or StatefulSet template). A pod AEI creates for
+#     a run (app.kubernetes.io/managed-by: aei) is refused even if it carries the
+#     label; AEI's providers never set it.
+# The rules name the container ports, as the Service does, so an overlay that moves
+# a listener and its named port moves the policy with it. Egress is not restricted. Kubelet probes come from the node and are admitted by
+# common enforcers.
+#
+# Enforcement is up to the cluster's network plugin. One that ignores NetworkPolicy
+# leaves this inert, so it adds to the TokenReview check rather than replacing it.
+# kindnet, kind's default plugin, enforces it (checked with kind v0.33).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aei-controller-ingress
+  namespace: aei-system
+  labels:
+    app.kubernetes.io/name: aei-controller
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aei-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: http
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchExpressions:
+              - key: agents.x-k8s.io/dispatch-client
+                operator: In
+                values: ["true"]
+              - key: app.kubernetes.io/managed-by
+                operator: NotIn
+                values: ["aei"]
+      ports:
+        - protocol: TCP
+          port: dispatch

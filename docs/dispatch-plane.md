@@ -155,20 +155,32 @@ dispatch audience (`aei-dispatch`, set by the controller's `-dispatch-audience`)
 The endpoint validates it via the Kubernetes **TokenReview** API, requesting that
 audience and checking that the review reports it, and extracts the SA identity
 (`system:serviceaccount:<ns>:<name>`). A token minted for any other service is
-refused. There is no shared bearer.
-
-While apps move to the dispatch audience, the controller also accepts a caller's
-default ServiceAccount token (`-accept-legacy-dispatch-tokens`, on by default for
-now). Such a token costs a second TokenReview, and the controller logs each
-ServiceAccount that still sends one, once. Both SDKs read the token from
+refused, and so is the pod's default ServiceAccount token, which every pod carries
+unless it opts out. There is no shared bearer. Both SDKs read the token from
 `AEI_DISPATCH_TOKEN_PATH` when it is set.
 
 The dispatch API has its own listener (`-dispatch-addr`), separate from the runtime
 ABI and `/metrics` on 8080, because a NetworkPolicy matches ports, not paths. Left
 unset, it listens on the ABI listener's host at port 8081, so an ABI bound to one
-interface keeps dispatch on that interface; if the ABI itself is on 8081, dispatch
-stays on the ABI listener alone. For now the 8080 listener also serves the dispatch routes, where apps
-called them before.
+interface keeps dispatch on that interface; an ABI on 8081 itself needs
+`-dispatch-addr`. The ABI listener never serves the dispatch routes.
+
+The install ships a NetworkPolicy (`controller/config/manager/networkpolicy.yaml`)
+that admits anyone to 8080, which runtime pods and Prometheus call, and admits to
+8081 only pods labelled `agents.x-k8s.io/dispatch-client: "true"`, in any namespace.
+An app puts that label on the pod template of whatever dispatches. Pods AEI creates
+for runs never carry it, and the policy refuses them even if they did. The rules
+name the container ports (`http`, `dispatch`), so an overlay that moves a listener
+moves its named port and the policy follows.
+
+The policy is enforced only by a network plugin that implements NetworkPolicy. On
+one that does not, applying it succeeds and changes nothing: runtime pods can then
+connect to the dispatch port, and only the TokenReview refuses them. kind's kindnet
+enforces it. AKS does not unless the cluster was created with a network policy
+engine: `az aks create`, and the repo's `make create-aks` with it, leaves the engine
+at `none`. Choose one when creating the cluster (for Linux node pools AKS recommends
+Azure CNI powered by Cilium) and check that it applies to the pods your runs use,
+Kata VM pods included. `make create-aks` reports the cluster's engine.
 
 Authorization is then the `AgentApp` policy:
 

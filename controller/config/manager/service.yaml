@@ -2,8 +2,8 @@
 #   * http (8080)     — the runtime ABI, AEI_CONTROL_URL / AEI_BROKER_URL
 #                       (/complete, /redeem, /vend, /authority), and /metrics
 #   * dispatch (8081) — the data plane, AEI_DISPATCH_URL (/dispatch, /runs/{id})
-# Separate ports let a NetworkPolicy admit runtime pods to the ABI while keeping
-# them away from dispatch. Until apps move to 8081, 8080 also serves dispatch.
+# Separate ports let a NetworkPolicy (networkpolicy.yaml) admit runtime pods to the
+# ABI while keeping them away from dispatch.
 apiVersion: v1
 kind: Service
 metadata:
