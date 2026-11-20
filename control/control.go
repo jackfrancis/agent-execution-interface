@@ -575,15 +575,45 @@ func (p *Plane) finishRun(runID string, res aei.Result) RunState {
 	return st
 }
 
-// persistBounded records res as runID's outcome (first writer wins), holding a
-// Store permit and waiting at most maxCommitGrace. A write still outstanding then
-// completes in the background.
-func (p *Plane) persistBounded(runID string, res aei.Result) {
-	ctx, cancel := context.WithTimeout(context.Background(), maxCommitGrace)
-	defer cancel()
-	if err := p.bounded(ctx, p.storeCalls, nil, runID, "run status commit", func() { p.finishRun(runID, res) }); err != nil {
-		p.log.Warn("run outcome not yet recorded in the store", "run_id", runID, "error", err.Error())
-	}
+// recordTimeout bounds a terminal write that no caller is waiting on: how long
+// record waits for a Store permit and then for the write. It sits inside the
+// runtime SDK's 30s request timeout (aeiruntime), so a /redeem that waits for its
+// write still answers the runtime.
+const recordTimeout = 20 * time.Second
+
+// recorded is what the Store holds for a run after record's write: st, and
+// whether this write won. ok is false when the write did not finish within
+// recordTimeout.
+type recorded struct {
+	st      RunState
+	won, ok bool
+}
+
+// record commits res as runID's outcome through the Store (first writer wins) on
+// its own goroutine, bounded by recordTimeout and holding a Store permit, so no
+// caller's cancellation or impatience can stop the outcome from being recorded.
+// The returned channel (buffered) delivers the result once the write finishes or
+// the bound ends; a caller may stop waiting for it at any time.
+func (p *Plane) record(runID string, res aei.Result) <-chan recorded {
+	out := make(chan recorded, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+		defer cancel()
+		// The worker writes only these, and they are read only once bounded
+		// reports the worker finished: a write that completes after the bound
+		// writes to storage nothing reads.
+		var (
+			st  RunState
+			won bool
+		)
+		if err := p.bounded(ctx, p.storeCalls, nil, runID, "run status commit", func() { st, won = p.commit(runID, res) }); err != nil {
+			p.log.Warn("run outcome not yet recorded in the store", "run_id", runID, "error", err.Error())
+			out <- recorded{}
+			return
+		}
+		out <- recorded{st: st, won: won, ok: true}
+	}()
+	return out
 }
 
 // stateOf is the RunState the Store records for res.
@@ -919,29 +949,24 @@ const (
 // mint. That makes Run's result and GET /runs/{id} the same outcome however the
 // signals interleaved, including one recorded just before the deadline.
 //
-// Run waits for the commit at most the commit grace past the run's deadline,
-// and never past callerCtx (the Run caller's own context, which the grace cannot
-// extend). The commit holds a Store permit, so a Store outage cannot hold Run or
-// pile up calls; when it does not finish in time Run keeps its own result (ok is
-// false), which is all this replica can know while the Store does not answer.
+// The write itself is record's, independent of Run's caller: a caller that
+// cancels, or a Store slower than Run waits, still leaves the outcome recorded
+// for Status. Run only waits for it, at most the commit grace past the run's
+// deadline and never past callerCtx (the Run caller's own context, which the
+// grace cannot extend). When the write has not finished by then Run keeps its
+// own result (ok is false), which is all this replica can know while the Store
+// does not answer.
 func (p *Plane) commitRun(callerCtx context.Context, spec aei.RunSpec, res aei.Result) (st RunState, won, ok bool) {
+	written := p.record(spec.ID, res)
 	grace := min(max(spec.Deadline/10, minCommitGrace), maxCommitGrace)
-	cctx, cancel := context.WithTimeout(callerCtx, grace)
+	wait, cancel := context.WithTimeout(callerCtx, grace)
 	defer cancel()
-	// The worker writes only got, and got is read only once bounded reports the
-	// worker finished: a commit that completes after the wait gave up writes to
-	// storage nothing reads.
-	var got struct {
-		st  RunState
-		won bool
-	}
-	if err := p.bounded(cctx, p.storeCalls, nil, spec.ID, "run status commit", func() { got.st, got.won = p.commit(spec.ID, res) }); err != nil {
-		if callerCtx.Err() == nil {
-			p.log.Warn("run outcome not committed to the store; reporting this replica's", "run_id", spec.ID, "error", err.Error())
-		}
+	select {
+	case r := <-written:
+		return r.st, r.won, r.ok
+	case <-wait.Done():
 		return RunState{}, false, false
 	}
-	return got.st, got.won, true
 }
 
 // resultOf turns a recorded terminal RunState back into the Result it came from.
@@ -1203,7 +1228,9 @@ func (p *Plane) issueTicket(c Claims) string {
 // redeem consumes a single-use ticket and mints the run token it was issued for,
 // preserving the run id so completion still correlates. A mint error fails the
 // run (the ticket is already spent, so the runtime cannot retry) and is returned.
-func (p *Plane) redeem(id string) (string, int, bool, error) {
+// ctx is the runtime's request: redeem stops waiting for the failure's Store
+// write when it ends.
+func (p *Plane) redeem(ctx context.Context, id string) (string, int, bool, error) {
 	c, ok := p.store.RedeemTicket(id, p.now())
 	if !ok {
 		return "", 0, false, nil
@@ -1214,11 +1241,17 @@ func (p *Plane) redeem(id string) (string, int, bool, error) {
 		// Deliver the known failure first: a run waiting on this replica ends
 		// with it at once, whatever the Store is doing.
 		p.fire(c.RunID, res)
-		// Then record it for GET /runs/{id} and peer replicas before answering
-		// the runtime, so the provider's report of the 500 ("redeem status 500")
-		// cannot reach the Store first. The write is bounded like Run's commit:
-		// a stalled Store delays this answer by at most the commit grace.
-		p.persistBounded(c.RunID, res)
+		// Then record it for GET /runs/{id} and peer replicas, and answer the
+		// runtime only once the write has landed: the provider learns of the
+		// failure from that answer, so its report ("redeem status 500") then
+		// reaches the Store second and the signing cause stays the run's
+		// outcome on every replica, for any write that lands within
+		// recordTimeout. The wait ends with the runtime's request or that
+		// bound; the write itself continues either way.
+		select {
+		case <-p.record(c.RunID, res):
+		case <-ctx.Done():
+		}
 		return "", 0, true, err
 	}
 	ttl := int(time.Unix(c.Exp, 0).Sub(p.now()).Seconds())
@@ -1472,7 +1505,7 @@ func (p *Plane) handleRedeem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	tok, ttl, ok, err := p.redeem(body.Ticket)
+	tok, ttl, ok, err := p.redeem(r.Context(), body.Ticket)
 	if !ok {
 		http.Error(w, "invalid ticket", http.StatusUnauthorized) // coarse: unknown/spent/expired alike
 		return

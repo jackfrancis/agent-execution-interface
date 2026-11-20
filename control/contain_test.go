@@ -512,7 +512,7 @@ func TestTicketMintedAfterQueueWait(t *testing.T) {
 	if cred.Kind != aei.Ticket {
 		t.Fatalf("credential kind = %v, want a ticket", cred.Kind)
 	}
-	if _, _, ok, err := p.redeem(cred.Value); !ok || err != nil {
+	if _, _, ok, err := p.redeem(context.Background(), cred.Value); !ok || err != nil {
 		t.Fatalf("ticket minted for a queued run had already expired when its create started (ok=%v, err=%v)", ok, err)
 	}
 }
@@ -777,7 +777,7 @@ func TestCredentialExpirySetAfterPermitWait(t *testing.T) {
 			if tc.pull {
 				var ok bool
 				var err error
-				if tok, _, ok, err = p.redeem(cred.Value); !ok || err != nil {
+				if tok, _, ok, err = p.redeem(context.Background(), cred.Value); !ok || err != nil {
 					t.Fatalf("ticket did not redeem (ok=%v, err=%v)", ok, err)
 				}
 			}

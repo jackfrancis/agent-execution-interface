@@ -1,8 +1,10 @@
 package control
 
 import (
+	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -131,7 +133,12 @@ func (o *recordingObserver) snapshot() []RunObservation {
 // run's deadline, after Submit returns) and returns its state.
 func waitFailed(t *testing.T, p *Plane, id string) RunState {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	return waitFailedWithin(t, p, id, 2*time.Second)
+}
+
+func waitFailedWithin(t *testing.T, p *Plane, id string, within time.Duration) RunState {
+	t.Helper()
+	deadline := time.Now().Add(within)
 	for {
 		if st, _ := p.Status(id); st.Phase == phaseFailed {
 			return st
@@ -216,8 +223,8 @@ type redeemingDispatcher struct {
 }
 
 func (redeemingDispatcher) PullsCredential() bool { return true }
-func (d redeemingDispatcher) Dispatch(_ context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
-	if _, _, ok, err := d.p.redeem(cred.Value); !ok || err != nil {
+func (d redeemingDispatcher) Dispatch(ctx context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
+	if _, _, ok, err := d.p.redeem(ctx, cred.Value); !ok || err != nil {
 		return aei.Handle{}, errors.New("redeem status 500")
 	}
 	return aei.Handle{Ref: spec.ID}, nil
@@ -326,7 +333,7 @@ func (lateAckDispatcher) PullsCredential() bool { return true }
 func (d lateAckDispatcher) Dispatch(_ context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
 	go func() {
 		time.Sleep(cmp.Or(d.recordAfter, 30*time.Millisecond))
-		d.receiver.redeem(cred.Value) // fails to mint; records the failure in the shared Store
+		d.receiver.redeem(context.Background(), cred.Value) // fails to mint; records the failure in the shared Store
 	}()
 	time.Sleep(d.ackAfter) // ignores cancellation, like a slow provider
 	return aei.Handle{}, errors.New("redeem status 500")
@@ -543,8 +550,8 @@ func (s hungFinishStore) FinishRun(id string, st RunState) bool {
 }
 
 // A failed /redeem delivers the failure to this replica's waiting run at once,
-// even when the Store write hangs, and still answers the runtime (500) within the
-// bound.
+// even when the Store write hangs, and stops waiting for that write when the
+// runtime's request ends.
 func TestRedeemFailureWakesLocalRunDespiteStalledStore(t *testing.T) {
 	st := hungFinishStore{newMemStore(), make(chan struct{})}
 	defer close(st.release)
@@ -560,18 +567,18 @@ func TestRedeemFailureWakesLocalRunDespiteStalledStore(t *testing.T) {
 		t.Fatalf("Run err = %v; want the signing failure, not the deadline", res.Err)
 	}
 
-	// The runtime's /redeem itself is answered within the commit bound.
-	cred := mustMint(t, p, &fakePull{}, aei.RunSpec{ID: "redeem-stall-http"})
-	srv := httptest.NewServer(p.Handler())
-	defer srv.Close()
+	// The runtime's /redeem waits for the write, but no longer than its request.
+	cred := mustMint(t, p, &fakePull{}, aei.RunSpec{ID: "redeem-stall-req"})
+	const requestLife = 100 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), requestLife)
+	defer cancel()
 	start = time.Now()
-	resp := post(t, srv.URL+"/aei/v1alpha1/redeem", "", map[string]string{"ticket": cred.Value})
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Errorf("redeem status = %d; want 500", resp.StatusCode)
+	_, _, ok, err := p.redeem(ctx, cred.Value)
+	if !ok || !errors.Is(err, errSigningKey) {
+		t.Errorf("redeem = (ok %v, %v); want the signing failure", ok, err)
 	}
-	if elapsed := time.Since(start); elapsed > maxCommitGrace+500*time.Millisecond {
-		t.Errorf("redeem answered after %v; want within the commit bound", elapsed)
+	if elapsed := time.Since(start); elapsed > requestLife+300*time.Millisecond {
+		t.Errorf("redeem answered after %v; want when its %v request ended", elapsed, requestLife)
 	}
 }
 
@@ -584,5 +591,96 @@ func TestLocalRedeemFailureKeepsIssuerError(t *testing.T) {
 		if !errors.Is(res.Err, errSigningKey) {
 			t.Fatalf("run %d: errors.Is(%v, errSigningKey) = false; the issuer's error was lost", i, res.Err)
 		}
+	}
+}
+
+// enteringLauncher is a plain provider that reports entering Launch, then runs
+// until its context ends.
+type enteringLauncher struct{ entered chan struct{} }
+
+func (l enteringLauncher) Launch(ctx context.Context, spec aei.RunSpec, _ aei.Credential) (aei.Handle, error) {
+	close(l.entered)
+	<-ctx.Done()
+	return aei.Handle{Ref: spec.ID}, ctx.Err()
+}
+
+// A Run whose caller cancels once the provider is running still records its
+// outcome: the caller's wait ends at once, and Status learns the outcome
+// afterwards, with a healthy Store, every time.
+func TestCanceledRunIsStillRecorded(t *testing.T) {
+	p := New(Config{Secret: []byte("k"), Logger: quietLog})
+	const n = 30
+	var wg sync.WaitGroup
+	for i := range n {
+		ctx, cancel := context.WithCancel(context.Background())
+		entered := make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, _ := p.Run(ctx, enteringLauncher{entered}, aei.RunSpec{ID: fmt.Sprintf("canceled-%d", i), Deadline: time.Minute})
+			if !errors.Is(res.Err, context.Canceled) {
+				t.Errorf("run %d: Run err = %v; want the caller's cancellation", i, res.Err)
+			}
+		}()
+		<-entered
+		start := time.Now()
+		cancel()
+		wg.Wait() // this caller has returned
+		if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
+			t.Errorf("run %d: Run returned %v after its caller canceled; want at once", i, elapsed)
+		}
+	}
+	for i := range n {
+		if st := waitFailed(t, p, fmt.Sprintf("canceled-%d", i)); !strings.Contains(st.Err, "canceled") {
+			t.Errorf("run %d: Status err = %q; want the cancellation", i, st.Err)
+		}
+	}
+}
+
+// httpRedeemer is a pull provider whose runtime redeems its ticket over HTTP at
+// a peer replica during Dispatch and, as a real provider does, reports only the
+// HTTP status when that fails.
+type httpRedeemer struct {
+	fakeWatch
+	peerURL string
+}
+
+func (httpRedeemer) PullsCredential() bool { return true }
+func (d httpRedeemer) Dispatch(ctx context.Context, spec aei.RunSpec, cred aei.Credential) (aei.Handle, error) {
+	b, _ := json.Marshal(map[string]string{"ticket": cred.Value})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, d.peerURL+"/aei/v1alpha1/redeem", bytes.NewReader(b))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return aei.Handle{}, err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return aei.Handle{}, fmt.Errorf("redeem status %d", resp.StatusCode)
+	}
+	return aei.Handle{Ref: spec.ID}, nil
+}
+
+// When the redeeming replica's Store write is slower than Run's commit grace,
+// the signing failure is still the run's outcome on the dispatching replica —
+// in Run's result and in Status, for Run and Submit — rather than the
+// provider's "redeem status 500".
+func TestSlowPeerWriteKeepsSigningCause(t *testing.T) {
+	shared := newMemStore()
+	dispatcher := New(Config{Authority: failingAuthority{}, Store: shared, Logger: quietLog})
+	receiver := New(Config{Authority: failingAuthority{}, Store: slowFinishStore{shared, maxCommitGrace + 200*time.Millisecond}, Logger: quietLog})
+	srv := httptest.NewServer(receiver.Handler())
+	defer srv.Close()
+
+	res, _ := dispatcher.Run(context.Background(), &httpRedeemer{peerURL: srv.URL}, aei.RunSpec{ID: "slow-peer", Deadline: 10 * time.Second})
+	if !strings.Contains(fmt.Sprint(res.Err), "signing key unavailable") {
+		t.Errorf("Run err = %v; want the signing failure", res.Err)
+	}
+	if st, _ := dispatcher.Status("slow-peer"); !strings.Contains(st.Err, "signing key unavailable") {
+		t.Errorf("Status err = %q; want the signing failure", st.Err)
+	}
+
+	id, _ := dispatcher.Submit(context.Background(), &httpRedeemer{peerURL: srv.URL}, aei.RunSpec{ID: "slow-peer-submit", Deadline: 10 * time.Second})
+	if st := waitFailedWithin(t, dispatcher, id, 5*time.Second); !strings.Contains(st.Err, "signing key unavailable") {
+		t.Errorf("Submit Status err = %q; want the signing failure", st.Err)
 	}
 }
