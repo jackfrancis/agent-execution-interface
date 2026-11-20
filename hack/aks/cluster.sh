@@ -630,6 +630,26 @@ EOF
 	# a claim on it is ReadWriteOnce.
 	say "default StorageClass (for apps' PersistentVolumeClaims)"
 	kc get storageclass -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}    {.metadata.name}: {.provisioner}, {.parameters.skuname}, reclaim {.reclaimPolicy}, binding {.volumeBindingMode}{"\n"}{end}'
+
+	# AEI ships a NetworkPolicy that keeps runtime pods off its dispatch port
+	# (controller/config/manager/networkpolicy.yaml). AKS enforces NetworkPolicy only
+	# when the cluster has a policy engine, and az aks create leaves it at none unless
+	# told otherwise, which is what this script does. Report it rather than change a
+	# cluster's networking: the engine is a creation-time choice.
+	say "network policy engine (enforces AEI's dispatch NetworkPolicy)"
+	local policy=""
+	dry || policy="$(az aks show --subscription "${SUB}" -g "${AKS_RESOURCE_GROUP}" -n "${AKS_CLUSTER}" \
+		--query networkProfile.networkPolicy -o tsv 2>/dev/null || true)"
+	case "${policy}" in
+		""|none)
+			echo "    ${policy:-unknown}. AEI's NetworkPolicy is accepted but NOT enforced here: runtime pods can"
+			echo "    connect to the dispatch port (8081), where only the TokenReview for the aei-dispatch"
+			echo "    audience refuses them. For the network-layer restriction too, create the cluster with"
+			echo "    a policy engine (for Linux pools AKS recommends Azure CNI powered by Cilium), and check"
+			echo "    that it applies to Kata pods: https://learn.microsoft.com/azure/aks/use-network-policies" ;;
+		*)
+			echo "    ${policy}" ;;
+	esac
 }
 
 next_steps() {

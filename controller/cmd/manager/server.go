@@ -18,26 +18,45 @@ import (
 const defaultDispatchPort = "8081"
 
 // resolveDispatchAddr picks the dispatch listener's address. An explicit
-// -dispatch-addr is used as given, and must differ from -abi-addr. Without one,
-// dispatch listens on the ABI listener's host at defaultDispatchPort, so an
-// installation that binds the ABI to one interface (say loopback) keeps dispatch
-// on that interface. An ABI already on that port needs -dispatch-addr: dispatch is
-// never served on the ABI listener, which runtime pods can reach.
+// -dispatch-addr is used as given. Without one, dispatch listens on the ABI
+// listener's host at defaultDispatchPort, so an installation that binds the ABI to
+// one interface (say loopback) keeps dispatch on that interface.
+//
+// Either way the two listeners must use different ports, whatever their hosts: a
+// NetworkPolicy admits traffic by port, so dispatch on the ABI's port (on another
+// address of the pod, say its IPv6 one) would be open to everything the ABI is,
+// runtime pods included.
 func resolveDispatchAddr(abiAddr, dispatchAddr string) (string, error) {
-	if dispatchAddr != "" {
-		if dispatchAddr == abiAddr {
-			return "", fmt.Errorf("-dispatch-addr %q must differ from -abi-addr", dispatchAddr)
-		}
-		return dispatchAddr, nil
-	}
-	host, port, err := net.SplitHostPort(abiAddr)
+	abiHost, abiPort, err := splitPort("-abi-addr", abiAddr)
 	if err != nil {
-		return "", fmt.Errorf("-abi-addr %q: %w", abiAddr, err)
+		return "", err
 	}
-	if port == defaultDispatchPort {
-		return "", fmt.Errorf("-abi-addr %q uses the default dispatch port %s; set -dispatch-addr to another address", abiAddr, defaultDispatchPort)
+	if dispatchAddr == "" {
+		dispatchAddr = net.JoinHostPort(abiHost, defaultDispatchPort)
 	}
-	return net.JoinHostPort(host, defaultDispatchPort), nil
+	_, dispatchPort, err := splitPort("-dispatch-addr", dispatchAddr)
+	if err != nil {
+		return "", err
+	}
+	if dispatchPort == abiPort {
+		return "", fmt.Errorf("-dispatch-addr %q and -abi-addr %q use the same port %d; dispatch needs a port of its own (set -dispatch-addr)",
+			dispatchAddr, abiAddr, abiPort)
+	}
+	return dispatchAddr, nil
+}
+
+// splitPort splits a listen address and resolves its port, which may be a
+// service name such as "http", to a number.
+func splitPort(flagName, addr string) (host string, port int, err error) {
+	host, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, fmt.Errorf("%s %q: %w", flagName, addr, err)
+	}
+	port, err = net.LookupPort("tcp", p)
+	if err != nil {
+		return "", 0, fmt.Errorf("%s %q: %w", flagName, addr, err)
+	}
+	return host, port, nil
 }
 
 // newMuxes builds the handlers for the two listeners. The ABI listener carries the

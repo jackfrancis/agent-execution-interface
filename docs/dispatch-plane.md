@@ -169,9 +169,18 @@ The install ships a NetworkPolicy (`controller/config/manager/networkpolicy.yaml
 that admits anyone to 8080, which runtime pods and Prometheus call, and admits to
 8081 only pods labelled `agents.x-k8s.io/dispatch-client: "true"`, in any namespace.
 An app puts that label on the pod template of whatever dispatches. Pods AEI creates
-for runs never carry it, and the policy refuses them even if they did. The policy
-needs a network plugin that enforces NetworkPolicy, as kind's kindnet does; on one
-that ignores it the policy is inert and the TokenReview check stands alone.
+for runs never carry it, and the policy refuses them even if they did. The rules
+name the container ports (`http`, `dispatch`), so an overlay that moves a listener
+moves its named port and the policy follows.
+
+The policy is enforced only by a network plugin that implements NetworkPolicy. On
+one that does not, applying it succeeds and changes nothing: runtime pods can then
+connect to the dispatch port, and only the TokenReview refuses them. kind's kindnet
+enforces it. AKS does not unless the cluster was created with a network policy
+engine: `az aks create`, and the repo's `make create-aks` with it, leaves the engine
+at `none`. Choose one when creating the cluster (for Linux node pools AKS recommends
+Azure CNI powered by Cilium) and check that it applies to the pods your runs use,
+Kata VM pods included. `make create-aks` reports the cluster's engine.
 
 Authorization is then the `AgentApp` policy:
 

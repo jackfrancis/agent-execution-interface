@@ -42,8 +42,9 @@ spec:
           # Dispatch listens on -dispatch-addr, which is left unset on purpose: it
           # then takes the -abi-addr host on port 8081, so an overlay that rebinds
           # the ABI (to loopback, say) moves dispatch with it rather than leaving it
-          # on every interface. Set it only to put dispatch somewhere else, and keep
-          # networkpolicy.yaml's ports in step with these.
+          # on every interface. Set it only to put dispatch somewhere else, and move
+          # the named container port with it: the Service and networkpolicy.yaml
+          # refer to the ports by name.
           args: ["-abi-addr=:8080"]
           ports:
             - name: http

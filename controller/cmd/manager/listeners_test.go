@@ -91,8 +91,8 @@ func TestListenersSplitRoutes(t *testing.T) {
 }
 
 // TestResolveDispatchAddr: without -dispatch-addr, dispatch keeps the ABI
-// listener's bind host on port 8081. An ABI already on 8081 is refused rather
-// than sharing a listener with dispatch.
+// listener's bind host on port 8081. The two listeners never share a port, even
+// on different hosts, since a NetworkPolicy admits by port.
 func TestResolveDispatchAddr(t *testing.T) {
 	cases := []struct {
 		abi, dispatch string
@@ -104,9 +104,15 @@ func TestResolveDispatchAddr(t *testing.T) {
 		{abi: "[::1]:8080", want: "[::1]:8081"},
 		{abi: "127.0.0.1:8080", dispatch: "0.0.0.0:9000", want: "0.0.0.0:9000"},
 		{abi: ":8081", dispatch: ":9000", want: ":9000"},
+		{abi: "10.0.0.5:8080", dispatch: "[fd00::5]:8081", want: "[fd00::5]:8081"},
 		{abi: ":8081", wantErr: true},
 		{abi: "127.0.0.1:8081", wantErr: true},
 		{abi: ":8080", dispatch: ":8080", wantErr: true},
+		{abi: "10.0.0.5:8080", dispatch: "[fd00::5]:8080", wantErr: true}, // dual-stack pod, same port
+		{abi: "127.0.0.1:8080", dispatch: "0.0.0.0:8080", wantErr: true},
+		{abi: ":http", want: ":8081"},
+		{abi: ":http", dispatch: ":80", wantErr: true}, // a service name resolves to its number
+		{abi: ":8080", dispatch: "no-port", wantErr: true},
 		{abi: "no-port", wantErr: true},
 	}
 	for _, tc := range cases {
