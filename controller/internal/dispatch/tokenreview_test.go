@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr/funcr"
 	authnv1 "k8s.io/api/authentication/v1"
@@ -231,10 +232,15 @@ func TestDispatchAudienceOverHTTP(t *testing.T) {
 			resp := do(t, http.MethodPost, url, tok, body)
 			_ = resp.Body.Close()
 			if resp.StatusCode != code {
-				t.Errorf("acceptLegacy=%v %s: status = %d, want %d", acceptLegacy, tok, resp.StatusCode, code)
+				t.Fatalf("acceptLegacy=%v %s: status = %d, want %d", acceptLegacy, tok, resp.StatusCode, code)
 			}
 			if code == http.StatusAccepted {
-				<-testLauncher.dispatched // the run reached the provider; drain its credential
+				// The run reached the provider; drain its credential.
+				select {
+				case <-testLauncher.dispatched:
+				case <-time.After(5 * time.Second):
+					t.Fatalf("acceptLegacy=%v %s: accepted, but no run reached the provider", acceptLegacy, tok)
+				}
 			}
 		}
 	}

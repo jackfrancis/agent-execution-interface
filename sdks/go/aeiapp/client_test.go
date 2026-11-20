@@ -131,3 +131,44 @@ func TestTokenPath(t *testing.T) {
 		t.Errorf("default token path = %q, want %q", c.tokenPath, DefaultTokenPath)
 	}
 }
+
+// TestMissingTokenFile: a configured token path that cannot be read fails the call
+// with the path and the OS error, before anything is sent; Wait stops at once
+// rather than polling until its context ends. An unreadable default path, as off
+// cluster, still sends the request without a bearer.
+func TestMissingTokenFile(t *testing.T) {
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_ = json.NewEncoder(w).Encode(Result{Phase: "Running"})
+	}))
+	defer srv.Close()
+	missing := filepath.Join(t.TempDir(), "not-mounted", "token")
+
+	check := func(name string, c *Client) {
+		t.Helper()
+		_, err := c.Dispatch(context.Background(), Spec{TaskRef: "x"})
+		if !errors.Is(err, ErrTokenFile) || !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), missing) {
+			t.Errorf("%s: Dispatch err = %v, want ErrTokenFile naming %s", name, err, missing)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := c.Wait(ctx, "r", 10*time.Millisecond); !errors.Is(err, ErrTokenFile) {
+			t.Errorf("%s: Wait err = %v, want ErrTokenFile", name, err)
+		}
+	}
+	t.Setenv(TokenPathEnv, "")
+	check("WithTokenPath", New(srv.URL, "a", WithTokenPath(missing)))
+	t.Setenv(TokenPathEnv, missing)
+	check(TokenPathEnv, New(srv.URL, "a"))
+	if requests != 0 {
+		t.Errorf("%d requests sent without a readable token file", requests)
+	}
+
+	t.Setenv(TokenPathEnv, "")
+	c := New(srv.URL, "a")
+	c.tokenPath = missing // stands in for an absent default ServiceAccount token
+	if _, err := c.Get(context.Background(), "r"); err != nil {
+		t.Errorf("unreadable default token path: Get err = %v, want the request sent", err)
+	}
+}

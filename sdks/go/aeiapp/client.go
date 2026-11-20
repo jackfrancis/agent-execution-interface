@@ -34,6 +34,12 @@ const (
 // back-off. Test for it with errors.Is.
 var ErrOverloaded = errors.New("aeiapp: dispatch overloaded")
 
+// ErrTokenFile is returned (wrapped, with the path and the OS error) when the
+// token file set by WithTokenPath or AEI_DISPATCH_TOKEN_PATH cannot be read, such
+// as a projected volume that is not mounted. Nothing is sent. Test for it with
+// errors.Is.
+var ErrTokenFile = errors.New("aeiapp: read token file")
+
 // Identity is the delegated authorization a run requests: the acting subject and
 // the scopes. The dispatch endpoint bounds these by the app's AgentApp policy.
 type Identity struct {
@@ -81,7 +87,10 @@ type Client struct {
 	app       string
 	token     string
 	tokenPath string
-	http      *http.Client
+	// tokenPathSet records that tokenPath was configured, not defaulted, so a
+	// failure to read it is an error rather than an empty bearer.
+	tokenPathSet bool
+	http         *http.Client
 }
 
 // Option configures a Client.
@@ -93,7 +102,9 @@ func WithToken(t string) Option { return func(c *Client) { c.token = t } }
 // WithTokenPath reads the bearer from the file at path, such as a ServiceAccount
 // token projected for the dispatch API's audience. The client re-reads the file on
 // every request, so a token the kubelet rotates is picked up. Without it the path
-// comes from AEI_DISPATCH_TOKEN_PATH, else DefaultTokenPath.
+// comes from AEI_DISPATCH_TOKEN_PATH, else DefaultTokenPath. A configured path that
+// cannot be read fails the request with ErrTokenFile; an unreadable default path
+// sends no bearer.
 func WithTokenPath(path string) Option { return func(c *Client) { c.tokenPath = path } }
 
 // WithHTTPClient injects an HTTP client (tests, custom transport/TLS).
@@ -109,7 +120,8 @@ func New(endpoint, app string, opts ...Option) *Client {
 	if c.tokenPath == "" {
 		c.tokenPath = strings.TrimSpace(os.Getenv(TokenPathEnv))
 	}
-	if c.tokenPath == "" {
+	c.tokenPathSet = c.tokenPath != ""
+	if !c.tokenPathSet {
 		c.tokenPath = DefaultTokenPath
 	}
 	return c
@@ -128,7 +140,9 @@ func (c *Client) Dispatch(ctx context.Context, spec Spec) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c.authorize(req)
+	if err := c.authorize(req); err != nil {
+		return "", err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return "", err
@@ -155,7 +169,9 @@ func (c *Client) Get(ctx context.Context, runID string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	c.authorize(req)
+	if err := c.authorize(req); err != nil {
+		return Result{}, err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return Result{}, err
@@ -172,7 +188,9 @@ func (c *Client) Get(ctx context.Context, runID string) (Result, error) {
 }
 
 // Wait polls a run until it reaches a terminal phase or ctx is done. It tracks
-// completion only; the run's result lands in the app's own store.
+// completion only; the run's result lands in the app's own store. A failed poll is
+// retried at the next tick, except an unreadable token file (ErrTokenFile), which
+// retrying cannot fix.
 func (c *Client) Wait(ctx context.Context, runID string, poll time.Duration) (Result, error) {
 	if poll <= 0 {
 		poll = 2 * time.Second
@@ -180,8 +198,12 @@ func (c *Client) Wait(ctx context.Context, runID string, poll time.Duration) (Re
 	t := time.NewTicker(poll)
 	defer t.Stop()
 	for {
-		if r, err := c.Get(ctx, runID); err == nil && r.Done() {
+		r, err := c.Get(ctx, runID)
+		if err == nil && r.Done() {
 			return r, nil
+		}
+		if errors.Is(err, ErrTokenFile) {
+			return Result{Phase: "Failed", Message: err.Error()}, err
 		}
 		select {
 		case <-ctx.Done():
@@ -191,16 +213,25 @@ func (c *Client) Wait(ctx context.Context, runID string, poll time.Duration) (Re
 	}
 }
 
-func (c *Client) authorize(req *http.Request) {
-	req.Header.Set("Authorization", "Bearer "+c.bearer())
+func (c *Client) authorize(req *http.Request) error {
+	b, err := c.bearer()
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+b)
+	return nil
 }
 
-func (c *Client) bearer() string {
+func (c *Client) bearer() (string, error) {
 	if c.token != "" {
-		return c.token
+		return c.token, nil
 	}
-	if b, err := os.ReadFile(c.tokenPath); err == nil {
-		return strings.TrimSpace(string(b))
+	b, err := os.ReadFile(c.tokenPath)
+	if err != nil {
+		if c.tokenPathSet {
+			return "", fmt.Errorf("%w %s: %w", ErrTokenFile, c.tokenPath, err)
+		}
+		return "", nil // off-cluster with no token configured: send no bearer
 	}
-	return ""
+	return strings.TrimSpace(string(b)), nil
 }

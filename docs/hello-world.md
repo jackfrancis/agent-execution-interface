@@ -107,6 +107,9 @@ volumes:
 ```
 
 The kubelet rotates the token in place, and the SDKs re-read it on every request.
+If a configured path cannot be read (say the volume is not mounted), the call fails
+with that path and the OS error (`aeiapp.ErrTokenFile`, Python `TokenFileError`)
+instead of sending no token.
 
 ---
 

@@ -41,7 +41,7 @@ func main() {
 	var acceptLegacyTokens bool
 	var runDefaultTimeout, runMaxTimeout time.Duration
 	flag.StringVar(&abiAddr, "abi-addr", ":8080", "address to serve the runtime ABI (/complete, /redeem, /vend, /authority) and /metrics")
-	flag.StringVar(&dispatchAddr, "dispatch-addr", ":8081", "address to serve the dispatch API (/dispatch, /runs/{id}) on its own listener, so a NetworkPolicy can restrict it by port")
+	flag.StringVar(&dispatchAddr, "dispatch-addr", "", "address to serve the dispatch API (/dispatch, /runs/{id}) on its own listener, so a NetworkPolicy can restrict it by port (default: the -abi-addr host on port 8081)")
 	flag.StringVar(&dispatchAudience, "dispatch-audience", dispatch.DefaultAudience, "token audience the dispatch API requests in its TokenReview; callers project a ServiceAccount token for it")
 	flag.BoolVar(&acceptLegacyTokens, "accept-legacy-dispatch-tokens", true, "also accept a caller's default ServiceAccount token (the apiserver's audience) while apps move to the dispatch audience")
 	var maxCreates, maxQueued int
@@ -124,11 +124,20 @@ func main() {
 	// runtime pods and Prometheus to the ABI while only apps reach dispatch. The
 	// manager runs both, so they stop with the controllers on SIGTERM and drain
 	// in-flight requests first.
+	dispatchAddr, separate, err := resolveDispatchAddr(abiAddr, dispatchAddr)
+	if err != nil {
+		log.Error(err, "invalid listener addresses")
+		os.Exit(1)
+	}
 	abiMux, dispatchMux := newMuxes(plane, disp, runMetrics.Handler(), dispatchOnABIListener)
-	for _, s := range []*httpServer{
-		{name: "abi", addr: abiAddr, handler: abiMux},
-		{name: "dispatch", addr: dispatchAddr, handler: dispatchMux},
-	} {
+	servers := []*httpServer{{name: "abi", addr: abiAddr, handler: abiMux}}
+	if separate {
+		servers = append(servers, &httpServer{name: "dispatch", addr: dispatchAddr, handler: dispatchMux})
+	} else {
+		log.Info("dispatch is served only on the ABI listener: -abi-addr already uses the default dispatch port; set -dispatch-addr to give dispatch its own listener",
+			"abiAddr", abiAddr)
+	}
+	for _, s := range servers {
 		s.timeouts, s.log = defaultServerTimeouts, log
 		if err := mgr.Add(s); err != nil {
 			log.Error(err, "unable to add AEI HTTP server", "server", s.name)

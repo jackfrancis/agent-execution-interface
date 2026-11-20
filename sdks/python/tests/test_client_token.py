@@ -1,6 +1,8 @@
 """The client's bearer: an explicit token, else a token file read per request."""
 
-from aei import AeiClient
+import pytest
+
+from aei import AeiClient, TokenFileError
 from aei import client as client_mod
 
 
@@ -50,3 +52,29 @@ def test_default_token_path(monkeypatch):
     assert AeiClient("http://aei", "a")._token_path == client_mod.DEFAULT_TOKEN_PATH
     monkeypatch.setenv(client_mod.TOKEN_PATH_ENV, "  ")
     assert AeiClient("http://aei", "a")._token_path == client_mod.DEFAULT_TOKEN_PATH
+
+
+def test_missing_configured_token_file_raises(tmp_path, monkeypatch):
+    """A configured path that cannot be read raises with the path and OS error
+    before any request; an unreadable default path still sends the request."""
+    missing = tmp_path / "not-mounted" / "token"
+    s = _Session()
+    for configure in ("option", "env"):
+        if configure == "env":
+            monkeypatch.setenv(client_mod.TOKEN_PATH_ENV, str(missing))
+            c = AeiClient("http://aei", "a", session=s)
+        else:
+            monkeypatch.delenv(client_mod.TOKEN_PATH_ENV, raising=False)
+            c = AeiClient("http://aei", "a", token_path=str(missing), session=s)
+        with pytest.raises(TokenFileError) as exc:
+            c.get("r")
+        assert str(missing) in str(exc.value)
+        assert isinstance(exc.value.__cause__, FileNotFoundError)
+        with pytest.raises(TokenFileError):
+            c.wait("r", timeout=5, poll=0.01)
+    assert s.bearers == []
+
+    monkeypatch.delenv(client_mod.TOKEN_PATH_ENV, raising=False)
+    c = AeiClient("http://aei", "a", session=s)
+    c._token_path = str(missing)  # stands in for an absent default ServiceAccount token
+    assert _bearer(c, s) == ""

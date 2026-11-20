@@ -94,3 +94,36 @@ func TestListenersSplitRoutes(t *testing.T) {
 		t.Error("dispatch must stay on the ABI listener until apps call the dispatch listener")
 	}
 }
+
+// TestResolveDispatchAddr: without -dispatch-addr, dispatch keeps the ABI
+// listener's bind host on port 8081, and an ABI already on 8081 keeps dispatch
+// on the ABI listener alone instead of failing to bind the port twice.
+func TestResolveDispatchAddr(t *testing.T) {
+	cases := []struct {
+		abi, dispatch string
+		want          string
+		wantSeparate  bool
+		wantErr       bool
+	}{
+		{abi: ":8080", want: ":8081", wantSeparate: true},
+		{abi: "127.0.0.1:8080", want: "127.0.0.1:8081", wantSeparate: true},
+		{abi: "[::1]:8080", want: "[::1]:8081", wantSeparate: true},
+		{abi: ":8081", want: ":8081", wantSeparate: false},
+		{abi: "127.0.0.1:8081", want: "127.0.0.1:8081", wantSeparate: false},
+		{abi: "127.0.0.1:8080", dispatch: "0.0.0.0:9000", want: "0.0.0.0:9000", wantSeparate: true},
+		{abi: ":8080", dispatch: ":8080", wantErr: true},
+		{abi: "no-port", wantErr: true},
+	}
+	for _, tc := range cases {
+		got, separate, err := resolveDispatchAddr(tc.abi, tc.dispatch)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("resolveDispatchAddr(%q, %q) = %q, want an error", tc.abi, tc.dispatch, got)
+			}
+			continue
+		}
+		if err != nil || got != tc.want || separate != tc.wantSeparate {
+			t.Errorf("resolveDispatchAddr(%q, %q) = %q, %v, %v; want %q, %v", tc.abi, tc.dispatch, got, separate, err, tc.want, tc.wantSeparate)
+		}
+	}
+}

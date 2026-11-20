@@ -163,9 +163,11 @@ now). Such a token costs a second TokenReview, and the controller logs each
 ServiceAccount that still sends one, once. Both SDKs read the token from
 `AEI_DISPATCH_TOKEN_PATH` when it is set.
 
-The dispatch API has its own listener (`-dispatch-addr`, port 8081), separate from
-the runtime ABI and `/metrics` on 8080, because a NetworkPolicy matches ports, not
-paths. For now the 8080 listener also serves the dispatch routes, where apps
+The dispatch API has its own listener (`-dispatch-addr`), separate from the runtime
+ABI and `/metrics` on 8080, because a NetworkPolicy matches ports, not paths. Left
+unset, it listens on the ABI listener's host at port 8081, so an ABI bound to one
+interface keeps dispatch on that interface; if the ABI itself is on 8081, dispatch
+stays on the ABI listener alone. For now the 8080 listener also serves the dispatch routes, where apps
 called them before.
 
 Authorization is then the `AgentApp` policy:

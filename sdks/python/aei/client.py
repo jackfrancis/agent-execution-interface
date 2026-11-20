@@ -25,6 +25,12 @@ DEFAULT_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"  # no
 TOKEN_PATH_ENV = "AEI_DISPATCH_TOKEN_PATH"  # nosec B105: variable name, not a secret
 
 
+class TokenFileError(OSError):
+    """The configured token file (``token_path`` or ``AEI_DISPATCH_TOKEN_PATH``)
+    could not be read, such as a projected volume that is not mounted. Nothing was
+    sent."""
+
+
 class AeiClient:
     """Submits runs to the AEI dispatch API and reads their status. Requires the
     endpoint URL and the app's ``AgentApp`` name; both default from the environment
@@ -32,7 +38,9 @@ class AeiClient:
 
     The bearer is ``token`` when given; otherwise it is read, on every request so a
     rotated token is picked up, from ``token_path``, else the file
-    ``AEI_DISPATCH_TOKEN_PATH`` names, else the pod's default ServiceAccount token."""
+    ``AEI_DISPATCH_TOKEN_PATH`` names, else the pod's default ServiceAccount token.
+    A configured path that cannot be read raises ``TokenFileError`` before anything
+    is sent; an unreadable default path sends no bearer."""
 
     def __init__(
         self,
@@ -46,7 +54,9 @@ class AeiClient:
         self._endpoint = (endpoint or os.environ.get("AEI_DISPATCH_URL", "")).rstrip("/")
         self._app = app or os.environ.get("AEI_APP", "")
         self._token = token
-        self._token_path = token_path or os.environ.get(TOKEN_PATH_ENV, "").strip() or DEFAULT_TOKEN_PATH
+        configured = token_path or os.environ.get(TOKEN_PATH_ENV, "").strip()
+        self._token_path = configured or DEFAULT_TOKEN_PATH
+        self._token_path_set = bool(configured)
         self._session = session  # an injectable requests-like session (tests); else lazy requests
 
     def dispatch(self, spec: AgentRunSpec, *, app: str | None = None) -> str:
@@ -99,5 +109,7 @@ class AeiClient:
         try:
             with open(self._token_path, encoding="utf-8") as f:
                 return f.read().strip()
-        except OSError:
-            return ""
+        except OSError as e:
+            if self._token_path_set:
+                raise TokenFileError(f"aei: read token file {self._token_path}: {e}") from e
+            return ""  # off-cluster with no token configured: send no bearer

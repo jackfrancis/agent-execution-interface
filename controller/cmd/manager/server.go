@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"time"
@@ -18,6 +19,36 @@ import (
 // call the dispatch listener, it goes, and a NetworkPolicy can then keep runtime
 // pods away from dispatch.
 const dispatchOnABIListener = true
+
+// defaultDispatchPort is the dispatch listener's port when -dispatch-addr is not set.
+const defaultDispatchPort = "8081"
+
+// resolveDispatchAddr picks the dispatch listener's address and reports whether it
+// gets a listener of its own. An explicit -dispatch-addr is used as given, and must
+// differ from -abi-addr. Without one, dispatch listens on the ABI listener's host
+// at defaultDispatchPort, so an installation that binds the ABI to one interface
+// (say loopback) does not start serving dispatch on every interface after an
+// upgrade. An installation whose ABI already uses that port keeps dispatch on the
+// ABI listener alone, as before, rather than failing to bind it twice.
+func resolveDispatchAddr(abiAddr, dispatchAddr string) (addr string, separate bool, err error) {
+	if dispatchAddr != "" {
+		if dispatchAddr == abiAddr {
+			return "", false, fmt.Errorf("-dispatch-addr %q must differ from -abi-addr", dispatchAddr)
+		}
+		return dispatchAddr, true, nil
+	}
+	host, port, err := net.SplitHostPort(abiAddr)
+	if err != nil {
+		return "", false, fmt.Errorf("-abi-addr %q: %w", abiAddr, err)
+	}
+	if port == defaultDispatchPort {
+		if !dispatchOnABIListener {
+			return "", false, fmt.Errorf("-abi-addr %q uses the default dispatch port; set -dispatch-addr", abiAddr)
+		}
+		return abiAddr, false, nil
+	}
+	return net.JoinHostPort(host, defaultDispatchPort), true, nil
+}
 
 // newMuxes builds the handlers for the two listeners. The ABI listener carries the
 // routes runtime pods call (/complete, /redeem, /vend, /authority) and /metrics for
